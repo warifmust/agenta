@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# macOS
+.DS_Store
+
+# Local/dev
+.claude/
+exports/
+prompts/
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# Env/config
+.env
+.env.*

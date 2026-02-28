@@ -1,0 +1,97 @@
+[package]
+name = "agenta"
+version = "0.1.0"
+edition = "2021"
+description = "AI Agent Management CLI and Daemon"
+authors = ["Your Name <you@example.com>"]
+
+[[bin]]
+name = "agenta"
+path = "src/main.rs"
+
+[[bin]]
+name = "agenta-daemon"
+path = "src/daemon/main.rs"
+
+[dependencies]
+# CLI and argument parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = "0.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "chrono"] }
+
+# HTTP client for Ollama
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+
+# Scheduling
+tokio-cron-scheduler = "0.10"
+cron = "0.12"
+
+# Socket communication
+tokio-serde = { version = "0.8", features = ["json", "bincode"] }
+tokio-stream = "0.1"
+
+# File watching for triggers
+notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-full = "0.3"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Directory management
+dirs = "5.0"
+
+# Process management
+sysinfo = "0.30"
+
+# Async trait
+async-trait = "0.1"
+
+# Regex for trigger patterns
+regex = "1.10"
+
+# YAML support
+serde_yaml = "0.9"
+
+# Terminal colors
+owo-colors = "4.0"
+
+# Table output for CLI
+comfy-table = "7.1"
+
+# Interactive prompts
+inquire = "0.7"
+
+# HTTP server for triggers (local webhooks)
+axum = "0.7"
+utoipa = { version = "4.2", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "7.1", features = ["axum"] }
+
+# Signal handling for daemon
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
