@@ -43,7 +43,7 @@ cargo install --path . --force
 Option B: Install directly from GitHub raw
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | bash
 ```
 
 Local installer script in this repo:
