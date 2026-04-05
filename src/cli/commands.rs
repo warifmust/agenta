@@ -1031,6 +1031,8 @@ fn print_executions_table(executions: &[ExecutionResult]) {
 async fn wait_for_tool_execution(config: &AppConfig, execution_id: &str) -> Result<()> {
     let started = std::time::Instant::now();
     let timeout = Duration::from_secs(10 * 60);
+    let mut last_status = String::new();
+    let mut next_heartbeat = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if started.elapsed() > timeout {
             return Err(anyhow!("Timed out waiting for tool execution {}", execution_id));
@@ -1040,12 +1042,26 @@ async fn wait_for_tool_execution(config: &AppConfig, execution_id: &str) -> Resu
         };
         match daemon_request(config, request).await? {
             DaemonResponse::ToolExecutionResult { result } => {
-                let status = result
+                let status_value = result
                     .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if status.contains("completed") || status.contains("failed") {
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let status = match status_value {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                let status = status.trim_matches('"').to_lowercase();
+                let completed = result
+                    .get("completed_at")
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+
+                if status != last_status {
+                    println!("Tool execution {} status: {}", execution_id, status);
+                    last_status = status.clone();
+                }
+
+                if completed || status.contains("completed") || status.contains("failed") {
                     if let Some(output) = result.get("output").and_then(|v| v.as_str()) {
                         println!("{}", output);
                     }
@@ -1059,6 +1075,10 @@ async fn wait_for_tool_execution(config: &AppConfig, execution_id: &str) -> Resu
             _ => {}
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+        if std::time::Instant::now() >= next_heartbeat {
+            println!("Tool execution {} still running...", execution_id);
+            next_heartbeat = std::time::Instant::now() + Duration::from_secs(5);
+        }
     }
     Ok(())
 }
