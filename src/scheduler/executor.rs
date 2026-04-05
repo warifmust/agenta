@@ -102,9 +102,10 @@ impl AgentExecutor {
         input_text: &str,
         execution: &mut ExecutionResult,
     ) -> anyhow::Result<String> {
+        let has_tools = self.agent_has_available_tools(agent).await?;
         if let Some(config) = &agent.deep_agent_config {
             let deep = crate::scheduler::DeepAgentExecutor::new(self, config)?;
-            if agent.tools.is_empty() {
+            if !has_tools {
                 deep.execute_deep(agent, input_text, execution).await
             } else {
                 deep.execute_deep_with_tools(agent, input_text, execution).await
@@ -112,14 +113,14 @@ impl AgentExecutor {
         } else {
             match agent.execution_mode {
                 ExecutionMode::Once | ExecutionMode::Scheduled | ExecutionMode::Triggered => {
-                    if agent.tools.is_empty() {
+                    if !has_tools {
                         self.execute_single(agent, input_text, execution).await
                     } else {
                         self.execute_with_tools(agent, input_text, execution).await
                     }
                 }
                 ExecutionMode::Continuous => {
-                    if agent.tools.is_empty() {
+                    if !has_tools {
                         self.execute_single(agent, input_text, execution).await
                     } else {
                         self.execute_with_tools(agent, input_text, execution).await
@@ -127,6 +128,10 @@ impl AgentExecutor {
                 }
             }
         }
+    }
+
+    async fn agent_has_available_tools(&self, agent: &Agent) -> anyhow::Result<bool> {
+        Ok(!self.resolve_available_tools(agent).await?.is_empty())
     }
 
     async fn execute_single(
