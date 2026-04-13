@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle signals
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let signal_shutdown_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
         use signal_hook::consts::signal::*;
@@ -97,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         ])?;
 
         if let Some(_sig) = signals.forever().next() {
-            let _ = shutdown_tx.send(()).await;
+            let _ = signal_shutdown_tx.send(()).await;
         }
 
         Ok::<(), anyhow::Error>(())
@@ -112,8 +113,9 @@ async fn main() -> anyhow::Result<()> {
                 match result {
                     Ok((stream, _)) => {
                         let state = state.clone();
+                        let shutdown_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state).await {
+                            if let Err(e) = handle_connection(stream, state, shutdown_tx).await {
                                 error!("Connection error: {}", e);
                             }
                         });
@@ -142,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
 async fn handle_connection(
     mut stream: UnixStream,
     state: Arc<DaemonState>,
+    shutdown_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
     // Read request
     let mut buffer = vec![0u8; 8192];
@@ -162,7 +165,7 @@ async fn handle_connection(
     };
 
     // Process request
-    let response = process_request(request, state).await;
+    let response = process_request(request, state, shutdown_tx).await;
 
     // Send response
     let response_bytes = serde_json::to_vec(&response)?;
@@ -174,6 +177,7 @@ async fn handle_connection(
 async fn process_request(
     request: DaemonRequest,
     state: Arc<DaemonState>,
+    shutdown_tx: mpsc::Sender<()>,
 ) -> DaemonResponse {
     match request {
         DaemonRequest::CreateAgent { agent } => {
@@ -442,7 +446,7 @@ async fn process_request(
         }
 
         DaemonRequest::Shutdown => {
-            // Signal shutdown - handled by main loop
+            let _ = shutdown_tx.send(()).await;
             DaemonResponse::Success {
                 message: "Shutting down...".to_string(),
             }

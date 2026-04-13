@@ -151,6 +151,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             prompt: new_prompt,
             description: new_description,
             temperature: new_temp,
+            max_tokens: new_max_tokens,
             mode: new_mode,
             schedule: new_schedule,
             tools: new_tools,
@@ -180,6 +181,9 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(temp) = new_temp {
                 agent.config.temperature = temp;
+            }
+            if let Some(max_tokens) = new_max_tokens {
+                agent.config.max_tokens = max_tokens;
             }
             if let Some(mode) = new_mode {
                 agent.execution_mode = parse_execution_mode(&mode)?;

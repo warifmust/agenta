@@ -168,6 +168,15 @@ agenta update travel-guide --prompt "New system prompt"
 agenta update travel-guide --model "qwen3:latest"
 ```
 
+### Tune Model Parameters
+
+```bash
+agenta update travel-guide --temperature 0.5
+agenta update travel-guide --max-tokens 8192
+```
+
+> **Tip:** Models with extended thinking (e.g. `qwen3`) may run silently for a long time with the default token limit. Increase `--max-tokens` (e.g. `8192`) if your agent hangs without producing output.
+
 ### Schedule Daily Run (10:00)
 
 ```bash

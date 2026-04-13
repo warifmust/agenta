@@ -126,6 +126,10 @@ pub enum Commands {
         #[arg(long)]
         temperature: Option<f32>,
 
+        /// New max tokens
+        #[arg(long)]
+        max_tokens: Option<u32>,
+
         /// New execution mode
         #[arg(short, long)]
         mode: Option<String>,
