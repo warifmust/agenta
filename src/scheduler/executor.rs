@@ -67,12 +67,21 @@ impl AgentExecutor {
 
         // Bound execution time so runs do not stay "running" forever.
         let execution_timeout = Duration::from_secs(180);
-        let result = tokio::time::timeout(
+        let run_result = tokio::time::timeout(
             execution_timeout,
             self.run_execution(agent, &input_text, execution),
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("Execution timed out after {} seconds", execution_timeout.as_secs()))?;
+        .await;
+
+        // Flatten timeout error and execution error into the same Result so the
+        // status update below always runs — even when the timeout fires.
+        let result: anyhow::Result<String> = match run_result {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(anyhow::anyhow!(
+                "Execution timed out after {} seconds",
+                execution_timeout.as_secs()
+            )),
+        };
 
         // Update execution result
         execution.completed_at = Some(Utc::now());

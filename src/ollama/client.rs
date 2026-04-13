@@ -105,7 +105,7 @@ pub struct OllamaClient {
 impl OllamaClient {
     pub fn new(base_url: String) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_default();
         Self { client, base_url }
