@@ -1,9 +1,10 @@
 use chrono::Utc;
 use regex::Regex;
+use std::sync::Arc;
 use tracing::info;
 
 use crate::core::{
-    Agent, DeepAgentConfig, ExecutionResult, ToolCall,
+    Agent, DeepAgentConfig, ExecutionResult, Storage, ToolCall,
 };
 use crate::ollama::client::{ChatMessage, ChatRequest, OllamaClient};
 use crate::ollama::models::ModelParameters;
@@ -13,6 +14,7 @@ use crate::tools::run_tool;
 /// Deep agent executor for multi-step reasoning
 pub struct DeepAgentExecutor {
     ollama: OllamaClient,
+    storage: Arc<dyn Storage>,
     max_iterations: u32,
     stop_patterns: Vec<Regex>,
 }
@@ -27,6 +29,7 @@ impl DeepAgentExecutor {
 
         Ok(Self {
             ollama: base.ollama_client(),
+            storage: base.storage(),
             max_iterations: config.max_iterations,
             stop_patterns: stop_patterns?,
         })
@@ -114,6 +117,48 @@ impl DeepAgentExecutor {
         self.stop_patterns.iter().any(|p| p.is_match(response))
     }
 
+    /// Build a memory block from the last 5 completed executions for this agent
+    async fn build_memory_block(&self, agent: &Agent) -> String {
+        let Ok(executions) = self.storage.list_executions(&agent.id, 10).await else {
+            return String::new();
+        };
+
+        let past: Vec<String> = executions
+            .into_iter()
+            .filter(|e| e.output.is_some())
+            .take(5)
+            .map(|e| {
+                let date = e.started_at.format("%Y-%m-%d").to_string();
+                let output = e.output.unwrap_or_default();
+                // Extract first line (usually the headline/title) as a summary
+                let summary = output
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("(no output)")
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_string();
+                // Truncate to 120 chars
+                let summary = if summary.len() > 120 {
+                    format!("{}...", &summary[..117])
+                } else {
+                    summary
+                };
+                format!("[{}] {}", date, summary)
+            })
+            .collect();
+
+        if past.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "MEMORY — YOUR PREVIOUS RUNS (most recent first):\n{}\n",
+            past.join("\n")
+        )
+    }
+
     /// Execute deep agent with tool support
     pub async fn execute_deep_with_tools(
         &self,
@@ -129,6 +174,13 @@ impl DeepAgentExecutor {
             .map(|t| format!("- {}: {}", t.name, t.description))
             .collect();
 
+        // Build memory block from past executions if memory is enabled
+        let memory_block = if agent.memory_enabled {
+            self.build_memory_block(agent).await
+        } else {
+            String::new()
+        };
+
         let mut context = String::new();
         let mut iteration = 0;
 
@@ -136,8 +188,9 @@ impl DeepAgentExecutor {
             execution.iterations = iteration + 1;
 
             let prompt = format!(
-                "{system}\n\nYou have access to these tools:\n{tools}\n\nUse tools by responding with: TOOL_CALL: {{\"tool\": \"name\", \"parameters\": {{...}}}}\n\nContext so far:\n{context}\n\nTask: {input}\n\nWhat is your next step?",
+                "{system}\n\n{memory}You have access to these tools:\n{tools}\n\nCRITICAL INSTRUCTIONS:\n- Use tools step by step to complete this task.\n- To call a tool, your response MUST start with exactly: TOOL_CALL: {{\"tool\": \"tool_name\", \"parameters\": {{...}}}}\n- Example: TOOL_CALL: {{\"tool\": \"read_article\", \"parameters\": {{}}}}\n- After each tool result, decide: do you have more tools to call? If yes, call the next tool. If all steps are done, write TASK_COMPLETE: followed by your final summary.\n- Do NOT call the same tool twice.\n- Do NOT write TASK_COMPLETE until all required tool calls are finished.\n\nContext so far:\n{context}\n\nTask: {input}\n\nWhat is your next action? Call a tool or write TASK_COMPLETE if all steps are done:",
                 system = agent.system_prompt,
+                memory = memory_block,
                 tools = tool_descriptions.join("\n"),
                 context = if context.is_empty() {
                     "(No context yet)".to_string()
@@ -184,13 +237,6 @@ impl DeepAgentExecutor {
                 }
             } else {
                 context.push_str(&format!("\nThought: {}", content));
-
-                // Check if agent indicates task is complete
-                if content.to_lowercase().contains("complete")
-                    || content.to_lowercase().contains("finished")
-                {
-                    return Ok(content);
-                }
             }
 
             iteration += 1;

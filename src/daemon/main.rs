@@ -51,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
     // Create daemon state
     let state = Arc::new(DaemonState::new(storage, config.ollama_url.clone()).await?);
 
+    // Auto-backup all agents on startup
+    auto_backup_agents(&state).await;
+
     // Start background tasks
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -139,6 +142,45 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Daemon stopped");
     Ok(())
+}
+
+/// On every daemon startup, export all agents to a timestamped JSON file.
+/// Keeps the last 14 backups and silently ignores errors (backup is best-effort).
+async fn auto_backup_agents(state: &Arc<DaemonState>) {
+    let agents = match state.storage().list_agents().await {
+        Ok(a) if !a.is_empty() => a,
+        _ => return, // nothing to back up
+    };
+
+    let backup_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".agenta")
+        .join("exports");
+
+    if std::fs::create_dir_all(&backup_dir).is_err() {
+        return;
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let backup_path = backup_dir.join(format!("backup_{}.json", timestamp));
+
+    let data = serde_json::json!({ "agents": agents, "backup_at": timestamp });
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(&backup_path, json);
+        info!("Auto-backup saved: {:?} ({} agents)", backup_path, agents.len());
+    }
+
+    // Prune: keep only the 14 most recent backups
+    if let Ok(mut entries) = std::fs::read_dir(&backup_dir) {
+        let mut backups: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("backup_"))
+            .collect();
+        backups.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+        for old in backups.into_iter().skip(14) {
+            let _ = std::fs::remove_file(old.path());
+        }
+    }
 }
 
 async fn handle_connection(
@@ -436,6 +478,72 @@ async fn process_request(
                 message: e.to_string(),
             },
         },
+
+        DaemonRequest::CreateScript { script } => {
+            use agenta::core::ScriptDefinition;
+            match serde_json::from_value::<ScriptDefinition>(script) {
+                Ok(script) => match state.create_script(script).await {
+                    Ok(id) => DaemonResponse::Success {
+                        message: format!("Script created: {}", id),
+                    },
+                    Err(e) => DaemonResponse::Error { message: e.to_string() },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Invalid script data: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::UpdateScript { id, script } => {
+            use agenta::core::ScriptDefinition;
+            match serde_json::from_value::<ScriptDefinition>(script) {
+                Ok(script) => match state.update_script(&id, script).await {
+                    Ok(_) => DaemonResponse::Success { message: "Script updated".to_string() },
+                    Err(e) => DaemonResponse::Error { message: e.to_string() },
+                },
+                Err(e) => DaemonResponse::Error {
+                    message: format!("Invalid script data: {}", e),
+                },
+            }
+        }
+
+        DaemonRequest::DeleteScript { id } => match state.delete_script(&id).await {
+            Ok(true) => DaemonResponse::Success { message: "Script deleted".to_string() },
+            Ok(false) => DaemonResponse::Error { message: "Script not found".to_string() },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::GetScript { id } => match state.get_script(&id).await {
+            Ok(Some(script)) => match serde_json::to_value(script) {
+                Ok(value) => DaemonResponse::ScriptDetails { script: value },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            },
+            Ok(None) => DaemonResponse::Error { message: "Script not found".to_string() },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::ListScripts => match state.list_scripts().await {
+            Ok(scripts) => {
+                let values: Vec<serde_json::Value> = scripts
+                    .into_iter()
+                    .filter_map(|s| serde_json::to_value(s).ok())
+                    .collect();
+                DaemonResponse::ScriptList { scripts: values }
+            }
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::RunScript { id } => match state.run_script(&id).await {
+            Ok(execution_id) => DaemonResponse::ScriptExecutionStarted { execution_id },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::GetScriptLogs { script_id, execution_id, lines } => {
+            match state.get_script_logs(&script_id, execution_id.as_deref(), lines).await {
+                Ok(logs) => DaemonResponse::ScriptExecutionLog { lines: logs },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
 
         DaemonRequest::Ping => {
             DaemonResponse::Status {

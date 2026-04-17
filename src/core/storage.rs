@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use sqlx::{
     postgres::PgPoolOptions,
     sqlite::SqlitePoolOptions,
@@ -6,7 +7,7 @@ use sqlx::{
 };
 use std::path::Path;
 
-use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource};
+use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource, ScriptDefinition, ScriptExecution, ScriptExecutionStatus};
 use super::error::Result;
 
 /// Storage trait - can be implemented for different backends
@@ -45,6 +46,9 @@ pub trait Storage: Send + Sync {
     /// List executions for an agent
     async fn list_executions(&self, agent_id: &str, limit: i64) -> Result<Vec<ExecutionResult>>;
 
+    /// Cancel all running executions for an agent
+    async fn cancel_running_executions(&self, agent_id: &str) -> Result<()>;
+
     /// Get active scheduled agents
     async fn get_scheduled_agents(&self) -> Result<Vec<Agent>>;
 
@@ -80,6 +84,39 @@ pub trait Storage: Send + Sync {
 
     /// List executions for a tool
     async fn list_tool_executions(&self, tool_id: &str, limit: i64) -> Result<Vec<ToolExecution>>;
+
+    /// Create a script
+    async fn create_script(&self, script: &ScriptDefinition) -> Result<()>;
+
+    /// Get script by ID or name
+    async fn get_script(&self, id: &str) -> Result<Option<ScriptDefinition>>;
+
+    /// Get script by name
+    async fn get_script_by_name(&self, name: &str) -> Result<Option<ScriptDefinition>>;
+
+    /// Update script
+    async fn update_script(&self, script: &ScriptDefinition) -> Result<()>;
+
+    /// Delete script
+    async fn delete_script(&self, id: &str) -> Result<bool>;
+
+    /// List all scripts
+    async fn list_scripts(&self) -> Result<Vec<ScriptDefinition>>;
+
+    /// Get scheduled scripts
+    async fn get_scheduled_scripts(&self) -> Result<Vec<ScriptDefinition>>;
+
+    /// Create script execution
+    async fn create_script_execution(&self, execution: &ScriptExecution) -> Result<()>;
+
+    /// Update script execution
+    async fn update_script_execution(&self, execution: &ScriptExecution) -> Result<()>;
+
+    /// Get script execution by ID
+    async fn get_script_execution(&self, id: &str) -> Result<Option<ScriptExecution>>;
+
+    /// List executions for a script
+    async fn list_script_executions(&self, script_id: &str, limit: i64) -> Result<Vec<ScriptExecution>>;
 }
 
 /// SQLite storage implementation
@@ -121,6 +158,7 @@ impl SqliteStorage {
                 schedule TEXT,
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
+                memory_enabled INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -131,6 +169,13 @@ impl SqliteStorage {
         )
         .execute(&self.pool)
         .await?;
+
+        // Migration: add memory_enabled column if it doesn't exist (SQLite)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await;
 
         // Create executions table
         sqlx::query(
@@ -207,6 +252,52 @@ impl SqliteStorage {
             .execute(&self.pool)
             .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scripts (
+                id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                handler TEXT NOT NULL,
+                schedule TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS script_executions (
+                id TEXT PRIMARY KEY,
+                script_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                exit_code INTEGER,
+                output TEXT,
+                stderr TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                triggered_by TEXT NOT NULL DEFAULT 'manual',
+                FOREIGN KEY (script_id) REFERENCES scripts(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_scripts_name ON scripts(name)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_script_exec_script_id ON script_executions(script_id)")
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 }
@@ -245,6 +336,7 @@ impl PostgresStorage {
                 schedule TEXT,
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
+                memory_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -255,6 +347,13 @@ impl PostgresStorage {
         )
         .execute(&self.pool)
         .await?;
+
+        // Migration: add memory_enabled column if it doesn't exist (Postgres)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        .execute(&self.pool)
+        .await;
 
         // Create executions table
         sqlx::query(
@@ -331,6 +430,52 @@ impl PostgresStorage {
             .execute(&self.pool)
             .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scripts (
+                id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                description TEXT,
+                handler TEXT NOT NULL,
+                schedule TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                last_run TIMESTAMPTZ,
+                run_count BIGINT NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS script_executions (
+                id TEXT PRIMARY KEY,
+                script_id TEXT NOT NULL,
+                started_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                exit_code INTEGER,
+                output TEXT,
+                stderr TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                triggered_by TEXT NOT NULL DEFAULT 'manual',
+                FOREIGN KEY (script_id) REFERENCES scripts(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_scripts_name ON scripts(name)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_script_exec_script_id ON script_executions(script_id)")
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 }
@@ -345,8 +490,8 @@ impl Storage for SqliteStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                status, created_at, updated_at, last_run, run_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                memory_enabled, status, created_at, updated_at, last_run, run_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             "#,
         )
         .bind(&agent.id)
@@ -361,6 +506,7 @@ impl Storage for SqliteStorage {
         .bind(&agent.schedule)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
+        .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
         .bind(agent.updated_at.to_rfc3339())
@@ -379,7 +525,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = ?1
             "#,
         )
@@ -397,7 +543,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = ?1
             "#,
         )
@@ -425,11 +571,12 @@ impl Storage for SqliteStorage {
                 schedule = ?9,
                 deep_agent_config = ?10,
                 environment = ?11,
-                status = ?12,
-                updated_at = ?13,
-                last_run = ?14,
-                run_count = ?15
-            WHERE id = ?16
+                memory_enabled = ?12,
+                status = ?13,
+                updated_at = ?14,
+                last_run = ?15,
+                run_count = ?16
+            WHERE id = ?17
             "#,
         )
         .bind(&agent.name)
@@ -443,6 +590,7 @@ impl Storage for SqliteStorage {
         .bind(&agent.schedule)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
+        .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
@@ -471,7 +619,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents ORDER BY created_at DESC
             "#,
         )
@@ -489,7 +637,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = ?1 ORDER BY created_at DESC
             "#,
         )
@@ -594,6 +742,22 @@ impl Storage for SqliteStorage {
         .await?;
 
         Ok(rows.into_iter().filter_map(|r| row_to_execution_sqlite(&r)).collect())
+    }
+
+    async fn cancel_running_executions(&self, agent_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE executions
+            SET status = '"cancelled"', completed_at = ?1
+            WHERE agent_id = ?2 AND status = '"running"'
+            "#,
+        )
+        .bind(&now)
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
@@ -763,6 +927,147 @@ impl Storage for SqliteStorage {
             .collect())
     }
 
+    async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO scripts (id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        )
+        .bind(&script.id)
+        .bind(&script.name)
+        .bind(&script.description)
+        .bind(&script.handler)
+        .bind(&script.schedule)
+        .bind(script.enabled as i64)
+        .bind(script.created_at.to_rfc3339())
+        .bind(script.updated_at.to_rfc3339())
+        .bind(script.last_run.map(|d| d.to_rfc3339()))
+        .bind(script.run_count as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_script(&self, id: &str) -> Result<Option<ScriptDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE id = ?1 OR name = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_sqlite(&r)))
+    }
+
+    async fn get_script_by_name(&self, name: &str) -> Result<Option<ScriptDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_sqlite(&r)))
+    }
+
+    async fn update_script(&self, script: &ScriptDefinition) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE scripts SET name=?1, description=?2, handler=?3, schedule=?4, enabled=?5, updated_at=?6, last_run=?7, run_count=?8 WHERE id=?9"#,
+        )
+        .bind(&script.name)
+        .bind(&script.description)
+        .bind(&script.handler)
+        .bind(&script.schedule)
+        .bind(script.enabled as i64)
+        .bind(script.updated_at.to_rfc3339())
+        .bind(script.last_run.map(|d| d.to_rfc3339()))
+        .bind(script.run_count as i64)
+        .bind(&script.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_script(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM scripts WHERE id = ?1 OR name = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_scripts(&self) -> Result<Vec<ScriptDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_sqlite(&r)).collect())
+    }
+
+    async fn get_scheduled_scripts(&self) -> Result<Vec<ScriptDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE enabled = 1 AND schedule IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_sqlite(&r)).collect())
+    }
+
+    async fn create_script_execution(&self, execution: &ScriptExecution) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO script_executions (id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        )
+        .bind(&execution.id)
+        .bind(&execution.script_id)
+        .bind(execution.started_at.to_rfc3339())
+        .bind(execution.completed_at.map(|d| d.to_rfc3339()))
+        .bind(execution.exit_code)
+        .bind(&execution.output)
+        .bind(&execution.stderr)
+        .bind(serde_json::to_string(&execution.status)?)
+        .bind(&execution.error)
+        .bind(&execution.triggered_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_script_execution(&self, execution: &ScriptExecution) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE script_executions SET completed_at=?1, exit_code=?2, output=?3, stderr=?4, status=?5, error=?6 WHERE id=?7"#,
+        )
+        .bind(execution.completed_at.map(|d| d.to_rfc3339()))
+        .bind(execution.exit_code)
+        .bind(&execution.output)
+        .bind(&execution.stderr)
+        .bind(serde_json::to_string(&execution.status)?)
+        .bind(&execution.error)
+        .bind(&execution.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_script_execution(&self, id: &str) -> Result<Option<ScriptExecution>> {
+        let row = sqlx::query(
+            "SELECT id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by FROM script_executions WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_execution_sqlite(&r)))
+    }
+
+    async fn list_script_executions(&self, script_id: &str, limit: i64) -> Result<Vec<ScriptExecution>> {
+        let rows = sqlx::query(
+            "SELECT id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by FROM script_executions WHERE script_id = ?1 ORDER BY started_at DESC LIMIT ?2",
+        )
+        .bind(script_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_execution_sqlite(&r)).collect())
+    }
+
     async fn get_scheduled_agents(
         &self
     ) -> Result<Vec<Agent>> {
@@ -805,8 +1110,8 @@ impl Storage for PostgresStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                status, created_at, updated_at, last_run, run_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                memory_enabled, status, created_at, updated_at, last_run, run_count
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             "#,
         )
         .bind(&agent.id)
@@ -821,6 +1126,7 @@ impl Storage for PostgresStorage {
         .bind(&agent.schedule)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
+        .bind(agent.memory_enabled)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
         .bind(agent.updated_at.to_rfc3339())
@@ -839,7 +1145,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = $1
             "#,
         )
@@ -857,7 +1163,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = $1
             "#,
         )
@@ -885,11 +1191,12 @@ impl Storage for PostgresStorage {
                 schedule = $9,
                 deep_agent_config = $10,
                 environment = $11,
-                status = $12,
-                updated_at = $13,
-                last_run = $14,
-                run_count = $15
-            WHERE id = $16
+                memory_enabled = $12,
+                status = $13,
+                updated_at = $14,
+                last_run = $15,
+                run_count = $16
+            WHERE id = $17
             "#,
         )
         .bind(&agent.name)
@@ -903,6 +1210,7 @@ impl Storage for PostgresStorage {
         .bind(&agent.schedule)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
+        .bind(agent.memory_enabled)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
@@ -931,7 +1239,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents ORDER BY created_at DESC
             "#,
         )
@@ -949,7 +1257,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = $1 ORDER BY created_at DESC
             "#,
         )
@@ -1054,6 +1362,22 @@ impl Storage for PostgresStorage {
         .await?;
 
         Ok(rows.into_iter().filter_map(|r| row_to_execution_pg(&r)).collect())
+    }
+
+    async fn cancel_running_executions(&self, agent_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE executions
+            SET status = '"cancelled"', completed_at = $1
+            WHERE agent_id = $2 AND status = '"running"'
+            "#,
+        )
+        .bind(&now)
+        .bind(agent_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
@@ -1223,6 +1547,147 @@ impl Storage for PostgresStorage {
             .collect())
     }
 
+    async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO scripts (id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+        )
+        .bind(&script.id)
+        .bind(&script.name)
+        .bind(&script.description)
+        .bind(&script.handler)
+        .bind(&script.schedule)
+        .bind(script.enabled)
+        .bind(script.created_at)
+        .bind(script.updated_at)
+        .bind(script.last_run)
+        .bind(script.run_count as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_script(&self, id: &str) -> Result<Option<ScriptDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE id = $1 OR name = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_pg(&r)))
+    }
+
+    async fn get_script_by_name(&self, name: &str) -> Result<Option<ScriptDefinition>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_pg(&r)))
+    }
+
+    async fn update_script(&self, script: &ScriptDefinition) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE scripts SET name=$1, description=$2, handler=$3, schedule=$4, enabled=$5, updated_at=$6, last_run=$7, run_count=$8 WHERE id=$9"#,
+        )
+        .bind(&script.name)
+        .bind(&script.description)
+        .bind(&script.handler)
+        .bind(&script.schedule)
+        .bind(script.enabled)
+        .bind(script.updated_at)
+        .bind(script.last_run)
+        .bind(script.run_count as i64)
+        .bind(&script.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_script(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM scripts WHERE id = $1 OR name = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_scripts(&self) -> Result<Vec<ScriptDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_pg(&r)).collect())
+    }
+
+    async fn get_scheduled_scripts(&self) -> Result<Vec<ScriptDefinition>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count FROM scripts WHERE enabled = TRUE AND schedule IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_pg(&r)).collect())
+    }
+
+    async fn create_script_execution(&self, execution: &ScriptExecution) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO script_executions (id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+        )
+        .bind(&execution.id)
+        .bind(&execution.script_id)
+        .bind(execution.started_at)
+        .bind(execution.completed_at)
+        .bind(execution.exit_code)
+        .bind(&execution.output)
+        .bind(&execution.stderr)
+        .bind(serde_json::to_string(&execution.status)?)
+        .bind(&execution.error)
+        .bind(&execution.triggered_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_script_execution(&self, execution: &ScriptExecution) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE script_executions SET completed_at=$1, exit_code=$2, output=$3, stderr=$4, status=$5, error=$6 WHERE id=$7"#,
+        )
+        .bind(execution.completed_at)
+        .bind(execution.exit_code)
+        .bind(&execution.output)
+        .bind(&execution.stderr)
+        .bind(serde_json::to_string(&execution.status)?)
+        .bind(&execution.error)
+        .bind(&execution.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_script_execution(&self, id: &str) -> Result<Option<ScriptExecution>> {
+        let row = sqlx::query(
+            "SELECT id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by FROM script_executions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_script_execution_pg(&r)))
+    }
+
+    async fn list_script_executions(&self, script_id: &str, limit: i64) -> Result<Vec<ScriptExecution>> {
+        let rows = sqlx::query(
+            "SELECT id, script_id, started_at, completed_at, exit_code, output, stderr, status, error, triggered_by FROM script_executions WHERE script_id = $1 ORDER BY started_at DESC LIMIT $2",
+        )
+        .bind(script_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_script_execution_pg(&r)).collect())
+    }
+
     async fn get_scheduled_agents(
         &self
     ) -> Result<Vec<Agent>> {
@@ -1242,7 +1707,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = $1
             "#,
@@ -1274,6 +1739,7 @@ fn row_to_agent_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Agent> {
         schedule: get_optional_str("schedule").map(|s| s.to_string()),
         deep_agent_config: get_optional_str("deep_agent_config").and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(get_str("environment")?).ok()?,
+        memory_enabled: get_i64("memory_enabled").unwrap_or(0) != 0,
         status: serde_json::from_str(get_str("status")?).ok()?,
         created_at: get_str("created_at")?.parse().ok()?,
         updated_at: get_str("updated_at")?.parse().ok()?,
@@ -1335,6 +1801,7 @@ fn row_to_agent_pg(row: &sqlx::postgres::PgRow) -> Option<Agent> {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(&environment).ok()?,
+        memory_enabled: row.try_get::<bool, _>("memory_enabled").unwrap_or(false),
         status: serde_json::from_str(&status).ok()?,
         created_at: created_at.parse().ok()?,
         updated_at: updated_at.parse().ok()?,
@@ -1446,5 +1913,83 @@ fn row_to_tool_execution_pg(row: &sqlx::postgres::PgRow) -> Option<ToolExecution
         output: get_optional_string("output"),
         status: serde_json::from_str(&status).ok()?,
         error: get_optional_string("error"),
+    })
+}
+
+fn row_to_script_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<ScriptDefinition> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+    let get_i64 = |col: &str| row.try_get::<i64, _>(col).ok();
+
+    Some(ScriptDefinition {
+        id: get_string("id")?,
+        name: get_string("name")?,
+        description: get_optional_string("description"),
+        handler: get_string("handler")?,
+        schedule: get_optional_string("schedule"),
+        enabled: get_i64("enabled").unwrap_or(1) != 0,
+        created_at: get_string("created_at")?.parse().ok()?,
+        updated_at: get_string("updated_at")?.parse().ok()?,
+        last_run: get_optional_string("last_run").as_deref().and_then(|s| s.parse().ok()),
+        run_count: get_i64("run_count").unwrap_or(0) as u64,
+    })
+}
+
+fn row_to_script_execution_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<ScriptExecution> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+    let get_optional_i32 = |col: &str| row.try_get::<Option<i32>, _>(col).ok().flatten();
+
+    let status = get_string("status")?;
+
+    Some(ScriptExecution {
+        id: get_string("id")?,
+        script_id: get_string("script_id")?,
+        started_at: get_string("started_at")?.parse().ok()?,
+        completed_at: get_optional_string("completed_at").as_deref().and_then(|s| s.parse().ok()),
+        exit_code: get_optional_i32("exit_code"),
+        output: get_optional_string("output"),
+        stderr: get_optional_string("stderr"),
+        status: serde_json::from_str(&status).ok()?,
+        error: get_optional_string("error"),
+        triggered_by: get_string("triggered_by").unwrap_or_else(|| "manual".to_string()),
+    })
+}
+
+fn row_to_script_pg(row: &sqlx::postgres::PgRow) -> Option<ScriptDefinition> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+
+    Some(ScriptDefinition {
+        id: get_string("id")?,
+        name: get_string("name")?,
+        description: get_optional_string("description"),
+        handler: get_string("handler")?,
+        schedule: get_optional_string("schedule"),
+        enabled: row.try_get::<bool, _>("enabled").ok()?,
+        created_at: row.try_get::<chrono::DateTime<Utc>, _>("created_at").ok()?,
+        updated_at: row.try_get::<chrono::DateTime<Utc>, _>("updated_at").ok()?,
+        last_run: row.try_get::<Option<chrono::DateTime<Utc>>, _>("last_run").ok().flatten(),
+        run_count: row.try_get::<i64, _>("run_count").ok().unwrap_or(0) as u64,
+    })
+}
+
+fn row_to_script_execution_pg(row: &sqlx::postgres::PgRow) -> Option<ScriptExecution> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+
+    let status = get_string("status")?;
+
+    Some(ScriptExecution {
+        id: get_string("id")?,
+        script_id: get_string("script_id")?,
+        started_at: row.try_get::<chrono::DateTime<Utc>, _>("started_at").ok()?,
+        completed_at: row.try_get::<Option<chrono::DateTime<Utc>>, _>("completed_at").ok().flatten(),
+        exit_code: row.try_get::<Option<i32>, _>("exit_code").ok().flatten(),
+        output: get_optional_string("output"),
+        stderr: get_optional_string("stderr"),
+        status: serde_json::from_str(&status).ok()?,
+        error: get_optional_string("error"),
+        triggered_by: get_string("triggered_by").unwrap_or_else(|| "manual".to_string()),
     })
 }

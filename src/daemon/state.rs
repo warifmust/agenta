@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use agenta::core::{
     Agent, AgentStatus, ExecutionMode, ExecutionResult, Storage, ToolExecution,
     ToolExecutionStatus, ToolResource, TriggerEvent, TriggerType,
+    ScriptDefinition, ScriptExecution, ScriptExecutionStatus,
 };
 use agenta::ollama::OllamaClient;
 use agenta::scheduler::AgentExecutor;
@@ -144,6 +145,10 @@ impl DaemonState {
         });
 
         Ok(())
+    }
+
+    pub fn storage(&self) -> Arc<dyn Storage> {
+        self.storage.clone()
     }
 
     pub async fn create_agent(&self,
@@ -298,6 +303,12 @@ impl DaemonState {
             handle.abort();
             info!("Stopped agent: {}", agent_id);
         }
+
+        // Mark all running executions as cancelled in the DB
+        if let Err(e) = self.storage.cancel_running_executions(&agent_id).await {
+            warn!("Failed to cancel running executions for agent {}: {}", agent_id, e);
+        }
+
         Ok(())
     }
 
@@ -552,11 +563,12 @@ async fn run_tool_handler(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Tool has no handler"))?;
 
-    let mut parts = handler.split_whitespace();
+    let expanded = expand_tilde(handler);
+    let mut parts = expanded.split_whitespace();
     let program = parts
         .next()
         .ok_or_else(|| anyhow::anyhow!("Invalid tool handler: {}", handler))?;
-    let args: Vec<&str> = parts.collect();
+    let args: Vec<String> = parts.map(|a| expand_tilde(a)).collect();
 
     let mut child = Command::new(program)
         .args(args)
@@ -640,4 +652,179 @@ impl DaemonState {
             trigger.unregister_webhook(agent_id).await;
         }
     }
+
+    // ── Script management ─────────────────────────────────────────────────────
+
+    pub async fn create_script(&self, script: ScriptDefinition) -> anyhow::Result<String> {
+        let id = script.id.clone();
+        self.storage.create_script(&script).await?;
+        info!("Created script: {} ({})", script.name, id);
+        Ok(id)
+    }
+
+    pub async fn get_script(&self, id_or_name: &str) -> anyhow::Result<Option<ScriptDefinition>> {
+        Ok(self.storage.get_script(id_or_name).await?)
+    }
+
+    pub async fn list_scripts(&self) -> anyhow::Result<Vec<ScriptDefinition>> {
+        Ok(self.storage.list_scripts().await?)
+    }
+
+    pub async fn update_script(&self, id_or_name: &str, mut script: ScriptDefinition) -> anyhow::Result<()> {
+        let existing = self.storage.get_script(id_or_name).await?
+            .ok_or_else(|| anyhow::anyhow!("Script not found: {}", id_or_name))?;
+        script.id = existing.id;
+        script.created_at = existing.created_at;
+        script.run_count = existing.run_count;
+        script.last_run = existing.last_run;
+        script.touch();
+        self.storage.update_script(&script).await?;
+        Ok(())
+    }
+
+    pub async fn delete_script(&self, id_or_name: &str) -> anyhow::Result<bool> {
+        Ok(self.storage.delete_script(id_or_name).await?)
+    }
+
+    pub async fn run_script(&self, id_or_name: &str) -> anyhow::Result<String> {
+        let script = self.storage.get_script(id_or_name).await?
+            .ok_or_else(|| anyhow::anyhow!("Script not found: {}", id_or_name))?;
+
+        let mut execution = ScriptExecution::new(script.id.clone(), "manual");
+        execution.status = ScriptExecutionStatus::Running;
+        self.storage.create_script_execution(&execution).await?;
+
+        let storage = self.storage.clone();
+        let handler = script.handler.clone();
+        let script_id = script.id.clone();
+        let exec_id = execution.id.clone();
+
+        tokio::spawn(async move {
+            let result = run_script_handler(&handler).await;
+            let mut exec = execution;
+            exec.completed_at = Some(chrono::Utc::now());
+            match result {
+                Ok((stdout, stderr, exit_code)) => {
+                    exec.output = Some(stdout);
+                    exec.stderr = if stderr.is_empty() { None } else { Some(stderr) };
+                    exec.exit_code = Some(exit_code);
+                    exec.status = if exit_code == 0 {
+                        ScriptExecutionStatus::Completed
+                    } else {
+                        ScriptExecutionStatus::Failed
+                    };
+                }
+                Err(e) => {
+                    exec.status = ScriptExecutionStatus::Failed;
+                    exec.error = Some(e.to_string());
+                }
+            }
+            let _ = storage.update_script_execution(&exec).await;
+            if let Ok(Some(mut s)) = storage.get_script(&script_id).await {
+                s.last_run = Some(chrono::Utc::now());
+                s.run_count += 1;
+                s.touch();
+                let _ = storage.update_script(&s).await;
+            }
+        });
+
+        Ok(exec_id)
+    }
+
+    pub async fn get_script_logs(
+        &self,
+        id_or_name: &str,
+        execution_id: Option<&str>,
+        lines: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        // If id_or_name looks like an execution ID (or prefix), try resolving via
+        // get_script_execution first so users can do: agenta script logs <exec_id>
+        let (script_id, injected_exec_id) = if let Some(exec) = self.storage.get_script_execution(id_or_name).await? {
+            (exec.script_id.clone(), Some(exec.id.clone()))
+        } else {
+            let script = self.storage.get_script(id_or_name).await?
+                .ok_or_else(|| anyhow::anyhow!("Script not found: {}", id_or_name))?;
+            (script.id.clone(), None)
+        };
+
+        // execution_id filter: prefer the one from the CLI arg, else from exec lookup
+        let exec_filter = execution_id.map(|s| s.to_string()).or(injected_exec_id);
+
+        let executions = self.storage.list_script_executions(&script_id, lines.max(50) as i64).await?;
+
+        let mut log_lines = Vec::new();
+        let filtered: Vec<_> = if let Some(ref exec_id) = exec_filter {
+            executions.into_iter().filter(|e| e.id.starts_with(exec_id.as_str())).collect()
+        } else {
+            executions
+        };
+
+        for exec in filtered.iter().take(lines) {
+            let exit_info = match exec.exit_code {
+                Some(code) => format!(" (exit {})", code),
+                None => String::new(),
+            };
+            log_lines.push(format!(
+                "[{}] {} - {:?}{}",
+                exec.started_at.format("%Y-%m-%d %H:%M:%S"),
+                &exec.id[..8],
+                exec.status,
+                exit_info,
+            ));
+            if let Some(output) = &exec.output {
+                if !output.trim().is_empty() {
+                    for line in output.lines().take(50) {
+                        log_lines.push(format!("  {}", line));
+                    }
+                }
+            }
+            if let Some(stderr) = &exec.stderr {
+                if !stderr.trim().is_empty() {
+                    log_lines.push("  --- stderr ---".to_string());
+                    for line in stderr.lines().take(20) {
+                        log_lines.push(format!("  {}", line));
+                    }
+                }
+            }
+            if let Some(err) = &exec.error {
+                log_lines.push(format!("  ERROR: {}", err));
+            }
+        }
+
+        Ok(log_lines)
+    }
+}
+
+/// Expand a leading `~` to the actual home directory so that handlers stored as
+/// `~/.agenta/scripts/foo.sh` work correctly when invoked without a shell.
+fn expand_tilde(s: &str) -> String {
+    if s.starts_with("~/") || s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &s[1..]);
+        }
+    }
+    s.to_string()
+}
+
+async fn run_script_handler(handler: &str) -> anyhow::Result<(String, String, i32)> {
+    let expanded = expand_tilde(handler);
+    let mut parts = expanded.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Empty handler for script"))?;
+    let args: Vec<String> = parts.map(|a| expand_tilde(a)).collect();
+
+    let output = Command::new(program)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn handler '{}': {}", handler, e))?
+        .wait_with_output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok((stdout, stderr, exit_code))
 }

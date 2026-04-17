@@ -1,7 +1,7 @@
-use super::{Commands, ToolCommands, ViewCommands};
+use super::{Commands, ScriptCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
-    ExecutionResult, ToolDefinition, ToolResource,
+    ExecutionResult, ScriptDefinition, ToolDefinition, ToolResource,
 };
 use anyhow::{anyhow, Context, Result};
 use comfy_table::{Cell, CellAlignment, Table};
@@ -65,6 +65,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             schedule,
             deep,
             deep_iterations,
+            memory,
             tools,
             interactive,
         } => {
@@ -85,6 +86,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             agent.config.max_tokens = max_tokens;
             agent.execution_mode = parse_execution_mode(&mode)?;
             agent.schedule = schedule;
+            agent.memory_enabled = memory;
             if let Some(tools_arg) = tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
             }
@@ -154,6 +156,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             max_tokens: new_max_tokens,
             mode: new_mode,
             schedule: new_schedule,
+            memory: new_memory,
             tools: new_tools,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -190,6 +193,9 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if new_schedule.is_some() {
                 agent.schedule = new_schedule;
+            }
+            if let Some(mem) = new_memory {
+                agent.memory_enabled = mem;
             }
             if let Some(tools_arg) = new_tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
@@ -341,35 +347,80 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
         }
 
-        Commands::Import { input, format: _ } => {
+        Commands::Import { input, format: _, force } => {
             let content = std::fs::read_to_string(&input)?;
             let data: serde_json::Value = serde_json::from_str(&content)?;
 
-            if let Some(agents) = data.get("agents").and_then(|v| v.as_array()) {
-                for agent_value in agents {
-                    let agent: Agent = serde_json::from_value(agent_value.clone())?;
-                    let request = DaemonRequest::CreateAgent {
-                        agent: serde_json::to_value(agent)?,
-                    };
-                    match daemon_request(&config, request).await? {
-                        DaemonResponse::Success { message } => println!("{}", message.green()),
-                        DaemonResponse::Error { message } => eprintln!("Error: {}", message.red()),
-                        _ => {}
-                    }
-                }
+            let agents_to_import: Vec<Agent> = if let Some(arr) = data.get("agents").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
             } else if let Ok(agent) = serde_json::from_value::<Agent>(data.clone()) {
-                let request = DaemonRequest::CreateAgent {
-                    agent: serde_json::to_value(agent)?,
-                };
-                match daemon_request(&config, request).await? {
-                    DaemonResponse::Success { message } => println!("{}", message.green()),
-                    DaemonResponse::Error { message } => return Err(anyhow!("{}", message)),
-                    _ => return Err(anyhow!("Unexpected response")),
-                }
+                vec![agent]
             } else {
                 return Err(anyhow!("Invalid import format"));
+            };
+
+            let total = agents_to_import.len();
+            let mut created = 0usize;
+            let mut updated = 0usize;
+            let mut skipped = 0usize;
+
+            for agent in agents_to_import {
+                let agent_name = agent.name.clone();
+                let agent_id = agent.id.clone();
+                let agent_value = serde_json::to_value(&agent)?;
+
+                // Try create first
+                let create_req = DaemonRequest::CreateAgent { agent: agent_value.clone() };
+                match daemon_request(&config, create_req).await? {
+                    DaemonResponse::Success { .. } => {
+                        println!("{} {}", "Created:".green(), agent_name);
+                        created += 1;
+                    }
+                    DaemonResponse::Error { message } if message.contains("duplicate") || message.contains("unique") || message.contains("already") => {
+                        // Agent exists — update if --force, skip otherwise
+                        if force {
+                            // Fetch existing agent to get its ID, then update with imported data
+                            let get_req = DaemonRequest::GetAgent { id: agent_name.clone() };
+                            if let Ok(DaemonResponse::AgentDetails { agent: existing }) = daemon_request(&config, get_req).await {
+                                let existing_id = existing.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&agent_id)
+                                    .to_string();
+                                let mut merged = agent_value.clone();
+                                merged["id"] = serde_json::Value::String(existing_id.clone());
+                                let update_req = DaemonRequest::UpdateAgent {
+                                    id: existing_id,
+                                    agent: merged,
+                                };
+                                match daemon_request(&config, update_req).await? {
+                                    DaemonResponse::Success { .. } => {
+                                        println!("{} {}", "Updated:".yellow(), agent_name);
+                                        updated += 1;
+                                    }
+                                    DaemonResponse::Error { message } => {
+                                        eprintln!("{} {}: {}", "Failed:".red(), agent_name, message);
+                                        skipped += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            println!("{} {} (use --force to overwrite)", "Skipped:".yellow(), agent_name);
+                            skipped += 1;
+                        }
+                    }
+                    DaemonResponse::Error { message } => {
+                        eprintln!("{} {}: {}", "Failed:".red(), agent_name, message);
+                        skipped += 1;
+                    }
+                    _ => {}
+                }
             }
 
+            println!("\nImport complete: {} total — {} created, {} updated, {} skipped",
+                total, created, updated, skipped);
             Ok(())
         }
 
@@ -380,6 +431,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         }
 
         Commands::Tool { command } => handle_tool_command(command, &config).await,
+
+        Commands::Script { command } => handle_script_command(command, &config).await,
 
         Commands::View { command } => match command {
             ViewCommands::Executions { limit } => {
@@ -756,6 +809,7 @@ fn print_agent_details(agent: &Agent) {
     if agent.is_deep_agent() {
         table.add_row(vec!["Deep Agent", "Yes"]);
     }
+    table.add_row(vec!["Memory", if agent.memory_enabled { "Enabled" } else { "Disabled" }]);
 
     println!("{}", table);
 
@@ -1105,6 +1159,232 @@ async fn follow_tool_logs(config: &AppConfig, request: DaemonRequest) -> Result<
     }
 }
 
+async fn handle_script_command(command: ScriptCommands, config: &AppConfig) -> Result<()> {
+    match command {
+        ScriptCommands::Create { name, handler, description, schedule } => {
+            let script = ScriptDefinition::new(name, handler, description, schedule);
+            let request = DaemonRequest::CreateScript {
+                script: serde_json::to_value(script)?,
+            };
+            match daemon_request(config, request).await? {
+                DaemonResponse::Success { message } => {
+                    println!("{}", message.green());
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::Get { id } => {
+            let request = DaemonRequest::GetScript { id };
+            match daemon_request(config, request).await? {
+                DaemonResponse::ScriptDetails { script } => {
+                    let script: ScriptDefinition = serde_json::from_value(script)?;
+                    print_script_details(&script);
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::List => {
+            let request = DaemonRequest::ListScripts;
+            match daemon_request(config, request).await? {
+                DaemonResponse::ScriptList { scripts } => {
+                    let scripts: Vec<ScriptDefinition> = scripts
+                        .into_iter()
+                        .filter_map(|v| serde_json::from_value(v).ok())
+                        .collect();
+                    print_scripts_table(&scripts);
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::Update { id, name, handler, description, schedule, enabled } => {
+            let current = match daemon_request(config, DaemonRequest::GetScript { id: id.clone() }).await? {
+                DaemonResponse::ScriptDetails { script } => serde_json::from_value::<ScriptDefinition>(script)?,
+                DaemonResponse::Error { message } => return Err(anyhow!(message)),
+                _ => return Err(anyhow!("Unexpected response")),
+            };
+            let mut script = current;
+            if let Some(v) = name { script.name = v; }
+            if let Some(v) = handler { script.handler = v; }
+            if description.is_some() { script.description = description; }
+            if schedule.is_some() { script.schedule = schedule; }
+            if let Some(v) = enabled { script.enabled = v; }
+
+            let request = DaemonRequest::UpdateScript {
+                id,
+                script: serde_json::to_value(script)?,
+            };
+            match daemon_request(config, request).await? {
+                DaemonResponse::Success { message } => {
+                    println!("{}", message.green());
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::Delete { id, force } => {
+            if !force {
+                print!("Are you sure you want to delete script {}? [y/N] ", id);
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled");
+                    return Ok(());
+                }
+            }
+            let request = DaemonRequest::DeleteScript { id };
+            match daemon_request(config, request).await? {
+                DaemonResponse::Success { message } => {
+                    println!("{}", message.green());
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::Run { id, wait } => {
+            let request = DaemonRequest::RunScript { id: id.clone() };
+            match daemon_request(config, request).await? {
+                DaemonResponse::ScriptExecutionStarted { execution_id } => {
+                    println!("Script execution started: {}", execution_id.blue());
+                    if wait {
+                        wait_for_script_execution(config, &id, &execution_id).await?;
+                    }
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+
+        ScriptCommands::Logs { script_id, execution_id, lines } => {
+            let request = DaemonRequest::GetScriptLogs {
+                script_id,
+                execution_id,
+                lines,
+            };
+            match daemon_request(config, request).await? {
+                DaemonResponse::ScriptExecutionLog { lines } => {
+                    for line in lines {
+                        println!("{}", line);
+                    }
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+    }
+}
+
+fn print_script_details(script: &ScriptDefinition) {
+    let mut table = Table::new();
+    table.set_header(vec!["Property", "Value"]);
+    table.add_row(vec!["ID", &script.id]);
+    table.add_row(vec!["Name", &script.name]);
+    table.add_row(vec![
+        "Description",
+        script.description.as_deref().unwrap_or("N/A"),
+    ]);
+    table.add_row(vec!["Handler", &script.handler]);
+    table.add_row(vec![
+        "Schedule",
+        script.schedule.as_deref().unwrap_or("None"),
+    ]);
+    table.add_row(vec!["Enabled", if script.enabled { "yes" } else { "no" }]);
+    table.add_row(vec!["Run Count", &script.run_count.to_string()]);
+    table.add_row(vec![
+        "Last Run",
+        &script
+            .last_run
+            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "Never".to_string()),
+    ]);
+    table.add_row(vec!["Created", &script.created_at.to_rfc3339()]);
+    table.add_row(vec!["Updated", &script.updated_at.to_rfc3339()]);
+    println!("{}", table);
+}
+
+fn print_scripts_table(scripts: &[ScriptDefinition]) {
+    if scripts.is_empty() {
+        println!("No scripts found");
+        return;
+    }
+    let mut table = Table::new();
+    table.set_header(vec!["Name", "Schedule", "Enabled", "Runs", "Last Run", "Handler"]);
+    for script in scripts {
+        table.add_row(vec![
+            script.name.clone(),
+            script.schedule.clone().unwrap_or_else(|| "None".to_string()),
+            if script.enabled { "yes".to_string() } else { "no".to_string() },
+            script.run_count.to_string(),
+            script
+                .last_run
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "Never".to_string()),
+            script.handler.clone(),
+        ]);
+    }
+    println!("{}", table);
+}
+
+async fn wait_for_script_execution(
+    config: &AppConfig,
+    script_id: &str,
+    execution_id: &str,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(10 * 60);
+    let mut next_heartbeat = std::time::Instant::now() + Duration::from_secs(5);
+
+    loop {
+        if started.elapsed() > timeout {
+            return Err(anyhow!("Timed out waiting for script execution {}", execution_id));
+        }
+
+        let request = DaemonRequest::GetScriptLogs {
+            script_id: script_id.to_string(),
+            execution_id: Some(execution_id[..8.min(execution_id.len())].to_string()),
+            lines: 100,
+        };
+
+        match daemon_request(config, request).await? {
+            DaemonResponse::ScriptExecutionLog { lines } => {
+                let is_done = lines.iter().any(|l| {
+                    l.contains("Completed") || l.contains("Failed") || l.contains("completed") || l.contains("failed")
+                });
+                if is_done {
+                    for line in lines {
+                        println!("{}", line);
+                    }
+                    break;
+                }
+            }
+            DaemonResponse::Error { message } => return Err(anyhow!(message)),
+            _ => {}
+        }
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        if std::time::Instant::now() >= next_heartbeat {
+            println!("Script execution {} still running...", execution_id);
+            next_heartbeat = std::time::Instant::now() + Duration::from_secs(5);
+        }
+    }
+    Ok(())
+}
+
 fn scaffold_tool_handler(name: &str, handler_arg: Option<&str>) -> Result<String> {
     let path = if let Some(handler) = handler_arg {
         let script_path = handler
@@ -1113,8 +1393,11 @@ fn scaffold_tool_handler(name: &str, handler_arg: Option<&str>) -> Result<String
             .trim();
         std::path::PathBuf::from(script_path)
     } else {
-        let cwd = std::env::current_dir()?;
-        cwd.join("tools").join(format!("{}.sh", name))
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".agenta")
+            .join("tools")
+            .join(format!("{}.sh", name))
     };
 
     if let Some(parent) = path.parent() {

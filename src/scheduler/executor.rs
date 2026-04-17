@@ -29,6 +29,10 @@ impl AgentExecutor {
         self.ollama.clone()
     }
 
+    pub fn storage(&self) -> Arc<dyn Storage> {
+        self.storage.clone()
+    }
+
     pub async fn execute(&self, agent: &Agent, input: Option<String>) -> anyhow::Result<ExecutionResult> {
         let input_text = input.unwrap_or_else(|| "".to_string());
         let mut execution = ExecutionResult::new(agent.id.clone(), input_text.clone());
@@ -198,12 +202,17 @@ impl AgentExecutor {
             content: agent.system_prompt.clone(),
         }];
 
-        // Load recent completed turns for this agent.
-        // We keep a small memory window to avoid huge prompts.
-        //
+        // Load recent completed turns for this agent only if memory is enabled.
         // Important: only feed prior user inputs back into memory, not prior
-        // assistant outputs. This avoids style lock-in (e.g., old markdown/table
-        // formatting) after system prompt changes.
+        // assistant outputs. This avoids style lock-in after system prompt changes.
+        if !agent.memory_enabled {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: input.to_string(),
+            });
+            return messages;
+        }
+
         let history = self.storage.list_executions(&agent.id, 20).await;
         if let Ok(executions) = history {
             let mut prior_user_inputs: Vec<_> = executions

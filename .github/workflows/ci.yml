@@ -6,12 +6,15 @@ on:
   pull_request:
 
 jobs:
-  rust:
+  check:
+    name: Check & Test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

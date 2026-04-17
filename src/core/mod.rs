@@ -7,6 +7,7 @@ pub use agent::{
     Agent, AgentConfig, AgentEnv, AgentStatus, DeepAgentConfig, ExecutionMode,
     ExecutionResult, ExecutionStatus, ToolCall, ToolDefinition, ToolExecution,
     ToolExecutionStatus, ToolResource, TriggerType,
+    ScriptDefinition, ScriptExecution, ScriptExecutionStatus,
 };
 pub use storage::{Storage, SqliteStorage, PostgresStorage};
 pub use error::{AgentaError, Result};

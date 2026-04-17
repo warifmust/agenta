@@ -71,6 +71,10 @@ pub enum Commands {
         #[arg(long, default_value = "10")]
         deep_iterations: u32,
 
+        /// Enable memory (agent recalls past executions)
+        #[arg(long)]
+        memory: bool,
+
         /// Tool definitions (comma-separated file paths)
         #[arg(long)]
         tools: Option<String>,
@@ -137,6 +141,10 @@ pub enum Commands {
         /// New schedule
         #[arg(long)]
         schedule: Option<String>,
+
+        /// Enable or disable memory
+        #[arg(long)]
+        memory: Option<bool>,
 
         /// Tool definitions (comma-separated file paths)
         #[arg(long)]
@@ -228,6 +236,10 @@ pub enum Commands {
         /// Format (json, yaml)
         #[arg(short, long, default_value = "json")]
         format: String,
+
+        /// Overwrite existing agents with the same name
+        #[arg(short, long)]
+        force: bool,
     },
 
     /// Shell completion
@@ -240,6 +252,12 @@ pub enum Commands {
     Tool {
         #[command(subcommand)]
         command: ToolCommands,
+    },
+
+    /// Script management commands
+    Script {
+        #[command(subcommand)]
+        command: ScriptCommands,
     },
 
     /// View runtime data
@@ -344,5 +362,65 @@ pub enum ViewCommands {
         /// Maximum rows to show
         #[arg(short, long, default_value = "100")]
         limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ScriptCommands {
+    /// Create a new scheduled script
+    Create {
+        /// Script name
+        #[arg(short, long)]
+        name: String,
+        /// Path to handler script (e.g. ~/.agenta/scripts/fetch.sh)
+        #[arg(long)]
+        handler: String,
+        /// Optional description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Cron schedule expression (e.g. "0 8 * * 1")
+        #[arg(long)]
+        schedule: Option<String>,
+    },
+    /// Get script details by ID or name
+    Get {
+        id: String,
+    },
+    /// List all scripts
+    List,
+    /// Update a script
+    Update {
+        id: String,
+        #[arg(short, long)]
+        name: Option<String>,
+        #[arg(long)]
+        handler: Option<String>,
+        #[arg(short, long)]
+        description: Option<String>,
+        #[arg(long)]
+        schedule: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Delete a script
+    Delete {
+        id: String,
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Run a script manually
+    Run {
+        id: String,
+        /// Wait for completion and print output
+        #[arg(short, long)]
+        wait: bool,
+    },
+    /// View script execution logs
+    Logs {
+        script_id: String,
+        #[arg(short, long)]
+        execution_id: Option<String>,
+        #[arg(short, long, default_value = "20")]
+        lines: usize,
     },
 }

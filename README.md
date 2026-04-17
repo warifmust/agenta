@@ -14,6 +14,8 @@
 
 - Local agent management (`create`, `update`, `run`, `logs`, `list`)
 - Daemon runtime with scheduling and triggers
+- Agent memory — recall past executions as context
+- Export / import agents (with auto-backup on every daemon start)
 - Optional Postgres backend (SQLite by default)
 - Optional REST API + Swagger
 - Optional Telegram/WhatsApp webhook gateway
@@ -152,8 +154,11 @@ agenta delete      # Delete agent
 agenta run         # Run once
 agenta stop        # Stop running agent
 agenta logs        # Execution logs
+agenta export      # Export agents to JSON/YAML
+agenta import      # Import agents from file
 agenta view        # View runtime data (e.g., executions)
 agenta tool        # Tool lifecycle (create/get/list/update/delete/run/logs)
+agenta script      # Script lifecycle (create/get/list/update/delete/run/logs)
 agenta daemon      # start/stop/status/restart daemon
 ```
 
@@ -189,6 +194,37 @@ agenta update travel-guide --mode scheduled --schedule "0 10 * * *"
 agenta update travel-guide --mode once --schedule ""
 ```
 
+### Enable Agent Memory
+
+Agents with memory enabled inject their last 6 past inputs as context on every run — useful for chat-style or recurring task agents.
+
+```bash
+# Enable memory on create
+agenta create --name "my-agent" --model "qwen3:latest" --prompt "..." --memory
+
+# Enable/disable on existing agent
+agenta update my-agent --memory true
+agenta update my-agent --memory false
+```
+
+### Export / Import Agents
+
+```bash
+# Export all agents
+agenta export all -o ~/.agenta/exports/backup.json
+
+# Export a single agent
+agenta export my-agent -o my-agent.json
+
+# Import (skip duplicates)
+agenta import -i backup.json
+
+# Import and overwrite existing agents
+agenta import -i backup.json --force
+```
+
+> **Auto-backup:** Every time the daemon starts, it automatically exports all agents to `~/.agenta/exports/backup_YYYYMMDD_HHMMSS.json` and keeps the last 14 backups.
+
 ### Attach Tools
 
 ```bash
@@ -197,7 +233,16 @@ agenta update travel-guide --tools tools/echo.json,tools/another.yaml
 
 ### Manage First-Class Tools
 
-Create tool:
+Create tool (script scaffolded to `~/.agenta/tools/<name>.sh`):
+
+```bash
+agenta tool create \
+  --name web-fetch \
+  --description "Fetch web content via custom script" \
+  --parameters '{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}'
+```
+
+Provide a custom handler instead of scaffolding:
 
 ```bash
 agenta tool create \
@@ -206,8 +251,6 @@ agenta tool create \
   --parameters '{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}' \
   --handler "/Users/you/bin/web_fetch_tool"
 ```
-
-If you omit `--handler`, `agenta` auto-creates `./tools/<name>.sh` and uses it as the handler.
 
 Scaffold starter script automatically:
 

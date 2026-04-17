@@ -91,6 +91,83 @@ impl ToolExecution {
     }
 }
 
+/// Standalone script managed by CLI/daemon (no LLM involved)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScriptDefinition {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub handler: String,
+    pub schedule: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_run: Option<DateTime<Utc>>,
+    pub run_count: u64,
+}
+
+impl ScriptDefinition {
+    pub fn new(name: String, handler: String, description: Option<String>, schedule: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            handler,
+            description,
+            schedule,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            last_run: None,
+            run_count: 0,
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptExecutionStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ScriptExecution {
+    pub id: String,
+    pub script_id: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub output: Option<String>,
+    pub stderr: Option<String>,
+    pub status: ScriptExecutionStatus,
+    pub error: Option<String>,
+    pub triggered_by: String,
+}
+
+impl ScriptExecution {
+    pub fn new(script_id: String, triggered_by: &str) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            script_id,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_code: None,
+            output: None,
+            stderr: None,
+            status: ScriptExecutionStatus::Pending,
+            error: None,
+            triggered_by: triggered_by.to_string(),
+        }
+    }
+}
+
 /// Execution mode for the agent
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +298,8 @@ pub struct Agent {
     pub schedule: Option<String>, // cron expression
     pub deep_agent_config: Option<DeepAgentConfig>,
     pub environment: Vec<AgentEnv>,
+    #[serde(default)]
+    pub memory_enabled: bool,
     pub status: AgentStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -244,6 +323,7 @@ impl Agent {
             schedule: None,
             deep_agent_config: None,
             environment: vec![],
+            memory_enabled: false,
             status: AgentStatus::Draft,
             created_at: now,
             updated_at: now,

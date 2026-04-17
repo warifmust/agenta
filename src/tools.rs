@@ -10,6 +10,18 @@ pub struct ToolInvocation {
     pub parameters: serde_json::Value,
 }
 
+/// Expand a leading `~` to the real home directory.
+/// Needed because we invoke handlers directly without a shell, so `~` is not
+/// expanded by the OS.
+fn expand_tilde(s: &str) -> String {
+    if s.starts_with("~/") || s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &s[1..]);
+        }
+    }
+    s.to_string()
+}
+
 pub async fn run_tool(
     agent: &Agent,
     tool_name: &str,
@@ -26,14 +38,15 @@ pub async fn run_tool(
         .as_ref()
         .ok_or_else(|| anyhow!("Tool has no handler: {}", tool_name))?;
 
-    let mut parts = handler.split_whitespace();
+    let expanded = expand_tilde(handler);
+    let mut parts = expanded.split_whitespace();
     let program = parts
         .next()
         .ok_or_else(|| anyhow!("Invalid tool handler: {}", handler))?;
-    let args: Vec<&str> = parts.collect();
+    let args: Vec<String> = parts.map(|a| expand_tilde(a)).collect();
 
     let mut child = Command::new(program)
-        .args(args)
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

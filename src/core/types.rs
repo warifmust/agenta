@@ -17,6 +17,10 @@ pub enum DaemonResponse {
     ToolExecutionStarted { execution_id: String },
     ToolExecutionResult { result: serde_json::Value },
     ToolExecutionLog { lines: Vec<String> },
+    ScriptList { scripts: Vec<serde_json::Value> },
+    ScriptDetails { script: serde_json::Value },
+    ScriptExecutionStarted { execution_id: String },
+    ScriptExecutionLog { lines: Vec<String> },
     Status { running: bool, pid: Option<u32>, version: String },
 }
 
@@ -42,6 +46,13 @@ pub enum DaemonRequest {
     RunTool { id: String, input: serde_json::Value },
     GetToolExecution { id: String },
     GetToolLogs { tool_id: String, execution_id: Option<String>, lines: usize },
+    CreateScript { script: serde_json::Value },
+    UpdateScript { id: String, script: serde_json::Value },
+    DeleteScript { id: String },
+    GetScript { id: String },
+    ListScripts,
+    RunScript { id: String },
+    GetScriptLogs { script_id: String, execution_id: Option<String>, lines: usize },
     Ping,
     Shutdown,
 }
@@ -63,6 +74,7 @@ pub enum TriggerEvent {
     HttpRequest { agent_id: String, method: String, path: String, body: Option<String> },
     CommandOutput { agent_id: String, command: String, output: String, matched: bool },
     Scheduled { agent_id: String, cron: String },
+    ScriptScheduled { script_id: String, cron: String },
     Manual { input: String },
 }
 
