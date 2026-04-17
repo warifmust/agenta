@@ -18,13 +18,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
           - target: x86_64-apple-darwin
             os: macos-13
+            use_cross: false
           - target: aarch64-apple-darwin
             os: macos-14
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -44,15 +47,17 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cross
-        if: ${{ matrix.use_cross }}
-        uses: taiki-e/install-action@cross
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build (native)
-        if: ${{ !matrix.use_cross }}
+        if: matrix.use_cross == false
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
-        if: ${{ matrix.use_cross }}
+        if: matrix.use_cross == true
         run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package
