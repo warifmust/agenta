@@ -29,8 +29,8 @@ toml = "0.8"
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "chrono"] }
 
-# HTTP client for Ollama
-reqwest = { version = "0.11", features = ["json", "multipart"] }
+# HTTP client for Ollama (rustls = no OpenSSL dependency, works on all cross targets)
+reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
 # Scheduling
 tokio-cron-scheduler = "0.10"
@@ -40,7 +40,7 @@ cron = "0.12"
 tokio-serde = { version = "0.8", features = ["json", "bincode"] }
 tokio-stream = "0.1"
 
-# File watching for triggers
+# File watching for triggers (backend selected per platform via cfg)
 notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
 notify-debouncer-full = "0.3"
 
