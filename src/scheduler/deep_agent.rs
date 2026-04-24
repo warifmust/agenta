@@ -4,12 +4,12 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::core::{
-    Agent, DeepAgentConfig, ExecutionResult, Storage, ToolCall,
+    Agent, DeepAgentConfig, ExecutionMode, ExecutionResult, Storage, ToolCall,
 };
 use crate::ollama::client::{ChatMessage, ChatRequest, OllamaClient};
 use crate::ollama::models::ModelParameters;
 use crate::scheduler::executor::AgentExecutor;
-use crate::tools::run_tool;
+use crate::tools::{builtin_tool_descriptions, is_builtin_tool, run_tool};
 
 /// Deep agent executor for multi-step reasoning
 pub struct DeepAgentExecutor {
@@ -168,11 +168,15 @@ impl DeepAgentExecutor {
     ) -> anyhow::Result<String> {
         let params = ModelParameters::from_agent_config(&agent.config);
 
-        let tool_descriptions: Vec<String> = agent
+        // User-defined tools + built-in tools
+        let mut tool_descriptions: Vec<String> = agent
             .tools
             .iter()
             .map(|t| format!("- {}: {}", t.name, t.description))
             .collect();
+        for (name, desc) in builtin_tool_descriptions() {
+            tool_descriptions.push(format!("- {} (built-in): {}", name, desc));
+        }
 
         // Build memory block from past executions if memory is enabled
         let memory_block = if agent.memory_enabled {
@@ -278,6 +282,11 @@ impl DeepAgentExecutor {
                 let tool_name = parsed.get("tool")?.as_str()?.to_string();
                 let parameters = parsed.get("parameters")?.clone();
 
+                // Check built-in tools first
+                if is_builtin_tool(&tool_name) {
+                    return self.run_builtin_tool(agent, &tool_name, &parameters).await;
+                }
+
                 match run_tool(agent, &tool_name, parameters).await {
                     Ok(output) => return Some(output),
                     Err(err) => return Some(format!("Tool error: {}", err)),
@@ -285,5 +294,60 @@ impl DeepAgentExecutor {
             }
         }
         None
+    }
+
+    async fn run_builtin_tool(
+        &self,
+        parent: &Agent,
+        tool_name: &str,
+        parameters: &serde_json::Value,
+    ) -> Option<String> {
+        match tool_name {
+            "spawn_agent" => self.spawn_subagent(parent, parameters).await,
+            _ => Some(format!("Unknown built-in tool: {}", tool_name)),
+        }
+    }
+
+    /// Spawn an ephemeral sub-agent, run it synchronously, return its output.
+    /// The sub-agent is never persisted — it exists only for the duration of this call.
+    async fn spawn_subagent(
+        &self,
+        parent: &Agent,
+        parameters: &serde_json::Value,
+    ) -> Option<String> {
+        let role = parameters.get("role")?.as_str()?.to_string();
+        let input = parameters
+            .get("input")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let model = parameters
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&parent.model)
+            .to_string();
+
+        info!(
+            "Spawning ephemeral sub-agent (model: {}) for parent: {}",
+            model, parent.name
+        );
+
+        // Build ephemeral agent — never saved to DB
+        let mut sub_agent = Agent::new(
+            format!("sub-{}", uuid::Uuid::new_v4()),
+            model,
+            role,
+        );
+        sub_agent.execution_mode = ExecutionMode::Once;
+
+        // Reuse existing executor — ephemeral, no DB writes
+        let executor = AgentExecutor::new(self.storage.clone(), self.ollama.clone());
+        match executor.execute_ephemeral(&sub_agent, Some(input)).await {
+            Ok(output) => {
+                info!("Sub-agent completed for parent: {}", parent.name);
+                Some(output)
+            }
+            Err(e) => Some(format!("Sub-agent failed: {}", e)),
+        }
     }
 }

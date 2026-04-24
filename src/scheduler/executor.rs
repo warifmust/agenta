@@ -12,7 +12,7 @@ use crate::ollama::{
     client::{ChatMessage, ChatRequest, GenerateRequest, OllamaClient},
     models::ModelParameters,
 };
-use crate::tools::{run_tool, ToolInvocation};
+use crate::tools::{is_builtin_tool, run_tool, ToolInvocation};
 
 #[derive(Clone)]
 pub struct AgentExecutor {
@@ -38,6 +38,19 @@ impl AgentExecutor {
         let mut execution = ExecutionResult::new(agent.id.clone(), input_text.clone());
         self.execute_with_execution(agent, input_text, &mut execution).await?;
         Ok(execution)
+    }
+
+    /// Run an ephemeral sub-agent — no DB writes, no status updates, no tool use.
+    /// Deliberately uses execute_single to break any recursive spawn chain.
+    /// Sub-agents are kept simple: one LLM call, one result.
+    pub async fn execute_ephemeral(
+        &self,
+        agent: &Agent,
+        input: Option<String>,
+    ) -> anyhow::Result<String> {
+        let input_text = input.unwrap_or_default();
+        let mut dummy = ExecutionResult::new(agent.id.clone(), input_text.clone());
+        self.execute_single(agent, &input_text, &mut dummy).await
     }
 
     pub async fn execute_with_id(
@@ -70,7 +83,8 @@ impl AgentExecutor {
         self.storage.update_agent(&updated_agent).await?;
 
         // Bound execution time so runs do not stay "running" forever.
-        let execution_timeout = Duration::from_secs(180);
+        // Deep agents with sub-agent spawning need more time — use 600s (10 min).
+        let execution_timeout = Duration::from_secs(600);
         let run_result = tokio::time::timeout(
             execution_timeout,
             self.run_execution(agent, &input_text, execution),
@@ -382,9 +396,52 @@ impl AgentExecutor {
         available_tools: &[ToolDefinition],
         tool: &ToolInvocation,
     ) -> anyhow::Result<String> {
+        // Built-in tools are handled by the daemon directly
+        if is_builtin_tool(&tool.name) {
+            return self.run_builtin_tool(agent, &tool.name, &tool.parameters).await;
+        }
+
         let mut runtime_agent = agent.clone();
         runtime_agent.tools = available_tools.to_vec();
         run_tool(&runtime_agent, &tool.name, tool.parameters.clone()).await
+    }
+
+    async fn run_builtin_tool(
+        &self,
+        parent: &Agent,
+        tool_name: &str,
+        parameters: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        match tool_name {
+            "spawn_agent" => {
+                let role = parameters
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("spawn_agent: missing 'role' parameter"))?
+                    .to_string();
+                let input = parameters
+                    .get("input")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let model = parameters
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&parent.model)
+                    .to_string();
+
+                let mut sub_agent = crate::core::Agent::new(
+                    format!("sub-{}", uuid::Uuid::new_v4()),
+                    model,
+                    role,
+                );
+                sub_agent.execution_mode = ExecutionMode::Once;
+
+                let output = self.execute_ephemeral(&sub_agent, Some(input)).await?;
+                Ok(output)
+            }
+            _ => Err(anyhow::anyhow!("Unknown built-in tool: {}", tool_name)),
+        }
     }
 
     async fn resolve_available_tools(&self, agent: &Agent) -> anyhow::Result<Vec<ToolDefinition>> {

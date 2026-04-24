@@ -10,6 +10,26 @@ pub struct ToolInvocation {
     pub parameters: serde_json::Value,
 }
 
+/// Names of tools handled natively by the daemon — no bash script needed.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["spawn_agent"];
+
+pub fn is_builtin_tool(name: &str) -> bool {
+    BUILTIN_TOOL_NAMES.contains(&name)
+}
+
+/// Descriptions injected into deep agent prompts so the LLM knows built-in tools exist.
+pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
+    vec![(
+        "spawn_agent",
+        "Spawn a temporary sub-agent to handle a specific sub-task. \
+         The sub-agent runs synchronously and returns its result. \
+         Use this when a task is too large or specialised to handle alone. \
+         Parameters: {\"role\": \"<system prompt for sub-agent>\", \
+         \"input\": \"<task to give the sub-agent>\", \
+         \"model\": \"<optional — defaults to your model>\"}",
+    )]
+}
+
 /// Expand a leading `~` to the real home directory.
 /// Needed because we invoke handlers directly without a shell, so `~` is not
 /// expanded by the OS.
