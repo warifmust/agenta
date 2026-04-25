@@ -288,6 +288,28 @@ impl DaemonState {
             .await
     }
 
+    /// Same as `run_agent_sync_execution` but attaches a progress channel.
+    /// Progress messages (e.g. sub-agent notifications) are sent through `progress_tx`
+    /// while the execution is running.
+    pub async fn run_agent_sync_execution_with_progress(
+        &self,
+        id: &str,
+        input: String,
+        progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<ExecutionResult> {
+        let agent = self
+            .get_agent(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+
+        let execution_id = uuid::Uuid::new_v4().to_string();
+        self.executor
+            .clone()
+            .with_progress(progress_tx)
+            .execute_with_id(&agent, Some(input), execution_id)
+            .await
+    }
+
     pub async fn stop_agent(
         &self,
         id: &str,

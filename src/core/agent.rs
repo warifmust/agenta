@@ -223,6 +223,11 @@ pub struct DeepAgentConfig {
     pub stop_conditions: Vec<String>,
     /// Whether to allow agent to spawn sub-agents
     pub allow_sub_agents: bool,
+    /// Custom notification message when a sub-agent is spawned.
+    /// Supports `{task}` placeholder. Defaults to a generic message if not set.
+    /// Example: "🪸 Deploying REEF sub-agent: {task}"
+    #[serde(default)]
+    pub subagent_spawn_message: Option<String>,
 }
 
 impl Default for DeepAgentConfig {
@@ -233,6 +238,7 @@ impl Default for DeepAgentConfig {
             available_tools: vec![],
             stop_conditions: vec!["task_complete".to_string()],
             allow_sub_agents: false,
+            subagent_spawn_message: None,
         }
     }
 }

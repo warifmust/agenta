@@ -149,6 +149,12 @@ pub enum Commands {
         /// Tool definitions (comma-separated file paths)
         #[arg(long)]
         tools: Option<String>,
+
+        /// Custom sub-agent spawn notification message (deep agents only).
+        /// Use {task} as a placeholder for the task description.
+        /// Example: "🪸 Deploying REEF sub-agent: {task}"
+        #[arg(long)]
+        spawn_message: Option<String>,
     },
 
     /// Delete an agent

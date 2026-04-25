@@ -17,6 +17,8 @@ pub struct DeepAgentExecutor {
     storage: Arc<dyn Storage>,
     max_iterations: u32,
     stop_patterns: Vec<Regex>,
+    /// Optional channel for emitting progress messages (e.g. Telegram notifications)
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl DeepAgentExecutor {
@@ -32,7 +34,15 @@ impl DeepAgentExecutor {
             storage: base.storage(),
             max_iterations: config.max_iterations,
             stop_patterns: stop_patterns?,
+            progress_tx: base.progress_tx.clone(),
         })
+    }
+
+    /// Send a progress notification if a channel is attached.
+    fn notify(&self, msg: impl Into<String>) {
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.send(msg.into());
+        }
     }
 
     pub async fn execute_deep(
@@ -326,6 +336,25 @@ impl DeepAgentExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or(&parent.model)
             .to_string();
+
+        // Build a human-readable task label from the input (first ~80 chars)
+        let task_preview = {
+            let trimmed = input.trim();
+            if trimmed.len() > 80 {
+                format!("{}…", &trimmed[..80])
+            } else {
+                trimmed.to_string()
+            }
+        };
+
+        // Use custom spawn message if configured, otherwise fall back to generic default
+        let spawn_msg = parent
+            .deep_agent_config
+            .as_ref()
+            .and_then(|c| c.subagent_spawn_message.as_deref())
+            .unwrap_or("⚙️ Spawning sub-agent: {task}")
+            .replace("{task}", &task_preview);
+        self.notify(spawn_msg);
 
         info!(
             "Spawning ephemeral sub-agent (model: {}) for parent: {}",

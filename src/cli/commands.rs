@@ -98,6 +98,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                     available_tools: agent.tools.iter().map(|t| t.name.clone()).collect(),
                     stop_conditions: vec!["task_complete".to_string()],
                     allow_sub_agents: false,
+                    subagent_spawn_message: None,
                 });
             }
 
@@ -158,6 +159,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             schedule: new_schedule,
             memory: new_memory,
             tools: new_tools,
+            spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
             let agent_response = daemon_request(&config, get_request).await?;
@@ -201,6 +203,11 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 agent.tools = read_tool_definitions(&tools_arg)?;
                 if let Some(config) = agent.deep_agent_config.as_mut() {
                     config.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+                }
+            }
+            if let Some(msg) = new_spawn_message {
+                if let Some(config) = agent.deep_agent_config.as_mut() {
+                    config.subagent_spawn_message = if msg.is_empty() { None } else { Some(msg) };
                 }
             }
 
@@ -479,6 +486,7 @@ async fn create_interactive(config: AppConfig) -> Result<()> {
             available_tools: vec![],
             stop_conditions: vec!["task_complete".to_string()],
             allow_sub_agents: false,
+            subagent_spawn_message: None,
         });
     }
 

@@ -25,6 +25,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting agenta daemon...");
 
+    // Load ~/.agenta/.env into process environment (if present)
+    load_agenta_env();
+
     // Load configuration
     let config = AppConfig::load()?;
     config.ensure_dirs()?;
@@ -62,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Optional Telegram/WhatsApp chat bridge
+    // Optional Telegram chat gateway (long polling)
     if let Err(e) = start_chat_gateway(state.clone(), &config).await {
         error!("Chat gateway startup failed: {}", e);
     }
@@ -142,6 +145,38 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Daemon stopped");
     Ok(())
+}
+
+/// Load ~/.agenta/.env into the current process environment.
+/// Lines are expected to be KEY=VALUE (comments and blanks are skipped).
+fn load_agenta_env() {
+    let env_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".agenta")
+        .join(".env");
+
+    let Ok(content) = std::fs::read_to_string(&env_path) else {
+        return; // .env absent — that's fine
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        // Skip blank lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !key.is_empty() {
+                // Don't override values already set in the real environment
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, val);
+                }
+            }
+        }
+    }
+    info!("Loaded env from {:?}", env_path);
 }
 
 /// On every daemon startup, export all agents to a timestamped JSON file.

@@ -78,6 +78,18 @@ pub enum TriggerEvent {
     Manual { input: String },
 }
 
+/// A single Telegram bot entry for multi-bot polling support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramBotConfig {
+    /// Bot token (or env var name like "$CORAL_BOT_TOKEN")
+    pub token: String,
+    /// Which agent handles messages from this bot
+    pub default_agent: String,
+    /// Friendly label shown in logs
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Configuration for the agenta application
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -90,12 +102,14 @@ pub struct AppConfig {
     pub default_model: String,
     #[serde(default = "default_chat_gateway_port")]
     pub chat_gateway_port: u16,
+    /// Legacy single-bot config (still supported for backward compat)
     #[serde(default)]
     pub telegram_bot_token: Option<String>,
     #[serde(default)]
     pub telegram_default_agent: Option<String>,
+    /// Multi-bot config — each entry gets its own polling loop
     #[serde(default)]
-    pub whatsapp_default_agent: Option<String>,
+    pub telegram_bots: Vec<TelegramBotConfig>,
     #[serde(default = "default_api_port")]
     pub api_port: u16,
     #[serde(default)]
@@ -126,7 +140,7 @@ impl Default for AppConfig {
             chat_gateway_port: 8790,
             telegram_bot_token: None,
             telegram_default_agent: None,
-            whatsapp_default_agent: None,
+            telegram_bots: Vec::new(),
             api_port: 8789,
             api_token: None,
         }

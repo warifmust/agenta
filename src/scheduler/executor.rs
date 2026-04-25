@@ -18,11 +18,19 @@ use crate::tools::{is_builtin_tool, run_tool, ToolInvocation};
 pub struct AgentExecutor {
     storage: Arc<dyn Storage>,
     ollama: OllamaClient,
+    /// Optional channel for streaming progress messages (e.g. sub-agent notifications)
+    pub progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AgentExecutor {
     pub fn new(storage: Arc<dyn Storage>, ollama: OllamaClient) -> Self {
-        Self { storage, ollama }
+        Self { storage, ollama, progress_tx: None }
+    }
+
+    /// Attach a progress sender. Returns a new executor with the channel set.
+    pub fn with_progress(mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        self.progress_tx = Some(tx);
+        self
     }
 
     pub fn ollama_client(&self) -> OllamaClient {
