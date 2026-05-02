@@ -51,11 +51,11 @@ jobs:
 
       - name: Build (native)
         if: matrix.use_cross == false
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross == true
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
