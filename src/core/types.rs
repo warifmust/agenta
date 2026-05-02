@@ -149,9 +149,10 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
-        let config_dir = dirs::config_dir()
-            .map(|d| d.join("agenta"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".agenta"));
+        // Use ~/.config/agenta on all platforms (XDG convention, consistent for CLI tools)
+        let config_dir = dirs::home_dir()
+            .map(|d| d.join(".config").join("agenta"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".config/agenta"));
 
         let config_file = config_dir.join("config.toml");
 

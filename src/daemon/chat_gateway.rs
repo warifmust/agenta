@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use agenta::core::{AppConfig, TelegramBotConfig};
+use agenta::core::{AppConfig, ExecutionStatus, TelegramBotConfig};
 
 use super::state::DaemonState;
 
@@ -139,11 +140,40 @@ async fn poll_telegram_bot(
                     }
                 });
 
+                // Show "typing..." indicator while agent is processing
+                let typing_cancel = CancellationToken::new();
+                let h_typing = h.clone();
+                let bu_typing = bu.clone();
+                let lbl_typing = lbl.clone();
+                let cancel_clone = typing_cancel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let _ = h_typing
+                            .post(&format!("{}/sendChatAction", bu_typing))
+                            .json(&serde_json::json!({
+                                "chat_id": chat_id,
+                                "action": "typing"
+                            }))
+                            .send()
+                            .await;
+                        tokio::select! {
+                            _ = cancel_clone.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(4)) => {}
+                        }
+                    }
+                    info!("[{}] Typing indicator stopped for chat {}", lbl_typing, chat_id);
+                });
+
                 let reply = match d
                     .run_agent_sync_execution_with_progress(&agent, input, progress_tx)
                     .await
                 {
                     Ok(execution) => {
+                        // Skip silently if execution was cancelled
+                        if execution.status == ExecutionStatus::Cancelled {
+                            typing_cancel.cancel();
+                            return;
+                        }
                         let raw = execution.output.as_deref().unwrap_or("").to_string();
                         if raw.trim().is_empty() || raw.trim_start().starts_with("TOOL_CALL:") {
                             "Sorry, I couldn't generate a response. Please try again.".to_string()
@@ -153,6 +183,9 @@ async fn poll_telegram_bot(
                     }
                     Err(e) => format!("Agent error: {}", e),
                 };
+
+                // Stop typing indicator before sending reply
+                typing_cancel.cancel();
 
                 if let Err(e) = send_telegram_message(&h, &bu, chat_id, &reply).await {
                     warn!("[{}] Failed sending reply to chat {}: {}", lbl, chat_id, e);
@@ -279,7 +312,6 @@ fn resolve_agent_and_input(text: &str, default_agent: Option<&str>) -> (String, 
 fn sanitize_for_chat(input: &str) -> String {
     let mut out = input.replace('\r', "");
     out = out.replace("**", "");
-    out = out.replace("```", "");
     out = out.replace("__", "");
     out = out.replace("### ", "");
     out = out.replace("## ", "");

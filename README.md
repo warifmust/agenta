@@ -1,150 +1,135 @@
 <p align="center">
-  <img src="assets/agenta-logo.svg" width="220" alt="Agenta Logo">
+  <img src="assets/agenta-logo.png" width="240" alt="Agenta Logo">
 </p>
 
 <h1 align="center">Agenta</h1>
 
 <p align="center">
-  <strong>Local-first AI agent platform.</strong> Build, run, schedule, and operate autonomous agents from one CLI + daemon with triggers, tools, deep agents, sub-agent spawning, REST API, and Telegram integration. Built with <strong>Rust</strong>.
+  <strong>You're the puppet master(Dalang). Your agents(Wayang) do the work.</strong>
+</p>
+
+<p align="center">
+  Local-first. Self-hosted. Schedule, chain, and run a full autonomous agent pipeline — tools, deep reasoning, sub-agent spawning, Telegram integration, REST API. No cloud. No lock-in. Just control. Powered by <strong>Rust</strong>.
 </p>
 
 ---
 
-## What You Get
+## ✨ What You Get
 
-- Local agent management (`create`, `update`, `run`, `logs`, `list`)
-- Daemon runtime with scheduling and triggers
-- **Deep agents** — multi-step reasoning with iterative tool use
-- **Sub-agent spawning** — deep agents can deploy ephemeral sub-agents at runtime
-- Agent memory — recall past executions as context
-- Export / import agents (with auto-backup on every daemon start)
-- Optional Postgres backend (SQLite by default)
-- Optional REST API + Swagger
-- **Multi-bot Telegram long-polling gateway** (one bot per agent, no webhook/tunnel needed)
+- 🤖 **Agent management** — `create`, `update`, `run`, `logs`, `list` from the CLI
+- ⏰ **Scheduling** — cron-based scheduling baked into the daemon
+- 🧠 **Deep agents** — multi-step reasoning with iterative tool use
+- 🪄 **Sub-agent spawning** — agents can spin up other agents at runtime
+- 💬 **Telegram integration** — multiple bots, one daemon, no webhook or tunnel needed
+- 🧵 **Agent memory** — inject past outputs as context on every run
+- 📦 **Export / import** — backup agents as JSON/YAML, auto-backup on every daemon start
+- 🗄️ **SQLite by default**, Postgres optional
+- 🌐 **REST API + Swagger UI** — built-in, no extra setup
+- 🏠 **Fully self-hosted** — runs on your laptop, a cheap VPS, or a Raspberry Pi
 
 ---
 
-## First-Time Setup (Recommended Path)
+## 🚀 First-Time Setup
 
 ### 1. Prerequisites
 
-- Ollama installed and running at `http://localhost:11434`
-- At least one model pulled (example below)
+- [Ollama](https://ollama.com) installed and running
+- At least one model pulled
 
 ```bash
-ollama pull qwen3:latest
+ollama pull gemma4:e4b # or any model from ollama
 ollama ps
 ```
 
 ### 2. Install Agenta
 
-Option A: From source (current repo)
-
-```bash
-cargo install --path . --force
-```
-
-Option B: Install directly from GitHub raw
+**From GitHub (recommended):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | bash
 ```
 
-Local installer script in this repo:
+**From source:**
 
 ```bash
-./install.sh
+cargo install --path . --force
 ```
 
-Installer env vars (optional):
+**Custom install options:**
 
 ```bash
-AGENTA_REPO="arifmustaffa/agenta"   # GitHub repo owner/name
+AGENTA_REPO="warifmust/agenta"      # GitHub repo
 AGENTA_VERSION="latest"             # release tag or "latest"
 AGENTA_INSTALL_DIR="$HOME/.local/bin"
 ./install.sh
 ```
 
-### 3. Verify CLI
+### 3. Verify
 
 ```bash
 agenta --help
 agenta daemon --help
 ```
 
-### 4. Configure Agenta
+### 4. Configure
 
-Agenta config path:
+Config lives at `~/.config/agenta/config.toml` on all platforms.
 
-- macOS: `~/Library/Application Support/agenta/config.toml`
-- Linux: `~/.config/agenta/config.toml`
+> **Migrating from an older install?** Your config may be at `~/Library/Application Support/agenta/config.toml` on macOS. Move it to `~/.config/agenta/config.toml` and restart the daemon.
 
-Minimal config example:
+Minimal config:
 
 ```toml
 ollama_url = "http://localhost:11434"
-default_model = "qwen3:latest"
+default_model = "gemma4:e4b"
 ```
 
-All supported `config.toml` keys:
+Full config reference:
 
 ```toml
 # Core
 ollama_url = "http://localhost:11434"
-default_model = "qwen3:latest"
+default_model = "gemma4:e4b"
 log_level = "info"
 
 # Storage
-# SQLite path (used when database_url is not set)
-database_path = "/Users/<you>/.agenta/agenta.db"
-# Optional Postgres DSN (takes precedence over database_path)
-database_url = "postgres://postgres:<password>@localhost:5432/postgres"
+database_path = "/Users/<you>/.agenta/agenta.db"   # SQLite (default)
+database_url  = "postgres://user:pass@localhost/db" # Postgres (overrides SQLite)
 
 # Daemon IPC socket
 socket_path = "/Users/<you>/.agenta/agenta.sock"
 
-# Legacy single Telegram bot (still supported)
-telegram_bot_token = "<telegram-bot-token>"
-telegram_default_agent = "travel-guide"
-
-# Multi-bot Telegram polling (one entry per bot)
+# Telegram — multiple bots supported
 [[telegram_bots]]
 name = "my-bot"
-token = "$MY_BOT_TOKEN"          # reads from ~/.agenta/.env
-default_agent = "travel-guide"
+token = "$MY_BOT_TOKEN"       # resolved from ~/.agenta/.env
+default_agent = "my-agent"
 
 # REST API
-api_port = 8789
+api_port  = 8789
 api_token = "replace-with-a-strong-token"
 ```
 
-Notes:
-- If `database_url` is set, Agenta uses Postgres.
-- If `database_url` is not set, Agenta uses SQLite at `database_path`.
-- `telegram_*` fields are optional — only needed for Telegram chat integration.
-- `api_token` is optional; if set, API endpoints require auth.
+### 5. Secrets
 
-### 5. Environment Variables
-
-Secrets (API keys, bot tokens) go in `~/.agenta/.env`. The daemon loads this file automatically on startup:
+Secrets go in `~/.agenta/.env` — the daemon loads this automatically:
 
 ```bash
 # ~/.agenta/.env
-TELEGRAM_BOT_TOKEN=<token>
-TELEGRAM_CHAT_ID=<chat-id>
-TAVILY_API_KEY=<key>
-MY_CUSTOM_BOT_TOKEN=<token>
+MY_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+TAVILY_API_KEY=your-tavily-key
 ```
 
-In `config.toml`, reference env vars with a `$` prefix:
+Reference them in `config.toml` with a `$` prefix:
 
 ```toml
 [[telegram_bots]]
-token = "$MY_CUSTOM_BOT_TOKEN"
+token = "$MY_BOT_TOKEN"
 default_agent = "my-agent"
 ```
 
-### 6. Start Daemon
+### 6. Start the Daemon
 
 ```bash
 agenta daemon start
@@ -153,197 +138,179 @@ agenta daemon status
 
 ### 7. Create Your First Agent
 
+Let's build a **morning briefing agent** that summarises the day ahead:
+
 ```bash
 agenta create \
-  --name "travel-guide" \
-  --model "qwen3:latest" \
-  --prompt "You are a practical travel assistant. Plain text only."
+  --name "morning-brief" \
+  --model "gemma4:e4b" \
+  --prompt "You are a sharp, concise personal assistant. Given a topic or question, respond with clear, useful insights. No filler, no fluff."
 ```
 
 ### 8. Run It
 
 ```bash
-agenta run travel-guide --input "Plan a 2D1N trip to Bangkok" --wait
-agenta logs travel-guide --lines 50
+agenta run morning-brief --input "What should I know about AI news this week?" --wait
+agenta logs morning-brief --lines 50
 ```
 
 ---
 
-## Core Commands
+## ⌨️ Core Commands
 
 ```bash
-agenta create      # Create agent
+agenta create      # Create an agent
 agenta get         # Show agent details
-agenta list        # List agents
+agenta list        # List all agents
 agenta update      # Update agent config
-agenta delete      # Delete agent
-agenta run         # Run once
-agenta stop        # Stop running agent
-agenta logs        # Execution logs
+agenta delete      # Delete an agent
+agenta run         # Run an agent once
+agenta stop        # Stop a running agent
+agenta logs        # View execution logs
 agenta export      # Export agents to JSON/YAML
 agenta import      # Import agents from file
-agenta view        # View runtime data (e.g., executions)
-agenta tool        # Tool lifecycle (create/get/list/update/delete/run/logs)
-agenta script      # Script lifecycle (create/get/list/update/delete/run/logs)
-agenta daemon      # start/stop/status/restart daemon
+agenta view        # View runtime data (executions, etc.)
+agenta tool        # Manage tools (create/get/list/update/delete/run/logs)
+agenta script      # Manage scripts (create/get/list/update/delete/run/logs)
+agenta daemon      # start / stop / status / restart daemon
 ```
 
 ---
 
-## Common Workflows
+## ⚡ Common Workflows
 
-### Update Prompt / Model
+### Update Prompt or Model
 
 ```bash
-agenta update travel-guide --prompt "New system prompt"
-agenta update travel-guide --model "qwen3:latest"
+agenta update morning-brief --prompt "You are a concise assistant. Bullet points only."
+agenta update morning-brief --model "gemma4:e4b"
 ```
 
-### Tune Model Parameters
+### Tune Parameters
 
 ```bash
-agenta update travel-guide --temperature 0.5
-agenta update travel-guide --max-tokens 8192
+agenta update morning-brief --temperature 0.3
+agenta update morning-brief --max-tokens 8192
 ```
 
-> **Tip:** Models with extended thinking (e.g. `qwen3`) may run silently for a long time with the default token limit. Increase `--max-tokens` (e.g. `8192`) if your agent hangs without producing output.
+> **Heads up:** Models with extended thinking (e.g. `qwen3`) can run silently for a while at low token limits. If your agent hangs without output, bump `--max-tokens` to `8192` or higher.
 
-### Schedule Daily Run (10:00)
+### Schedule a Daily Run
 
 ```bash
-agenta update travel-guide --mode scheduled --schedule "0 10 * * *"
+# Every morning at 8:00 AM
+agenta update morning-brief --mode scheduled --schedule "0 8 * * *"
 ```
 
-### Switch Back to Manual Only
+### Back to Manual Only
 
 ```bash
-agenta update travel-guide --mode once --schedule ""
+agenta update morning-brief --mode once --schedule ""
 ```
 
 ### Enable Agent Memory
 
-Agents with memory enabled inject their last 6 past outputs as context on every run — useful for chat-style or recurring task agents.
+Memory injects the last 6 outputs as context — great for chat-style or recurring agents.
 
 ```bash
-# Enable memory on create
-agenta create --name "my-agent" --model "qwen3:latest" --prompt "..." --memory
+# On create
+agenta create --name "standup-bot" --model "gemma4:e4b" --prompt "..." --memory
 
-# Enable/disable on existing agent
-agenta update my-agent --memory true
-agenta update my-agent --memory false
+# On existing agent
+agenta update standup-bot --memory true
+agenta update standup-bot --memory false
 ```
 
 ### Export / Import Agents
 
 ```bash
-# Export all agents
+# Back up everything
 agenta export all -o ~/.agenta/exports/backup.json
 
-# Export a single agent
-agenta export my-agent -o my-agent.json
+# Back up one agent
+agenta export morning-brief -o morning-brief.json
 
 # Import (skip duplicates)
 agenta import -i backup.json
 
-# Import and overwrite existing agents
+# Import and overwrite
 agenta import -i backup.json --force
 ```
 
-> **Auto-backup:** Every time the daemon starts, it automatically exports all agents to `~/.agenta/exports/backup_YYYYMMDD_HHMMSS.json` and keeps the last 14 backups.
+> **Auto-backup:** The daemon automatically exports all agents to `~/.agenta/exports/backup_YYYYMMDD_HHMMSS.json` on every start, keeping the last 14 backups.
 
-### Attach Tools
+---
+
+## 🧰 Tools
+
+Tools let agents call external scripts — web search, file reads, API calls, anything a shell script can do.
+
+### Attach Tools to an Agent
 
 ```bash
-agenta update travel-guide --tools tools/echo.json,tools/another.yaml
+agenta update my-agent --tools ~/.agenta/tools/my_tools.json
 ```
 
-### Manage First-Class Tools
-
-Create tool (script scaffolded to `~/.agenta/tools/<name>.sh`):
+### Create a Tool
 
 ```bash
 agenta tool create \
-  --name web-fetch \
-  --description "Fetch web content via custom script" \
-  --parameters '{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}'
+  --name web-search \
+  --description "Search the web for current information" \
+  --parameters '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}'
 ```
 
-Provide a custom handler instead of scaffolding:
+With a custom handler:
 
 ```bash
 agenta tool create \
-  --name web-fetch \
-  --description "Fetch web content via custom script" \
-  --parameters '{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}' \
-  --handler "/Users/you/bin/web_fetch_tool"
+  --name web-search \
+  --description "Search the web for current information" \
+  --parameters '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}' \
+  --handler "/Users/you/bin/tavily_search.sh"
 ```
 
-Scaffold starter script automatically:
+Auto-scaffold a starter script:
 
 ```bash
 agenta tool create \
-  --name web_fetch_readonly \
-  --description "Read-only web fetch tool" \
-  --parameters '{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}' \
+  --name web-search \
+  --description "Search the web" \
+  --parameters '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}' \
   --scaffold
 ```
 
-List tools:
+### Manage Tools
 
 ```bash
 agenta tool list
+agenta tool get web-search
+agenta tool run web-search --input '{"query":"Rust vs Go performance 2025"}' --wait
+agenta tool logs web-search --lines 50
+agenta tool update web-search --enabled false
+agenta tool delete web-search
 ```
 
-Get tool details:
-
-```bash
-agenta tool get web-fetch
-```
-
-Run tool manually:
-
-```bash
-agenta tool run web-fetch --input '{"url":"https://www.tourismthailand.org"}' --wait
-```
-
-View tool logs:
-
-```bash
-agenta tool logs web-fetch --lines 50
-```
-
-View agent executions:
+### View Agent Executions
 
 ```bash
 agenta view executions
 agenta view executions --limit 200
 ```
 
-Update tool:
-
-```bash
-agenta tool update web-fetch --enabled false
-```
-
-Delete tool:
-
-```bash
-agenta tool delete web-fetch
-```
-
 ---
 
-## Deep Agents
+## 🧠 Deep Agents
 
-Deep agents run in a multi-step reasoning loop — they can call tools, evaluate results, and iterate until they reach a conclusion or hit the iteration limit.
+Deep agents don't just generate one response, they think, act, observe, and iterate. Perfect for research, multi-step tasks, or anything that needs more than one shot.
 
 ### Create a Deep Agent
 
 ```bash
 agenta create \
-  --name "researcher" \
-  --model "deepseek-v3.1:671b-cloud" \
-  --prompt "You are a research agent. Use available tools to answer questions thoroughly." \
+  --name "deal-hunter" \
+  --model "gemma4:e4b" \
+  --prompt "You are a sharp deal-finding agent. Search for the best prices, compare options, and give a clear recommendation with reasoning." \
   --deep \
   --deep-iterations 10
 ```
@@ -351,24 +318,24 @@ agenta create \
 ### How It Works
 
 Each iteration the agent can:
-1. Call a tool via `TOOL_CALL: {"tool": "<name>", "parameters": {...}}`
-2. Observe the result and decide next action
-3. Finish by writing `TASK_COMPLETE: <final answer>`
+1. Call a tool → `TOOL_CALL: {"tool": "<name>", "parameters": {...}}`
+2. Observe the result and decide what to do next
+3. Conclude with → `TASK_COMPLETE: <final answer>`
 
 The loop exits when:
 - The agent writes `TASK_COMPLETE:`
 - A stop condition is matched
 - The iteration limit is reached
 
-### Tool Definition for Deep Agents
+### Tool Definition
 
-Define tools in a JSON file and attach to a deep agent:
+Define tools in a JSON file:
 
 ```json
 [
   {
-    "name": "tavily_search",
-    "description": "Search the web. Parameters: {\"query\": \"<query>\", \"max_results\": 5}",
+    "name": "web_search",
+    "description": "Search the web for current information.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -377,98 +344,92 @@ Define tools in a JSON file and attach to a deep agent:
       },
       "required": ["query"]
     },
-    "handler": "/usr/bin/env bash ~/.agenta/tools/tavily_search.sh"
+    "handler": "/Users/you/.agenta/tools/tavily_search.sh"
   }
 ]
 ```
 
 ```bash
-agenta update researcher --tools ~/.agenta/tools/my_tools.json
+agenta update deal-hunter --tools ~/.agenta/tools/search_tools.json
 ```
 
 ---
 
-## Sub-Agent Spawning
+## 🪄 Sub-Agent Spawning
 
-Deep agents can spawn ephemeral sub-agents at runtime using the built-in `spawn_agent` tool. Sub-agents run synchronously, return their output to the parent, and are never persisted to the database.
+Deep agents can spin up ephemeral sub-agents at runtime, like delegating work to a specialist. Sub-agents run, return their answer, and disappear. Nothing is saved to the database.
 
 ### How to Use
 
-In your deep agent's system prompt, instruct it to call `spawn_agent`:
+Instruct your agent to call `spawn_agent` in its prompt:
 
 ```
 TOOL_CALL: {"tool": "spawn_agent", "parameters": {
-  "role": "You are a research analyst specialising in regulatory affairs.",
-  "input": "What are the current EU AI Act regulations affecting LLM providers?",
-  "model": "deepseek-v3.1:671b-cloud"
+  "role": "You are a financial analyst. Be precise, cite numbers.",
+  "input": "Summarise the latest earnings report for NVIDIA.",
+  "model": "gemma4:e4b"
 }}
 ```
-
-Parameters:
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `role`    | Yes      | System prompt for the sub-agent |
-| `input`   | Yes      | The task or question to answer |
-| `model`   | No       | Model to use (defaults to parent's model) |
+| `input`   | Yes      | The task or question to hand off |
+| `model`   | No       | Model override (defaults to parent's model) |
 
-### Sub-Agent Spawn Notifications
+### Progress Notifications
 
-When a deep agent spawns a sub-agent, a progress notification is sent to the caller (e.g. Telegram chat). The message is configurable per agent:
+When a sub-agent is spawned, a notification is sent to the caller (e.g. your Telegram chat):
 
 ```bash
-# Set a custom notification message ({task} is replaced with the actual task)
-agenta update my-agent --spawn-message "🤖 Deploying sub-agent: {task}"
+# Customise the message ({task} is replaced at runtime)
+agenta update deal-hunter --spawn-message "🔍 Delegating to specialist: {task}"
 
-# Clear custom message (reverts to generic default)
-agenta update my-agent --spawn-message ""
+# Reset to default
+agenta update deal-hunter --spawn-message ""
 ```
 
-Default message (used when no custom message is set):
-
-```
-⚙️ Spawning sub-agent: <task>
-```
+Default: `⚙️ Spawning sub-agent: <task>`
 
 ### Built-in Tools
 
-Built-in tools are available to all deep agents without any configuration:
+Available to all deep agents, no setup needed:
 
 | Tool | Description |
 |------|-------------|
-| `spawn_agent` | Spawn an ephemeral sub-agent, wait for its output, and return the result to the parent agent |
+| `spawn_agent` | Spawn an ephemeral sub-agent and get its output |
 
 ---
 
-## Telegram Integration
+## 💬 Telegram Integration
 
-No public URL or webhook setup needed. The daemon polls Telegram for new messages automatically using long polling.
+Chat with your agents directly from Telegram. No webhook, no public URL, no tunnel — just long polling.
 
 ### Setup
 
-**1. Create a bot** via [@BotFather](https://t.me/BotFather) on Telegram and copy the token.
+**1. Create a bot** via [@BotFather](https://t.me/BotFather) and copy the token.
 
-**2. Add your bot token to `~/.agenta/.env`:**
+**2. Add the token to `~/.agenta/.env`:**
 
 ```bash
-MY_BOT_TOKEN=<your-bot-token>
+MY_BOT_TOKEN=your-bot-token
 ```
 
-**3. Add one or more bots to `config.toml`:**
+**3. Register bots in `config.toml`:**
 
 ```toml
 [[telegram_bots]]
 name = "assistant"
-token = "$MY_BOT_TOKEN"           # reads from ~/.agenta/.env
-default_agent = "travel-guide"
+token = "$MY_BOT_TOKEN"
+default_agent = "morning-brief"
 
 [[telegram_bots]]
 name = "researcher"
 token = "$RESEARCH_BOT_TOKEN"
-default_agent = "my-research-agent"
+default_agent = "deal-hunter"
 ```
 
-Each bot entry gets its own polling loop. Messages are routed to the configured `default_agent`.
+Each bot runs its own polling loop. Scale to as many bots as you want.
 
 **4. Restart the daemon:**
 
@@ -476,14 +437,14 @@ Each bot entry gets its own polling loop. Messages are routed to the configured 
 agenta daemon stop && agenta daemon start
 ```
 
-### Routing
+### Message Routing
 
-- Default: messages go to `default_agent`
-- Override: send `/agent <agent-name> <message>` to route to a specific agent
+- Default: all messages go to `default_agent`
+- Override per message: `/agent <agent-name> your message here`
 
 ### Troubleshooting
 
-If the daemon logs a `409 Conflict` error, a webhook is registered on the bot. Delete it first:
+`409 Conflict` in logs means a webhook is still registered. Clear it:
 
 ```bash
 curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook"
@@ -491,66 +452,54 @@ curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook"
 
 ---
 
-## REST API + Swagger
-
-Setup:
+## 🌐 REST API + Swagger
 
 ```toml
-api_port = 8789
-api_token = "replace-with-a-strong-token" # optional
+api_port  = 8789
+api_token = "replace-with-a-strong-token"  # optional
 ```
-
-Start daemon (this also starts REST API + Swagger server):
 
 ```bash
 agenta daemon start
-```
-
-Verify:
-
-```bash
 agenta daemon status
 ```
 
-Endpoints:
+| Endpoint | URL |
+|----------|-----|
+| API base | `http://127.0.0.1:8789/api` |
+| Swagger UI | `http://127.0.0.1:8789/swagger-ui` |
+| OpenAPI JSON | `http://127.0.0.1:8789/api-doc/openapi.json` |
 
-- API base: `http://127.0.0.1:8789/api`
-- Swagger UI: `http://127.0.0.1:8789/swagger-ui`
-- OpenAPI JSON: `http://127.0.0.1:8789/api-doc/openapi.json`
-
-Auth (if `api_token` is set):
-
-- `Authorization: Bearer <token>`
-- `x-api-key: <token>`
-
-Example:
+Auth (when `api_token` is set):
 
 ```bash
 curl -H "Authorization: Bearer $AGENTA_API_TOKEN" \
   http://127.0.0.1:8789/api/health
 ```
 
+Also accepts `x-api-key: <token>`.
+
 ---
 
-## Database Configuration
+## 🗄️ Database
 
 ### SQLite (Default)
 
-No extra setup needed; Agenta uses local `database_path`.
+No setup needed. Agenta creates the database automatically at `database_path`.
 
-### Postgres (Optional)
+### Postgres
 
 ```toml
-database_url = "postgres://postgres:<password>@localhost:5432/postgres"
+database_url = "postgres://postgres:password@localhost:5432/mydb"
 ```
 
-If `database_url` is set, daemon uses Postgres. If not set, daemon uses SQLite.
+When `database_url` is set, Agenta uses Postgres. When it's not, SQLite is used.
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
-### `Daemon is not running`
+### Daemon won't start
 
 ```bash
 agenta daemon start
@@ -559,31 +508,81 @@ agenta daemon status
 
 ### `Address already in use`
 
-You likely have another daemon instance.
+Kill the stale daemon process and restart:
 
 ```bash
 pkill -f agenta-daemon || true
 agenta daemon start
 ```
 
-### Telegram polling conflict (`409 Conflict`)
+### Telegram `409 Conflict`
 
-If you previously registered a webhook on the bot, polling will fail with a 409 error. Delete the webhook first:
+A previously registered webhook is blocking polling:
 
 ```bash
 curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook"
 ```
 
-### Swagger resolver errors / stale docs
+### Swagger shows stale docs
 
-Hard refresh browser or reopen Swagger URL after daemon restart.
+Hard refresh the browser tab or reopen the Swagger URL after daemon restart.
 
 ---
 
-## Notes
+## 🏗️ Architecture
 
-- Daemon must be running for CLI operations that use socket RPC.
-- Scheduling, triggers, chat gateway, and REST API all run inside daemon process.
-- Use `agenta daemon status` as source of truth for daemon health.
-- Sub-agents spawned by deep agents are ephemeral — they are not saved to the database and cannot be listed or queried.
-- Tools live in `~/.agenta/tools/` — decoupled from the repo so they persist across upgrades.
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                               AGENTA PLATFORM                                  │
+│                                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                              ENTRY POINTS                                │  │
+│  │                                                                          │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │  │
+│  │  │     CLI      │  │   Telegram   │  │   REST API   │  │  Scheduler   │  │  │
+│  │  │              │  │              │  │              │  │              │  │  │
+│  │  │ agenta run   │  │  multi-bot   │  │  :8789       │  │ 0 8 * * *    │  │  │
+│  │  │ agenta logs  │  │  long-poll   │  │  + Swagger   │  │  triggers    │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+│                                       │                                        │
+│                                       ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                              DAEMON CORE                                 │  │
+│  │                                                                          │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │  │
+│  │  │ Agent Runner │  │  Deep Loop   │  │  Sub-Agents  │  │   Memory     │  │  │
+│  │  │              │  │              │  │              │  │              │  │  │
+│  │  │ prompt →     │  │ think → act  │  │ ephemeral    │  │ last 6 runs  │  │  │
+│  │  │ model → out  │  │ → observe    │  │ at runtime   │  │ as context   │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │  │
+│  │                                                                          │  │
+│  │  ┌──────────────────────────────────────────────────────────────────┐    │  │
+│  │  │                       TOOL EXECUTOR                              │    │  │
+│  │  │        TOOL_CALL → shell handler → result → agent                │    │  │
+│  │  └──────────────────────────────────────────────────────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+│                                       │                                        │
+│                                       ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                               BACKENDS                                   │  │
+│  │                                                                          │  │
+│  │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐  │  │
+│  │  │       Ollama       │  │      Storage       │  │    Shell Tools     │  │  │
+│  │  │                    │  │                    │  │                    │  │  │
+│  │  │  local inference   │  │  SQLite            │  │ ~/.agenta/tools/   │  │  │
+│  │  │  any Ollama model  │  │  · Postgres        │  │  any executable    │  │  │
+│  │  └────────────────────┘  └────────────────────┘  └────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📝 Notes
+
+- The daemon must be running for CLI operations that use socket RPC.
+- Scheduling, triggers, Telegram, and the REST API all run inside the daemon process.
+- `agenta daemon status` is the source of truth for daemon health.
+- Sub-agents are ephemeral — not saved to the database, not listable.
+- Tools live in `~/.agenta/tools/` — decoupled from the repo, safe across upgrades.
