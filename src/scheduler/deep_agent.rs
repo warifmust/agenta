@@ -6,14 +6,15 @@ use tracing::info;
 use crate::core::{
     Agent, DeepAgentConfig, ExecutionMode, ExecutionResult, Storage, ToolCall,
 };
-use crate::ollama::client::{ChatMessage, ChatRequest, OllamaClient};
+use crate::ollama::client::{ChatMessage, ChatRequest};
 use crate::ollama::models::ModelParameters;
+use crate::providers::ModelBackend;
 use crate::scheduler::executor::AgentExecutor;
 use crate::tools::{builtin_tool_descriptions, is_builtin_tool, run_tool};
 
 /// Deep agent executor for multi-step reasoning
 pub struct DeepAgentExecutor {
-    ollama: OllamaClient,
+    backend: Arc<dyn ModelBackend>,
     storage: Arc<dyn Storage>,
     max_iterations: u32,
     stop_patterns: Vec<Regex>,
@@ -30,7 +31,7 @@ impl DeepAgentExecutor {
             .collect();
 
         Ok(Self {
-            ollama: base.ollama_client(),
+            backend: base.backend(),
             storage: base.storage(),
             max_iterations: config.max_iterations,
             stop_patterns: stop_patterns?,
@@ -83,7 +84,7 @@ impl DeepAgentExecutor {
                 options: Some(params.to_json_value()),
             };
 
-            let response = self.ollama.chat(request).await?;
+            let response = self.backend.chat(request).await?;
             let assistant_response = response.message.content.clone();
 
             conversation.push(ChatMessage {
@@ -226,7 +227,7 @@ impl DeepAgentExecutor {
                 options: Some(params.to_json_value()),
             };
 
-            let response = self.ollama.generate(request).await?;
+            let response = self.backend.generate(request).await?;
             let content = response.response.clone();
 
             // Check for task completion
@@ -370,7 +371,7 @@ impl DeepAgentExecutor {
         sub_agent.execution_mode = ExecutionMode::Once;
 
         // Reuse existing executor — ephemeral, no DB writes
-        let executor = AgentExecutor::new(self.storage.clone(), self.ollama.clone());
+        let executor = AgentExecutor::new(self.storage.clone(), self.backend.clone());
         match executor.execute_ephemeral(&sub_agent, Some(input)).await {
             Ok(output) => {
                 info!("Sub-agent completed for parent: {}", parent.name);

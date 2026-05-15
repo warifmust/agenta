@@ -159,6 +159,7 @@ impl SqliteStorage {
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled INTEGER NOT NULL DEFAULT 0,
+                provider TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -173,6 +174,13 @@ impl SqliteStorage {
         // Migration: add memory_enabled column if it doesn't exist (SQLite)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add provider column if it doesn't exist (SQLite)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN provider TEXT"
         )
         .execute(&self.pool)
         .await;
@@ -337,6 +345,7 @@ impl PostgresStorage {
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                provider TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -351,6 +360,13 @@ impl PostgresStorage {
         // Migration: add memory_enabled column if it doesn't exist (Postgres)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add provider column if it doesn't exist (Postgres)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider TEXT"
         )
         .execute(&self.pool)
         .await;
@@ -490,8 +506,8 @@ impl Storage for SqliteStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                memory_enabled, status, created_at, updated_at, last_run, run_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             "#,
         )
         .bind(&agent.id)
@@ -507,6 +523,7 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
+        .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
         .bind(agent.updated_at.to_rfc3339())
@@ -525,7 +542,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = ?1
             "#,
         )
@@ -543,7 +560,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = ?1
             "#,
         )
@@ -572,11 +589,12 @@ impl Storage for SqliteStorage {
                 deep_agent_config = ?10,
                 environment = ?11,
                 memory_enabled = ?12,
-                status = ?13,
-                updated_at = ?14,
-                last_run = ?15,
-                run_count = ?16
-            WHERE id = ?17
+                provider = ?13,
+                status = ?14,
+                updated_at = ?15,
+                last_run = ?16,
+                run_count = ?17
+            WHERE id = ?18
             "#,
         )
         .bind(&agent.name)
@@ -591,6 +609,7 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
+        .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
@@ -619,7 +638,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents ORDER BY created_at DESC
             "#,
         )
@@ -637,7 +656,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = ?1 ORDER BY created_at DESC
             "#,
         )
@@ -1087,7 +1106,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = ?1
             "#,
@@ -1110,8 +1129,8 @@ impl Storage for PostgresStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                memory_enabled, status, created_at, updated_at, last_run, run_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             "#,
         )
         .bind(&agent.id)
@@ -1127,6 +1146,7 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(agent.memory_enabled)
+        .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
         .bind(agent.updated_at.to_rfc3339())
@@ -1145,7 +1165,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = $1
             "#,
         )
@@ -1163,7 +1183,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = $1
             "#,
         )
@@ -1192,11 +1212,12 @@ impl Storage for PostgresStorage {
                 deep_agent_config = $10,
                 environment = $11,
                 memory_enabled = $12,
-                status = $13,
-                updated_at = $14,
-                last_run = $15,
-                run_count = $16
-            WHERE id = $17
+                provider = $13,
+                status = $14,
+                updated_at = $15,
+                last_run = $16,
+                run_count = $17
+            WHERE id = $18
             "#,
         )
         .bind(&agent.name)
@@ -1211,6 +1232,7 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(agent.memory_enabled)
+        .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
@@ -1239,7 +1261,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents ORDER BY created_at DESC
             "#,
         )
@@ -1257,7 +1279,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = $1 ORDER BY created_at DESC
             "#,
         )
@@ -1707,7 +1729,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = $1
             "#,
@@ -1740,6 +1762,7 @@ fn row_to_agent_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Agent> {
         deep_agent_config: get_optional_str("deep_agent_config").and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(get_str("environment")?).ok()?,
         memory_enabled: get_i64("memory_enabled").unwrap_or(0) != 0,
+        provider: get_optional_str("provider").map(|s| s.to_string()),
         status: serde_json::from_str(get_str("status")?).ok()?,
         created_at: get_str("created_at")?.parse().ok()?,
         updated_at: get_str("updated_at")?.parse().ok()?,
@@ -1802,6 +1825,7 @@ fn row_to_agent_pg(row: &sqlx::postgres::PgRow) -> Option<Agent> {
             .and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(&environment).ok()?,
         memory_enabled: row.try_get::<bool, _>("memory_enabled").unwrap_or(false),
+        provider: get_optional_string("provider"),
         status: serde_json::from_str(&status).ok()?,
         created_at: created_at.parse().ok()?,
         updated_at: updated_at.parse().ok()?,

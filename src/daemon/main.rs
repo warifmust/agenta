@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create daemon state
-    let state = Arc::new(DaemonState::new(storage, config.ollama_url.clone()).await?);
+    let state = Arc::new(DaemonState::new(storage, &config).await?);
 
     // Auto-backup all agents on startup
     auto_backup_agents(&state).await;

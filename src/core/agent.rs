@@ -295,7 +295,11 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    pub model: String, // e.g., "llama2", "mistral", etc.
+    pub model: String, // e.g., "llama2", "deepseek/deepseek-chat", etc.
+    /// Provider override for this agent. None = use global default_provider from config.
+    /// Supported values: "ollama", "openrouter", "deepseek", "openai"
+    #[serde(default)]
+    pub provider: Option<String>,
     pub system_prompt: String,
     pub config: AgentConfig,
     pub tools: Vec<ToolDefinition>,
@@ -321,6 +325,7 @@ impl Agent {
             name,
             description: None,
             model,
+            provider: None,
             system_prompt,
             config: AgentConfig::default(),
             tools: vec![],

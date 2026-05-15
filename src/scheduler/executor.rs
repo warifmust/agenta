@@ -9,22 +9,23 @@ use crate::core::{
     ToolDefinition,
 };
 use crate::ollama::{
-    client::{ChatMessage, ChatRequest, GenerateRequest, OllamaClient},
+    client::{ChatMessage, ChatRequest, GenerateRequest},
     models::ModelParameters,
 };
+use crate::providers::ModelBackend;
 use crate::tools::{is_builtin_tool, run_tool, ToolInvocation};
 
 #[derive(Clone)]
 pub struct AgentExecutor {
     storage: Arc<dyn Storage>,
-    ollama: OllamaClient,
+    backend: Arc<dyn ModelBackend>,
     /// Optional channel for streaming progress messages (e.g. sub-agent notifications)
     pub progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AgentExecutor {
-    pub fn new(storage: Arc<dyn Storage>, ollama: OllamaClient) -> Self {
-        Self { storage, ollama, progress_tx: None }
+    pub fn new(storage: Arc<dyn Storage>, backend: Arc<dyn ModelBackend>) -> Self {
+        Self { storage, backend, progress_tx: None }
     }
 
     /// Attach a progress sender. Returns a new executor with the channel set.
@@ -33,8 +34,8 @@ impl AgentExecutor {
         self
     }
 
-    pub fn ollama_client(&self) -> OllamaClient {
-        self.ollama.clone()
+    pub fn backend(&self) -> Arc<dyn ModelBackend> {
+        self.backend.clone()
     }
 
     pub fn storage(&self) -> Arc<dyn Storage> {
@@ -192,7 +193,7 @@ impl AgentExecutor {
                 options: Some(params.to_json_value()),
             };
 
-            let response = self.ollama.generate(request).await?;
+            let response = self.backend.generate(request).await?;
             Ok(response.response)
         } else {
             // Chat-based interaction with automatic memory from recent executions.
@@ -208,7 +209,7 @@ impl AgentExecutor {
                 options: Some(params.to_json_value()),
             };
 
-            let response = self.ollama.chat(request).await?;
+            let response = self.backend.chat(request).await?;
             Ok(response.message.content)
         }
     }
@@ -300,7 +301,7 @@ impl AgentExecutor {
             options: Some(params.to_json_value()),
         };
 
-        let response = self.ollama.generate(request).await?;
+        let response = self.backend.generate(request).await?;
         let content = response.response;
 
         // Check for tool calls in response
@@ -335,7 +336,7 @@ impl AgentExecutor {
                             options: Some(params.to_json_value()),
                         };
 
-                        let follow_response = self.ollama.generate(follow_request).await?;
+                        let follow_response = self.backend.generate(follow_request).await?;
                         return Ok(follow_response.response);
                     }
                     Err(e) => {

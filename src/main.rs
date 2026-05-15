@@ -1,6 +1,7 @@
 mod cli;
 mod core;
 mod ollama;
+mod providers;
 mod scheduler;
 mod trigger;
 mod tools;

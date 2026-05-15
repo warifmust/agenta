@@ -11,14 +11,15 @@ use agenta::core::{
     ToolExecutionStatus, ToolResource, TriggerEvent, TriggerType,
     ScriptDefinition, ScriptExecution, ScriptExecutionStatus,
 };
-use agenta::ollama::OllamaClient;
+use agenta::core::AppConfig;
+use agenta::providers::build_backend;
 use agenta::scheduler::AgentExecutor;
 use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler as CronScheduler};
 
 pub struct DaemonState {
     storage: Arc<dyn Storage>,
-    ollama: OllamaClient,
     executor: AgentExecutor,
+    config: AppConfig,
     cron_scheduler: CronScheduler,
     running_agents: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     http_trigger: Arc<RwLock<Option<HttpTrigger>>>,
@@ -28,15 +29,15 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub async fn new(storage: Arc<dyn Storage>, ollama_url: String) -> anyhow::Result<Self> {
-        let ollama = OllamaClient::new(ollama_url);
-        let executor = AgentExecutor::new(storage.clone(), ollama.clone());
+    pub async fn new(storage: Arc<dyn Storage>, config: &AppConfig) -> anyhow::Result<Self> {
+        let backend = build_backend(config, None);
+        let executor = AgentExecutor::new(storage.clone(), backend);
         let cron_scheduler = CronScheduler::new();
 
         Ok(Self {
             storage,
-            ollama,
             executor,
+            config: config.clone(),
             cron_scheduler,
             running_agents: Arc::new(RwLock::new(HashMap::new())),
             http_trigger: Arc::new(RwLock::new(None)),
@@ -225,6 +226,16 @@ impl DaemonState {
         Ok(self.storage.list_agents().await?)
     }
 
+    /// Build an executor using the agent's provider override (if any), falling back to default.
+    fn executor_for_agent(&self, agent: &Agent) -> AgentExecutor {
+        if agent.provider.is_some() {
+            let backend = build_backend(&self.config, agent.provider.as_deref());
+            AgentExecutor::new(self.storage.clone(), backend)
+        } else {
+            self.executor.clone()
+        }
+    }
+
     pub async fn run_agent(
         &self,
         id: &str,
@@ -236,7 +247,7 @@ impl DaemonState {
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
 
         let storage = self.storage.clone();
-        let executor = self.executor.clone();
+        let executor = self.executor_for_agent(&agent);
 
         let execution_id = uuid::Uuid::new_v4().to_string();
         let execution_id_clone = execution_id.clone();
@@ -283,7 +294,7 @@ impl DaemonState {
 
         let execution_id = uuid::Uuid::new_v4().to_string();
         self
-            .executor
+            .executor_for_agent(&agent)
             .execute_with_id(&agent, Some(input), execution_id)
             .await
     }
@@ -303,8 +314,7 @@ impl DaemonState {
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
 
         let execution_id = uuid::Uuid::new_v4().to_string();
-        self.executor
-            .clone()
+        self.executor_for_agent(&agent)
             .with_progress(progress_tx)
             .execute_with_id(&agent, Some(input), execution_id)
             .await

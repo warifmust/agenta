@@ -1,15 +1,15 @@
 <p align="center">
-  <img src="assets/agenta-logo.png" width="240" alt="Agenta Logo">
+  <img src="assets/agenta-logo-2.png" width="240" alt="Agenta Logo">
 </p>
 
 <h1 align="center">Agenta</h1>
 
 <p align="center">
-  <strong>You're the puppet master(Dalang). Your agents(Wayang) do the work.</strong>
+  <strong>Define it. Deploy it. Forget it.</strong>
 </p>
 
 <p align="center">
-  Local-first. Self-hosted. Schedule, chain, and run a full autonomous agent pipeline — tools, deep reasoning, sub-agent spawning, Telegram integration, REST API. No cloud. No lock-in. Just control. Powered by <strong>Rust</strong>.
+  Local-first agent runtime for autonomous pipelines. Ollama by default — or swap to DeepSeek, OpenRouter, or OpenAI per agent, no re-architecture needed. Tools, deep reasoning, sub-agent spawning, Telegram, REST API. No vendor lock-in. No subscriptions. Just control. Powered by <strong>Rust</strong>.
 </p>
 
 ---
@@ -25,6 +25,7 @@
 - 📦 **Export / import** — backup agents as JSON/YAML, auto-backup on every daemon start
 - 🗄️ **SQLite by default**, Postgres optional
 - 🌐 **REST API + Swagger UI** — built-in, no extra setup
+- 🔌 **Pluggable model backends** — Ollama (local), DeepSeek, OpenRouter, OpenAI — per-agent override
 - 🏠 **Fully self-hosted** — runs on your laptop, a cheap VPS, or a Raspberry Pi
 
 ---
@@ -73,9 +74,7 @@ agenta daemon --help
 
 ### 4. Configure
 
-Config lives at `~/.config/agenta/config.toml` on all platforms.
-
-> **Migrating from an older install?** Your config may be at `~/Library/Application Support/agenta/config.toml` on macOS. Move it to `~/.config/agenta/config.toml` and restart the daemon.
+Config lives at `~/.agenta/config.toml`.
 
 Minimal config:
 
@@ -90,6 +89,7 @@ Full config reference:
 # Core
 ollama_url = "http://localhost:11434"
 default_model = "gemma4:e4b"
+default_provider = "ollama"   # ollama | deepseek | openrouter | openai
 log_level = "info"
 
 # Storage
@@ -98,6 +98,22 @@ database_url  = "postgres://user:pass@localhost/db" # Postgres (overrides SQLite
 
 # Daemon IPC socket
 socket_path = "/Users/<you>/.agenta/agenta.sock"
+
+# Model providers — api_key can be a literal or "$ENV_VAR" (resolved from ~/.agenta/.env)
+[providers.ollama]
+# url = "http://localhost:11434"   # overrides ollama_url if set
+
+[providers.deepseek]
+api_key = "$DEEPSEEK_API_KEY"
+# url = "https://api.deepseek.com/v1"   # default
+
+[providers.openrouter]
+api_key = "$OPENROUTER_API_KEY"
+# url = "https://openrouter.ai/api/v1"  # default
+
+[providers.openai]
+api_key = "$OPENAI_API_KEY"
+# url = "https://api.openai.com/v1"     # default
 
 # Telegram — multiple bots supported
 [[telegram_bots]]
@@ -219,6 +235,35 @@ agenta create --name "standup-bot" --model "gemma4:e4b" --prompt "..." --memory
 # On existing agent
 agenta update standup-bot --memory true
 agenta update standup-bot --memory false
+```
+
+### Use a Cloud Provider
+
+Every agent can have its own provider override. Default is Ollama.
+
+```bash
+# Create an agent using DeepSeek
+agenta create \
+  --name "writer" \
+  --model "deepseek-chat" \
+  --provider deepseek \
+  --prompt "You are a professional tech writer."
+
+# Switch an existing agent to OpenRouter
+agenta update my-agent --provider openrouter --model "anthropic/claude-3.5-sonnet"
+
+# Switch back to local Ollama
+agenta update my-agent --provider ollama --model "gemma4:e4b"
+```
+
+Provider resolution order: **agent `--provider`** → **`default_provider` in config.toml** → **ollama**
+
+Add API keys to `~/.agenta/.env`:
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+OPENAI_API_KEY=sk-...
 ```
 
 ### Export / Import Agents
@@ -567,12 +612,12 @@ Hard refresh the browser tab or reopen the Swagger URL after daemon restart.
 │  ┌──────────────────────────────────────────────────────────────────────────┐  │
 │  │                               BACKENDS                                   │  │
 │  │                                                                          │  │
-│  │  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐  │  │
-│  │  │       Ollama       │  │      Storage       │  │    Shell Tools     │  │  │
-│  │  │                    │  │                    │  │                    │  │  │
-│  │  │  local inference   │  │  SQLite            │  │ ~/.agenta/tools/   │  │  │
-│  │  │  any Ollama model  │  │  · Postgres        │  │  any executable    │  │  │
-│  │  └────────────────────┘  └────────────────────┘  └────────────────────┘  │  │
+│  │  ┌──────────────────────────────────┐  ┌──────────┐  ┌───────────────┐  │  │
+│  │  │        Model Backend (pluggable) │  │ Storage  │  │  Shell Tools  │  │  │
+│  │  │                                  │  │          │  │               │  │  │
+│  │  │  Ollama · DeepSeek · OpenRouter  │  │ SQLite   │  │ ~/.agenta/    │  │  │
+│  │  │  OpenAI · any OpenAI-compat API  │  │ Postgres │  │ tools/        │  │  │
+│  │  └──────────────────────────────────┘  └──────────┘  └───────────────┘  │  │
 │  └──────────────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```

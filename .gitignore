@@ -7,6 +7,7 @@
 
 # Local/dev
 .claude/
+CLAUDE.md
 exports/
 prompts/
 *.log

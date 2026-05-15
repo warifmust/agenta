@@ -75,6 +75,10 @@ pub enum Commands {
         #[arg(long)]
         memory: bool,
 
+        /// Model provider override (e.g., ollama, deepseek, openrouter, openai)
+        #[arg(long)]
+        provider: Option<String>,
+
         /// Tool definitions (comma-separated file paths)
         #[arg(long)]
         tools: Option<String>,
@@ -145,6 +149,10 @@ pub enum Commands {
         /// Enable or disable memory
         #[arg(long)]
         memory: Option<bool>,
+
+        /// Model provider override (e.g., ollama, deepseek, openrouter, openai)
+        #[arg(long)]
+        provider: Option<String>,
 
         /// Tool definitions (comma-separated file paths)
         #[arg(long)]

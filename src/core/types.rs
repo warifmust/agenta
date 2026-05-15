@@ -90,9 +90,22 @@ pub struct TelegramBotConfig {
     pub name: Option<String>,
 }
 
+/// Per-provider configuration block (URL + API key).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// Base URL override (optional — each provider has a sensible default).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// API key or "$ENV_VAR" reference.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 /// Configuration for the agenta application
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Kept for backward compatibility — used as the Ollama URL when
+    /// no explicit [providers.ollama] block is present.
     pub ollama_url: String,
     pub database_path: String,
     #[serde(default)]
@@ -100,6 +113,13 @@ pub struct AppConfig {
     pub socket_path: String,
     pub log_level: String,
     pub default_model: String,
+    /// Default provider used when an agent has no explicit provider set.
+    /// Supported values: "ollama" (default), "openrouter", "deepseek", "openai"
+    #[serde(default = "default_provider")]
+    pub default_provider: Option<String>,
+    /// Per-provider config blocks: [providers.ollama], [providers.deepseek], etc.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
     #[serde(default = "default_chat_gateway_port")]
     pub chat_gateway_port: u16,
     /// Legacy single-bot config (still supported for backward compat)
@@ -114,6 +134,10 @@ pub struct AppConfig {
     pub api_port: u16,
     #[serde(default)]
     pub api_token: Option<String>,
+}
+
+fn default_provider() -> Option<String> {
+    Some("ollama".to_string())
 }
 
 fn default_chat_gateway_port() -> u16 {
@@ -137,6 +161,8 @@ impl Default for AppConfig {
             socket_path: data_dir.join("agenta.sock").to_string_lossy().to_string(),
             log_level: "info".to_string(),
             default_model: "llama2".to_string(),
+            default_provider: Some("ollama".to_string()),
+            providers: std::collections::HashMap::new(),
             chat_gateway_port: 8790,
             telegram_bot_token: None,
             telegram_default_agent: None,
@@ -148,11 +174,37 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Resolve provider URL: check [providers.<name>].url, fall back to ollama_url for ollama.
+    pub fn provider_url(&self, provider: &str) -> Option<String> {
+        self.providers
+            .get(provider)
+            .and_then(|p| p.url.clone())
+            .or_else(|| {
+                if provider == "ollama" {
+                    Some(self.ollama_url.clone())
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Resolve provider API key: check [providers.<name>].api_key, expand $ENV_VAR if needed.
+    pub fn provider_api_key(&self, provider: &str) -> Option<String> {
+        let raw = self.providers.get(provider)?.api_key.as_ref()?;
+        if let Some(var_name) = raw.strip_prefix('$') {
+            std::env::var(var_name).ok()
+        } else {
+            Some(raw.clone())
+        }
+    }
+}
+
+impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
-        // Use ~/.config/agenta on all platforms (XDG convention, consistent for CLI tools)
+        // Use ~/.agenta for all config — same directory as .env, tools, scripts
         let config_dir = dirs::home_dir()
-            .map(|d| d.join(".config").join("agenta"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".config/agenta"));
+            .map(|d| d.join(".agenta"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".agenta"));
 
         let config_file = config_dir.join("config.toml");
 

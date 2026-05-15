@@ -66,6 +66,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             deep,
             deep_iterations,
             memory,
+            provider,
             tools,
             interactive,
         } => {
@@ -87,6 +88,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             agent.execution_mode = parse_execution_mode(&mode)?;
             agent.schedule = schedule;
             agent.memory_enabled = memory;
+            agent.provider = provider;
             if let Some(tools_arg) = tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
             }
@@ -158,6 +160,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             mode: new_mode,
             schedule: new_schedule,
             memory: new_memory,
+            provider: new_provider,
             tools: new_tools,
             spawn_message: new_spawn_message,
         } => {
@@ -198,6 +201,9 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(mem) = new_memory {
                 agent.memory_enabled = mem;
+            }
+            if new_provider.is_some() {
+                agent.provider = new_provider;
             }
             if let Some(tools_arg) = new_tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
@@ -802,6 +808,9 @@ fn print_agent_details(agent: &Agent) {
         agent.description.as_deref().unwrap_or("N/A"),
     ]);
     table.add_row(vec!["Model", &agent.model]);
+    if let Some(provider) = &agent.provider {
+        table.add_row(vec!["Provider", provider]);
+    }
     table.add_row(vec!["Status", &format!("{:?}", agent.status)]);
     table.add_row(vec!["Execution Mode", &format!("{:?}", agent.execution_mode)]);
 

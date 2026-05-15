@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod core;
 pub mod ollama;
+pub mod providers;
 pub mod scheduler;
 pub mod trigger;
 pub mod tools;
