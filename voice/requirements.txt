@@ -1,6 +1,0 @@
-openwakeword
-pyaudio
-sounddevice
-numpy
-requests
-scipy

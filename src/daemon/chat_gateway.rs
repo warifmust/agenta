@@ -80,12 +80,21 @@ async fn poll_telegram_bot(
 ) {
     let base_url = format!("https://api.telegram.org/bot{}", token);
     let mut offset: i64 = 0;
+    let mut consecutive_errors: u32 = 0;
 
     loop {
         let updates = match fetch_updates(&http, &base_url, offset).await {
-            Ok(u) => u,
+            Ok(u) => {
+                consecutive_errors = 0;
+                u
+            }
             Err(e) => {
-                warn!("[{}] getUpdates error: {} — retrying in 10s", label, e);
+                consecutive_errors += 1;
+                if consecutive_errors == 1 {
+                    warn!("[{}] Telegram bot error: {} — check your token in ~/.agenta/.env", label, e);
+                } else {
+                    tracing::debug!("[{}] getUpdates error ({}): {} — retrying in 10s", label, consecutive_errors, e);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 continue;
             }

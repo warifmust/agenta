@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Local-first agent runtime for autonomous pipelines. Ollama by default — or swap to DeepSeek, OpenRouter, or OpenAI per agent, no re-architecture needed. Tools, deep reasoning, sub-agent spawning, Telegram, REST API. No vendor lock-in. No subscriptions. Just control. Powered by <strong>Rust</strong>.
+  Local-first agent runtime for autonomous pipelines. Ollama by default, swap to DeepSeek, OpenRouter, or OpenAI per agent, no re-architecture needed. Tools, deep reasoning, sub-agent spawning, Telegram, REST API. No vendor lock-in. No subscriptions. Just control. Powered by <strong>Rust</strong>.
 </p>
 
 ---
@@ -52,6 +52,14 @@ curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | 
 
 **From source:**
 
+Requires Rust. If `cargo` is not found, install it via [rustup](https://rustup.rs) (works on macOS and Linux — prefer this over `brew` or `apt` which ship outdated versions):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # macOS and Linux
+source $HOME/.cargo/env
+```
+
+Then build and install:
 ```bash
 cargo install --path . --force
 ```
@@ -93,11 +101,11 @@ default_provider = "ollama"   # ollama | deepseek | openrouter | openai
 log_level = "info"
 
 # Storage
-database_path = "/Users/<you>/.agenta/agenta.db"   # SQLite (default)
+database_path = "~/.agenta/agenta.db"              # SQLite (default)
 database_url  = "postgres://user:pass@localhost/db" # Postgres (overrides SQLite)
 
 # Daemon IPC socket
-socket_path = "/Users/<you>/.agenta/agenta.sock"
+socket_path = "~/.agenta/agenta.sock"
 
 # Model providers — api_key can be a literal or "$ENV_VAR" (resolved from ~/.agenta/.env)
 [providers.ollama]

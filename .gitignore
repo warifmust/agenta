@@ -8,6 +8,7 @@
 # Local/dev
 .claude/
 CLAUDE.md
+voice/
 exports/
 prompts/
 *.log
