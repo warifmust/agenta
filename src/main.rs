@@ -1,3 +1,7 @@
+// Modules are shared with the lib; the CLI binary only uses cli + core.
+// Suppress dead_code / unused_imports for items used by the daemon binary.
+#![allow(dead_code, unused_imports)]
+
 mod cli;
 mod core;
 mod ollama;

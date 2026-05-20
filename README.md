@@ -99,6 +99,7 @@ ollama_url = "http://localhost:11434"
 default_model = "gemma4:e4b"
 default_provider = "ollama"   # ollama | deepseek | openrouter | openai
 log_level = "info"
+# timezone = "Asia/Kuala_Lumpur"  # optional — defaults to system timezone
 
 # Storage
 database_path = "~/.agenta/agenta.db"              # SQLite (default)
@@ -197,6 +198,7 @@ agenta view        # View runtime data (executions, etc.)
 agenta tool        # Manage tools (create/get/list/update/delete/run/logs)
 agenta script      # Manage scripts (create/get/list/update/delete/run/logs)
 agenta daemon      # start / stop / status / restart daemon
+agenta upgrade     # upgrade agenta to the latest (or a specific) version
 ```
 
 ---
@@ -222,9 +224,11 @@ agenta update morning-brief --max-tokens 8192
 ### Schedule a Daily Run
 
 ```bash
-# Every morning at 8:00 AM
+# Every morning at 8:00 AM (local time — no UTC conversion needed)
 agenta update morning-brief --mode scheduled --schedule "0 8 * * *"
 ```
+
+> The scheduler uses your system timezone automatically. `8am` means `8am` on your machine. Override with `timezone = "Asia/Kuala_Lumpur"` in `~/.agenta/config.toml` if needed.
 
 ### Back to Manual Only
 
@@ -272,6 +276,24 @@ Add API keys to `~/.agenta/.env`:
 DEEPSEEK_API_KEY=sk-...
 OPENROUTER_API_KEY=sk-or-...
 OPENAI_API_KEY=sk-...
+```
+
+### Upgrade Agenta
+
+```bash
+# Upgrade to the latest release
+agenta upgrade
+
+# Upgrade to a specific version
+agenta upgrade v1.0.7
+```
+
+The daemon is stopped automatically before upgrading and must be restarted after:
+
+```bash
+agenta daemon stop
+agenta upgrade
+agenta daemon start
 ```
 
 ### Export / Import Agents

@@ -100,8 +100,23 @@ install_from_release() {
   return 0
 }
 
+ensure_cargo() {
+  if have_cmd cargo; then
+    return 0
+  fi
+  echo "" >&2
+  echo "Error: cargo not found — Rust is required to build from source." >&2
+  echo "" >&2
+  echo "Install Rust via rustup (macOS and Linux):" >&2
+  echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+  echo "  source \$HOME/.cargo/env" >&2
+  echo "" >&2
+  echo "Then re-run this installer." >&2
+  exit 1
+}
+
 install_from_cargo() {
-  need_cmd cargo
+  ensure_cargo
   local git_ref=""
   if [ "$VERSION" != "latest" ]; then
     git_ref="--tag ${VERSION}"

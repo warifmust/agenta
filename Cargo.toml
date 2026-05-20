@@ -1,6 +1,6 @@
 [package]
 name = "agenta"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "AI Agent Management CLI and Daemon"
 authors = ["Arif Mustaffa <wmaz93@gmail.com>"]
@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 
 # UUID
 uuid = { version = "1.6", features = ["v4", "serde"] }

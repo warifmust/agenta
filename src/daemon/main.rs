@@ -206,7 +206,7 @@ async fn auto_backup_agents(state: &Arc<DaemonState>) {
     }
 
     // Prune: keep only the 14 most recent backups
-    if let Ok(mut entries) = std::fs::read_dir(&backup_dir) {
+    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
         let mut backups: Vec<_> = entries
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("backup_"))

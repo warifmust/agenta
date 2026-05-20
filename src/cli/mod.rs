@@ -279,6 +279,13 @@ pub enum Commands {
         #[command(subcommand)]
         command: ViewCommands,
     },
+
+    /// Upgrade agenta to the latest version (or a specific version)
+    Upgrade {
+        /// Target version (e.g. v1.0.6). Defaults to latest.
+        #[arg(default_value = "latest")]
+        version: String,
+    },
 }
 
 #[derive(Subcommand)]

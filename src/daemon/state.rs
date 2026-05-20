@@ -14,7 +14,7 @@ use agenta::core::{
 use agenta::core::AppConfig;
 use agenta::providers::build_backend;
 use agenta::scheduler::AgentExecutor;
-use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler as CronScheduler};
+use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler as CronScheduler, resolve_timezone};
 
 pub struct DaemonState {
     storage: Arc<dyn Storage>,
@@ -32,7 +32,8 @@ impl DaemonState {
     pub async fn new(storage: Arc<dyn Storage>, config: &AppConfig) -> anyhow::Result<Self> {
         let backend = build_backend(config, None);
         let executor = AgentExecutor::new(storage.clone(), backend);
-        let cron_scheduler = CronScheduler::new();
+        let timezone = resolve_timezone(config.timezone.as_deref());
+        let cron_scheduler = CronScheduler::with_timezone(timezone);
 
         Ok(Self {
             storage,
@@ -246,7 +247,7 @@ impl DaemonState {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
 
-        let storage = self.storage.clone();
+        let _storage = self.storage.clone();
         let executor = self.executor_for_agent(&agent);
 
         let execution_id = uuid::Uuid::new_v4().to_string();
@@ -268,6 +269,7 @@ impl DaemonState {
         Ok(execution_id)
     }
 
+    #[allow(dead_code)]
     pub async fn run_agent_sync(
         &self,
         id: &str,
@@ -282,6 +284,7 @@ impl DaemonState {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn run_agent_sync_execution(
         &self,
         id: &str,

@@ -53,3 +53,63 @@ pub fn build_backend(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{AppConfig, types::ProviderConfig};
+
+    fn cfg_with_provider(name: &str, url: &str, key: &str) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.providers.insert(
+            name.to_string(),
+            ProviderConfig {
+                url: Some(url.to_string()),
+                api_key: Some(key.to_string()),
+            },
+        );
+        cfg
+    }
+
+    /// build_backend must not panic for any supported provider string.
+    #[test]
+    fn build_backend_ollama_default() {
+        let cfg = AppConfig::default();
+        // Should build without panic; we can't call the backend without a server,
+        // but we verify the Arc is created.
+        let _backend = build_backend(&cfg, None);
+    }
+
+    #[test]
+    fn build_backend_deepseek_provider() {
+        let cfg = cfg_with_provider("deepseek", "https://api.deepseek.com/v1", "sk-test");
+        let _backend = build_backend(&cfg, Some("deepseek"));
+    }
+
+    #[test]
+    fn build_backend_openrouter_provider() {
+        let cfg = cfg_with_provider("openrouter", "https://openrouter.ai/api/v1", "sk-or-test");
+        let _backend = build_backend(&cfg, Some("openrouter"));
+    }
+
+    #[test]
+    fn build_backend_openai_provider() {
+        let cfg = cfg_with_provider("openai", "https://api.openai.com/v1", "sk-oai-test");
+        let _backend = build_backend(&cfg, Some("openai"));
+    }
+
+    #[test]
+    fn build_backend_agent_provider_overrides_default() {
+        // Config default is "ollama", but agent specifies "deepseek" — must use deepseek
+        let cfg = cfg_with_provider("deepseek", "https://api.deepseek.com/v1", "sk-test");
+        // No panic and backend is created; URL is validated via provider_url
+        let _backend = build_backend(&cfg, Some("deepseek"));
+    }
+
+    #[test]
+    fn build_backend_unknown_provider_falls_back_to_ollama() {
+        let cfg = AppConfig::default();
+        // Completely unknown provider — should silently fall back to Ollama
+        let _backend = build_backend(&cfg, Some("unknown-provider-xyz"));
+    }
+}

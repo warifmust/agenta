@@ -1,3 +1,8 @@
+// Many items in this lib are public API consumed by the daemon binary.
+// The CLI binary and lib-test targets don't use all of them, so suppress
+// false-positive dead_code / unused_imports warnings here.
+#![allow(dead_code, unused_imports)]
+
 pub mod cli;
 pub mod core;
 pub mod ollama;

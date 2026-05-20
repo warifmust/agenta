@@ -6,7 +6,7 @@ pub mod scheduler;
 pub use file_watcher::FileWatcherTrigger;
 pub use http_trigger::HttpTrigger;
 pub use command_trigger::CommandTrigger;
-pub use scheduler::Scheduler;
+pub use scheduler::{Scheduler, resolve_timezone};
 
 use crate::core::TriggerEvent;
 use tokio::sync::mpsc;

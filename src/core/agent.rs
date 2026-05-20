@@ -430,6 +430,8 @@ mod tests {
         assert_eq!(agent.run_count, 0);
         assert!(!agent.id.is_empty());
         assert!(!agent.is_deep_agent());
+        // provider defaults to None — resolved from config at runtime
+        assert!(agent.provider.is_none());
     }
 
     #[test]

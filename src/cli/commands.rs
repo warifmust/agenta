@@ -464,6 +464,29 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 }
             }
         },
+
+        Commands::Upgrade { version } => {
+            println!("Upgrading agenta to {}...", version);
+            let script_url = "https://raw.githubusercontent.com/warifmust/agenta/main/install.sh";
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "AGENTA_VERSION={version} curl -fsSL {url} | bash",
+                    version = if version == "latest" { String::new() } else { version.clone() },
+                    url = script_url
+                ))
+                .env("AGENTA_VERSION", &version)
+                .status()
+                .map_err(|e| anyhow!("Failed to run upgrade: {}", e))?;
+
+            if status.success() {
+                println!("Upgrade complete. Restart the daemon to apply:");
+                println!("  agenta daemon stop && agenta daemon start");
+                Ok(())
+            } else {
+                Err(anyhow!("Upgrade failed with exit code: {}", status))
+            }
+        },
     }
 }
 

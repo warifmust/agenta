@@ -134,6 +134,10 @@ pub struct AppConfig {
     pub api_port: u16,
     #[serde(default)]
     pub api_token: Option<String>,
+    /// Timezone for cron scheduling (e.g. "Asia/Kuala_Lumpur").
+    /// Defaults to system local timezone if not set.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 fn default_provider() -> Option<String> {
@@ -169,6 +173,7 @@ impl Default for AppConfig {
             telegram_bots: Vec::new(),
             api_port: 8789,
             api_token: None,
+            timezone: None,
         }
     }
 }
@@ -302,5 +307,107 @@ mod tests {
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("\"type\":\"list_executions\""));
         assert!(json.contains("\"limit\":50"));
+    }
+
+    // ── provider / timezone fields ────────────────────────────────────────────
+
+    #[test]
+    fn app_config_default_provider_is_ollama() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.default_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn app_config_default_timezone_is_none() {
+        let cfg = AppConfig::default();
+        assert!(cfg.timezone.is_none());
+    }
+
+    #[test]
+    fn provider_url_returns_ollama_url_for_ollama_provider() {
+        let cfg = AppConfig {
+            ollama_url: "http://localhost:11434".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.provider_url("ollama").as_deref(),
+            Some("http://localhost:11434")
+        );
+    }
+
+    #[test]
+    fn provider_url_returns_custom_url_from_providers_map() {
+        let mut cfg = AppConfig::default();
+        cfg.providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                url: Some("https://api.deepseek.com/v1".to_string()),
+                api_key: None,
+            },
+        );
+        assert_eq!(
+            cfg.provider_url("deepseek").as_deref(),
+            Some("https://api.deepseek.com/v1")
+        );
+    }
+
+    #[test]
+    fn provider_url_returns_none_for_unknown_provider_with_no_entry() {
+        let cfg = AppConfig::default();
+        assert!(cfg.provider_url("openrouter").is_none());
+    }
+
+    #[test]
+    fn provider_api_key_returns_literal_value() {
+        let mut cfg = AppConfig::default();
+        cfg.providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                url: None,
+                api_key: Some("sk-literal-key".to_string()),
+            },
+        );
+        assert_eq!(
+            cfg.provider_api_key("openai").as_deref(),
+            Some("sk-literal-key")
+        );
+    }
+
+    #[test]
+    fn provider_api_key_expands_env_var() {
+        std::env::set_var("AGENTA_TEST_DEEPSEEK_KEY", "sk-from-env");
+        let mut cfg = AppConfig::default();
+        cfg.providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                url: None,
+                api_key: Some("$AGENTA_TEST_DEEPSEEK_KEY".to_string()),
+            },
+        );
+        assert_eq!(
+            cfg.provider_api_key("deepseek").as_deref(),
+            Some("sk-from-env")
+        );
+        std::env::remove_var("AGENTA_TEST_DEEPSEEK_KEY");
+    }
+
+    #[test]
+    fn provider_api_key_returns_none_when_env_var_not_set() {
+        std::env::remove_var("AGENTA_TEST_MISSING_KEY");
+        let mut cfg = AppConfig::default();
+        cfg.providers.insert(
+            "openrouter".to_string(),
+            ProviderConfig {
+                url: None,
+                api_key: Some("$AGENTA_TEST_MISSING_KEY".to_string()),
+            },
+        );
+        assert!(cfg.provider_api_key("openrouter").is_none());
+    }
+
+    #[test]
+    fn provider_api_key_returns_none_for_unknown_provider() {
+        let cfg = AppConfig::default();
+        assert!(cfg.provider_api_key("deepseek").is_none());
     }
 }
