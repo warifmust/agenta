@@ -32,10 +32,27 @@ detect_os() {
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    arm64|aarch64) echo "arm64" ;;
+    x86_64|amd64) echo "x86_64" ;;
+    arm64|aarch64) echo "aarch64" ;;
     *)
       echo "Error: unsupported architecture: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Returns the Rust target triple used by the CI release workflow.
+detect_target() {
+  local os arch
+  os="$(detect_os)"
+  arch="$(detect_arch)"
+  case "${os}-${arch}" in
+    darwin-aarch64)  echo "aarch64-apple-darwin" ;;
+    darwin-x86_64)   echo "x86_64-apple-darwin" ;;
+    linux-aarch64)   echo "aarch64-unknown-linux-gnu" ;;
+    linux-x86_64)    echo "x86_64-unknown-linux-gnu" ;;
+    *)
+      echo "Error: unsupported platform: ${os}-${arch}" >&2
       exit 1
       ;;
   esac
@@ -72,12 +89,11 @@ ensure_install_dir() {
 }
 
 install_from_release() {
-  local os arch version asset url tmp=""
+  local target version asset url tmp=""
   trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' RETURN
-  os="$(detect_os)"
-  arch="$(detect_arch)"
+  target="$(detect_target)"
   version="$(resolve_version)" || return 1
-  asset="agenta-${os}-${arch}.tar.gz"
+  asset="agenta-${version}-${target}.tar.gz"
   url="https://github.com/${REPO}/releases/download/${version}/${asset}"
 
   echo "Installing agenta ${version} from ${url}"
