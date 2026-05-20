@@ -89,31 +89,34 @@ ensure_install_dir() {
 }
 
 install_from_release() {
-  local target version asset url tmp=""
-  trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' RETURN
+  local target version asset url tmp
   target="$(detect_target)"
   version="$(resolve_version)" || return 1
   asset="agenta-${version}-${target}.tar.gz"
   url="https://github.com/${REPO}/releases/download/${version}/${asset}"
 
   echo "Installing agenta ${version} from ${url}"
-  tmp="$(mktemp -d)"
 
   need_cmd curl
   need_cmd tar
-  curl -fsSL "$url" -o "${tmp}/${asset}" || return 1
-  tar -xzf "${tmp}/${asset}" -C "$tmp" || return 1
-  [ -f "${tmp}/agenta" ] || return 1
-  [ -f "${tmp}/agenta-daemon" ] || return 1
+
+  tmp="$(mktemp -d)"
+
+  # Explicit cleanup on any failure — no trap (bash RETURN traps leak to caller)
+  curl -fsSL "$url" -o "${tmp}/${asset}"    \
+    && tar -xzf "${tmp}/${asset}" -C "$tmp" \
+    && [ -f "${tmp}/agenta" ]               \
+    && [ -f "${tmp}/agenta-daemon" ]        \
+    || { rm -rf "$tmp"; return 1; }
 
   ensure_install_dir
-  install -m 0755 "${tmp}/agenta" "${INSTALL_DIR}/agenta" || return 1
-  install -m 0755 "${tmp}/agenta-daemon" "${INSTALL_DIR}/agenta-daemon" || return 1
+  install -m 0755 "${tmp}/agenta" "${INSTALL_DIR}/agenta"
+  install -m 0755 "${tmp}/agenta-daemon" "${INSTALL_DIR}/agenta-daemon"
+  rm -rf "$tmp"
 
   echo "Installed:"
   echo "  - ${INSTALL_DIR}/agenta"
   echo "  - ${INSTALL_DIR}/agenta-daemon"
-  return 0
 }
 
 ensure_cargo() {
