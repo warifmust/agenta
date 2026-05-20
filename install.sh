@@ -72,7 +72,8 @@ ensure_install_dir() {
 }
 
 install_from_release() {
-  local os arch version asset url tmp
+  local os arch version asset url tmp=""
+  trap '[[ -n "$tmp" ]] && rm -rf "$tmp"' RETURN
   os="$(detect_os)"
   arch="$(detect_arch)"
   version="$(resolve_version)" || return 1
@@ -81,7 +82,6 @@ install_from_release() {
 
   echo "Installing agenta ${version} from ${url}"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
 
   need_cmd curl
   need_cmd tar
