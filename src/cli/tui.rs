@@ -96,46 +96,46 @@ fn is_meaningful_log(line: &str) -> bool {
         && s.len() > 3
 }
 
-// ── Robot logo (box-drawing, clean) ──────────────────────────────────────────
+// ── Robot logo (@ style, compact) ────────────────────────────────────────────
 
 fn robot_logo<'a>() -> Vec<Line<'a>> {
-    let f = Style::default().fg(Color::Rgb(90, 120, 145)); // frame
+    let r = Style::default().fg(Color::Rgb(82, 115, 140)); // robot body @
+    let d = Style::default().fg(Color::Rgb(50, 75, 95));   // darker detail
     let e = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD); // eyes
-    let g = Style::default().fg(Color::Rgb(55, 80, 95));  // grill
+    let g = Style::default().fg(Color::Rgb(55, 80, 95));   // mouth grill
     let h = Style::default().fg(Color::Green);             // heart
     let b = Style::default().fg(Color::Yellow);            // bitcoin
     let a = Style::default().fg(Color::Red);               // antenna
 
-    // Each line is padded to fit the sidebar
     vec![
+        // antenna
+        Line::from(vec![Span::raw("    "), Span::styled("@", a), Span::styled("@@@@", d), Span::styled("@", a)]),
+        // head top
+        Line::from(vec![Span::styled("   @", r), Span::styled("*==*", d), Span::styled("@", r)]),
+        // ears + eyes row
         Line::from(vec![
-            Span::raw("       "),
-            Span::styled("●", a),
+            Span::styled("  @", r), Span::styled("@ ", d),
+            Span::styled("◉", e), Span::styled("  ", r), Span::styled("◉", e),
+            Span::styled(" @", d), Span::styled("@", r),
         ]),
-        Line::from(vec![Span::styled("  ┌─────────┐", f)]),
+        // mouth grill row 1
+        Line::from(vec![Span::styled("  @", r), Span::styled("@ ", d), Span::styled("─ ─ ─", g), Span::styled(" @", d), Span::styled("@", r)]),
+        // head bottom
+        Line::from(vec![Span::styled("   @", r), Span::styled("####", d), Span::styled("@", r)]),
+        // neck
+        Line::from(vec![Span::styled("    @", r), Span::styled("@@", d), Span::styled("@", r)]),
+        // shoulders
+        Line::from(vec![Span::styled("  @", r), Span::styled("@######", d), Span::styled("@", r)]),
+        // body with icons
         Line::from(vec![
-            Span::styled("  │ ", f),
-            Span::styled("◉", e),
-            Span::styled("     ", f),
-            Span::styled("◉", e),
-            Span::styled(" │", f),
+            Span::styled("  @", r), Span::styled("@  ", d),
+            Span::styled("♥", h), Span::styled("  ", d), Span::styled("₿", b),
+            Span::styled("  @", d), Span::styled("@", r),
         ]),
-        Line::from(vec![
-            Span::styled("  │  ", f),
-            Span::styled("─────", g),
-            Span::styled("  │", f),
-        ]),
-        Line::from(vec![Span::styled("  └─────────┘", f)]),
-        Line::from(vec![Span::styled("     │   │   ", f)]),
-        Line::from(vec![Span::styled("  ┌─────────┐", f)]),
-        Line::from(vec![
-            Span::styled("  │  ", f),
-            Span::styled("♥", h),
-            Span::styled("   ", f),
-            Span::styled("₿", b),
-            Span::styled("  │", f),
-        ]),
-        Line::from(vec![Span::styled("  └─────────┘", f)]),
+        // base
+        Line::from(vec![Span::styled("  @", r), Span::styled("@######", d), Span::styled("@", r)]),
+        // legs
+        Line::from(vec![Span::styled("   @", r), Span::styled("@  @", d), Span::styled("@", r)]),
     ]
 }
 
