@@ -35,8 +35,19 @@ async fn main() {
         }
     };
 
-    if let Err(e) = handle_command(cli.command, config).await {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    match cli.command {
+        Some(cmd) => {
+            if let Err(e) = handle_command(cmd, config).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        None => {
+            // No subcommand — drop into interactive shell
+            if let Err(e) = cli::shell::run_shell(config).await {
+                eprintln!("Shell error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }

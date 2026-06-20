@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod shell;
 
 use clap::{Parser, Subcommand};
 
@@ -8,6 +9,7 @@ pub use commands::handle_command;
 #[command(name = "agenta")]
 #[command(about = "AI Agent Management CLI")]
 #[command(version)]
+#[command(subcommand_required = false, arg_required_else_help = false)]
 pub struct Cli {
     #[arg(short, long, help = "Configuration file path")]
     pub config: Option<String>,
@@ -16,11 +18,14 @@ pub struct Cli {
     pub output: String,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Launch interactive shell
+    Shell,
+
     /// Create a new agent
     Create {
         /// Agent name
@@ -286,6 +291,9 @@ pub enum Commands {
         #[arg(default_value = "latest")]
         version: String,
     },
+
+    /// Run diagnostics and check system health
+    Doctor,
 }
 
 #[derive(Subcommand)]

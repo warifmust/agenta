@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 /// Send a request to the daemon and return the response
-async fn daemon_request(config: &AppConfig, request: DaemonRequest) -> Result<DaemonResponse> {
+pub(crate) async fn daemon_request(config: &AppConfig, request: DaemonRequest) -> Result<DaemonResponse> {
     let socket_path = Path::new(&config.socket_path);
 
     if !socket_path.exists() {
@@ -52,6 +52,11 @@ async fn is_daemon_running(config: &AppConfig) -> bool {
 
 pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> {
     match command {
+        Commands::Shell => {
+            super::shell::run_shell(config).await?;
+            return Ok(());
+        },
+
         Commands::Create {
             name,
             model,
@@ -465,6 +470,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
         },
 
+        Commands::Doctor => run_doctor(&config).await,
+
         Commands::Upgrade { version } => {
             println!("Upgrading agenta to {}...", version);
             let script_url = "https://raw.githubusercontent.com/warifmust/agenta/main/install.sh";
@@ -488,6 +495,77 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
         },
     }
+}
+
+async fn run_doctor(config: &AppConfig) -> Result<()> {
+    let pass  = "✓".green().to_string();
+    let warn  = "⚠".yellow().to_string();
+    let fail  = "✗".red().to_string();
+
+    println!("{}", "agenta doctor — core runtime".bold());
+    println!("{}", "─".repeat(44));
+
+    // ── 1. Config file ────────────────────────────────
+    let config_path = dirs::home_dir()
+        .map(|h| h.join(".agenta").join("config.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.agenta/config.toml"));
+
+    if config_path.exists() {
+        println!("{} Config file found ({})", pass, config_path.display());
+    } else {
+        println!("{} Config file not found at {} — using defaults", warn, config_path.display());
+    }
+
+    // ── 2. Daemon socket ──────────────────────────────
+    let socket_path = std::path::Path::new(&config.socket_path);
+    if !socket_path.exists() {
+        println!("{} Daemon socket not found — run: agenta daemon start", fail);
+    } else {
+        // ── 3. Daemon ping ────────────────────────────
+        match daemon_request(config, DaemonRequest::Ping).await {
+            Ok(DaemonResponse::Status { running: true, .. }) => {
+                println!("{} Daemon running and reachable", pass);
+            }
+            Ok(_) => {
+                println!("{} Daemon socket exists but returned unexpected response", warn);
+            }
+            Err(e) => {
+                println!("{} Daemon not responding: {}", fail, e);
+            }
+        }
+    }
+
+    // ── 4. Database ───────────────────────────────────
+    let db_path = std::path::Path::new(&config.database_path);
+    if db_path.exists() {
+        println!("{} Database found ({})", pass, config.database_path);
+    } else if config.database_url.is_some() {
+        println!("{} Using remote database ({})", pass, config.database_url.as_deref().unwrap_or(""));
+    } else {
+        println!("{} Database not found at {} — daemon may not have initialised yet", warn, config.database_path);
+    }
+
+    // ── 5. Ollama ─────────────────────────────────────
+    let ollama_url = format!("{}/api/tags", config.ollama_url);
+    match reqwest::Client::new()
+        .get(&ollama_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("{} Ollama reachable at {}", pass, config.ollama_url);
+        }
+        Ok(resp) => {
+            println!("{} Ollama responded with HTTP {} at {}", warn, resp.status(), config.ollama_url);
+        }
+        Err(_) => {
+            println!("{} Ollama not reachable at {} — is it running?", fail, config.ollama_url);
+        }
+    }
+
+    println!("{}", "─".repeat(44));
+    Ok(())
 }
 
 async fn create_interactive(config: AppConfig) -> Result<()> {
