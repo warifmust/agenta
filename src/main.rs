@@ -43,9 +43,9 @@ async fn main() {
             }
         }
         None => {
-            // No subcommand — drop into interactive shell
-            if let Err(e) = cli::shell::run_shell(config).await {
-                eprintln!("Shell error: {}", e);
+            // No subcommand — open TUI
+            if let Err(e) = cli::tui::run_tui(config).await {
+                eprintln!("TUI error: {}", e);
                 std::process::exit(1);
             }
         }
