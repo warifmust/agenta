@@ -22,6 +22,7 @@ use super::commands::daemon_request;
 const REFRESH: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
 const STOP_WORDS: &[&str] = &["and", "for", "of", "the", "a", "an", "to", "in"];
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,8 @@ struct App {
     daemon_version: String,
     status_msg: Option<(String, Instant)>,
     last_refresh: Instant,
+    spinner_tick: usize,
+    log_hint: Option<String>,
 }
 
 impl App {
@@ -147,6 +150,8 @@ impl App {
             daemon_version: String::new(),
             status_msg: None,
             last_refresh: Instant::now() - Duration::from_secs(60),
+            spinner_tick: 0,
+            log_hint: None,
         }
     }
 
@@ -236,8 +241,44 @@ impl App {
     async fn poll_pending(&mut self) {
         let pending = match &self.pending {
             Some(p) => (p.exec_id.clone(), p.agent_name.clone(), p.msg_idx),
-            None => return,
+            None => {
+                self.log_hint = None;
+                return;
+            }
         };
+
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+
+        // Fetch latest log line as live hint
+        if let Ok(DaemonResponse::ExecutionLog { lines }) = daemon_request(
+            &self.config,
+            DaemonRequest::GetLogs {
+                agent_id: pending.1.clone(),
+                execution_id: Some(pending.0.clone()),
+                lines: 20,
+            },
+        )
+        .await
+        {
+            let hint = lines.iter().rev()
+                .find(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.is_empty()
+                        && !trimmed.starts_with("TASK_COMPLETE")
+                        && !trimmed.contains("Starting agent")
+                })
+                .map(|l| {
+                    // Strip leading timestamp/bracket noise: [2026-06-20 10:01:23] TEXT
+                    let s = l.trim();
+                    if let Some(rest) = s.strip_prefix('[') {
+                        if let Some(pos) = rest.find("] ") {
+                            return rest[pos + 2..].chars().take(80).collect::<String>();
+                        }
+                    }
+                    s.chars().take(80).collect::<String>()
+                });
+            self.log_hint = hint;
+        }
 
         if let Ok(DaemonResponse::ExecutionResult { result }) =
             daemon_request(&self.config, DaemonRequest::GetExecution { id: pending.0.clone() }).await
@@ -247,23 +288,14 @@ impl App {
                 "completed" => {
                     let raw_output = result["output"].as_str().unwrap_or("").to_string();
                     let response = extract_task_complete(&raw_output);
-                    let started = result["started_at"].as_str().unwrap_or("").to_string();
-                    let completed = result["completed_at"].as_str().unwrap_or("");
-                    let duration = if !started.is_empty() && !completed.is_empty() {
-                        // rough duration from timestamps (seconds)
-                        None // compute later if needed
-                    } else {
-                        None
-                    };
-
                     if let Some(msgs) = self.chat.get_mut(&pending.1) {
                         if let Some(msg) = msgs.get_mut(pending.2) {
                             msg.response = Some(response);
                             msg.status = ExecStatus::Completed;
-                            msg.duration_secs = duration;
                         }
                     }
                     self.pending = None;
+                    self.log_hint = None;
                 }
                 "failed" | "cancelled" => {
                     let err = result["error"].as_str().unwrap_or("unknown error").to_string();
@@ -274,8 +306,9 @@ impl App {
                         }
                     }
                     self.pending = None;
+                    self.log_hint = None;
                 }
-                _ => {} // still running, keep pending
+                _ => {} // still running
             }
         }
     }
@@ -472,7 +505,7 @@ fn render(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(3),
+            Constraint::Length(5),
         ])
         .split(area)
     } else {
@@ -560,26 +593,20 @@ fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
         }
 
         if i == app.selected_agent {
-            spans.push(Span::styled(
-                " ",
-                Style::default().bg(Color::DarkGray),
-            ));
+            spans.push(Span::raw("  "));
             spans.push(dot);
             spans.push(Span::styled(
                 short,
                 Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
-            spans.push(Span::styled(
-                "  ",
-                Style::default().bg(Color::DarkGray),
-            ));
+            spans.push(Span::raw("  "));
         } else {
-            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::raw("  "));
             spans.push(dot);
             spans.push(Span::styled(short, Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled("  ", Style::default()));
+            spans.push(Span::raw("  "));
         }
 
         used += tab_width;
@@ -672,14 +699,24 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         // Agent response
         match &msg.status {
             ExecStatus::Running => {
+                let spin = SPINNER[app.spinner_tick % SPINNER.len()];
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {}", short),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled(" › ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("thinking...", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} thinking...", spin),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
+                if let Some(hint) = &app.log_hint {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", hint),
+                        Style::default().fg(Color::from_u32(0x444444)),
+                    )));
+                }
                 lines.push(Line::from(
                     Span::styled("  ▶ running", Style::default().fg(Color::Yellow)),
                 ));
@@ -937,23 +974,31 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
         ..area
     };
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Length(1), // context / status
+        Constraint::Length(1), // log hint (only when pending)
+        Constraint::Length(1), // blank spacer
+        Constraint::Length(1), // input line
+    ])
+    .split(inner);
 
-    // Status / context line
+    // Context / status line
     let context = if let Some((msg, _)) = &app.status_msg {
         let color = if msg.starts_with('✗') { Color::Red } else { Color::Green };
         Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color)))
     } else if app.pending.is_some() {
-        Line::from(Span::styled(
-            format!("  ▶ waiting for {} to respond...", short),
-            Style::default().fg(Color::Yellow),
-        ))
-    } else {
+        let spin = SPINNER[app.spinner_tick % SPINNER.len()];
         Line::from(vec![
             Span::styled(
-                format!("  talking to "),
-                Style::default().fg(Color::DarkGray),
+                format!("  {} waiting for ", spin),
+                Style::default().fg(Color::Yellow),
             ),
+            Span::styled(short.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" to respond...", Style::default().fg(Color::Yellow)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  talking to ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 short.clone(),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -966,6 +1011,17 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(Paragraph::new(context), rows[0]);
 
+    // Live log hint while pending
+    if let Some(hint) = &app.log_hint {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("    {}", hint),
+                Style::default().fg(Color::from_u32(0x444444)),
+            ))),
+            rows[1],
+        );
+    }
+
     // Input line
     let cursor = if focused { "▌" } else { "" };
     let input_line = Line::from(vec![
@@ -973,5 +1029,5 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(app.composer_input.clone(), Style::default().fg(Color::White)),
         Span::styled(cursor, Style::default().fg(Color::Cyan)),
     ]);
-    f.render_widget(Paragraph::new(input_line), rows[1]);
+    f.render_widget(Paragraph::new(input_line), rows[3]);
 }
