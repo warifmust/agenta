@@ -394,7 +394,7 @@ impl App {
             for msg in msgs.iter_mut() {
                 if msg.status == ExecStatus::Completed {
                     if let Some(resp) = &msg.response {
-                        let len = resp.len();
+                        let len = resp.chars().count(); // char count, not bytes
                         if msg.typewriter_pos < len {
                             msg.typewriter_pos =
                                 (msg.typewriter_pos + TYPEWRITER_SPEED).min(len);
@@ -489,6 +489,14 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Restore terminal on panic so the shell isn't left in raw mode
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -772,22 +780,25 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
             ExecStatus::Completed => {
                 if let Some(resp) = &msg.response {
                     let is_latest = msg_i == msgs.len() - 1;
-                    // Typewriter: reveal up to typewriter_pos chars if this is the latest
-                    let display: &str = if is_latest && msg.typewriter_pos < resp.len() {
-                        &resp[..msg.typewriter_pos]
+                    let char_total = resp.chars().count();
+                    let is_animating = is_latest && msg.typewriter_pos < char_total;
+                    // Collect chars up to typewriter_pos — char-safe, no byte-boundary panics
+                    let display: String = if is_animating {
+                        resp.chars().take(msg.typewriter_pos).collect()
                     } else {
-                        resp.as_str()
+                        resp.clone()
                     };
-                    let is_animating = is_latest && msg.typewriter_pos < resp.len();
+                    let line_count = display.lines().count();
 
                     for (i, part) in display.lines().enumerate() {
+                        let is_last_line = i + 1 == line_count;
                         if i == 0 {
                             let mut spans = vec![
                                 Span::styled(format!("  {}", short), Style::default().fg(Color::Cyan)),
                                 Span::styled(" › ", Style::default().fg(Color::DarkGray)),
                                 Span::styled(part.to_string(), Style::default().fg(Color::White)),
                             ];
-                            if is_animating && i == display.lines().count() - 1 {
+                            if is_animating && is_last_line {
                                 spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
                             }
                             lines.push(Line::from(spans));
@@ -797,7 +808,7 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
                                 format!("{}{}", indent, part),
                                 Style::default().fg(Color::White),
                             )];
-                            if is_animating && i == display.lines().count() - 1 {
+                            if is_animating && is_last_line {
                                 spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
                             }
                             lines.push(Line::from(spans));
