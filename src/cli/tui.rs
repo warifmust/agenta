@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -10,16 +11,16 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 
 use crate::core::{AppConfig, DaemonRequest, DaemonResponse};
 use super::commands::daemon_request;
 
-const REFRESH_SECS: Duration = Duration::from_secs(2);
-const POLL_MS: Duration = Duration::from_millis(100);
+const REFRESH: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_millis(100);
 const STOP_WORDS: &[&str] = &["and", "for", "of", "the", "a", "an", "to", "in"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -39,27 +40,73 @@ fn abbrev(name: &str) -> String {
     }
 }
 
-fn short_ts(ts: &str) -> String {
-    // "2026-06-19T10:01:23..." → "Jun 19 10:01"
-    let t = if ts.len() > 16 { &ts[..16] } else { ts };
-    t.replace('T', " ")
-        .trim_start_matches(|c: char| c.is_ascii_digit() && false) // keep year for now
-        .to_string()
+fn fmt_ts(ts: &str) -> String {
+    // "2026-06-19T10:01:23.456Z" → "Jun 19 10:01"
+    if ts.len() < 16 {
+        return ts.to_string();
+    }
+    let date = &ts[..10]; // 2026-06-19
+    let time = &ts[11..16]; // 10:01
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() < 3 {
+        return format!("{} {}", date, time);
+    }
+    let mon = match parts[1] {
+        "01" => "Jan", "02" => "Feb", "03" => "Mar", "04" => "Apr",
+        "05" => "May", "06" => "Jun", "07" => "Jul", "08" => "Aug",
+        "09" => "Sep", "10" => "Oct", "11" => "Nov", "12" => "Dec",
+        _ => parts[1],
+    };
+    format!("{} {} {}", mon, parts[2], time)
 }
 
-// ── Focus / Tab ───────────────────────────────────────────────────────────────
+fn extract_task_complete(text: &str) -> String {
+    if let Some(pos) = text.rfind("TASK_COMPLETE:") {
+        let after = text[pos + "TASK_COMPLETE:".len()..].trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    // Return raw output if no TASK_COMPLETE marker
+    text.trim().to_string()
+}
 
-#[derive(Debug, PartialEq)]
-enum Focus {
-    Sidebar,
-    Main,
-    Composer,
+// ── Domain types ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExecStatus {
+    Running,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct ChatMsg {
+    run_num: usize,
+    input: String,
+    response: Option<String>,
+    status: ExecStatus,
+    started_at: String,
+    duration_secs: Option<i64>,
+}
+
+struct Pending {
+    exec_id: String,
+    agent_name: String,
+    msg_idx: usize,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum MainTab {
-    Execution,
-    RawLogs,
+enum AgentTab {
+    Chat,
+    Runs,
+    Config,
+}
+
+#[derive(Debug, PartialEq)]
+enum Focus {
+    Content,
+    Composer,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -67,89 +114,91 @@ enum MainTab {
 struct App {
     config: AppConfig,
     agents: Vec<serde_json::Value>,
+    selected_agent: usize,
+    tab_offset: usize,
+    agent_tab: AgentTab,
+    chat: HashMap<String, Vec<ChatMsg>>,
+    pending: Option<Pending>,
     executions: Vec<serde_json::Value>,
-    log_lines: Vec<String>,
+    focus: Focus,
+    scroll: u16,
+    composer_input: String,
     daemon_ok: bool,
     daemon_version: String,
-    sidebar_state: ListState,
-    focus: Focus,
-    tab: MainTab,
-    log_scroll: u16,
-    composer_input: String,
-    composer_to_idx: usize,
     status_msg: Option<(String, Instant)>,
     last_refresh: Instant,
 }
 
 impl App {
     fn new(config: AppConfig) -> Self {
-        let mut sidebar_state = ListState::default();
-        sidebar_state.select(Some(0));
         Self {
             config,
             agents: vec![],
+            selected_agent: 0,
+            tab_offset: 0,
+            agent_tab: AgentTab::Chat,
+            chat: HashMap::new(),
+            pending: None,
             executions: vec![],
-            log_lines: vec![],
+            focus: Focus::Content,
+            scroll: 0,
+            composer_input: String::new(),
             daemon_ok: false,
             daemon_version: String::new(),
-            sidebar_state,
-            focus: Focus::Sidebar,
-            tab: MainTab::Execution,
-            log_scroll: 0,
-            composer_input: String::new(),
-            composer_to_idx: 0,
             status_msg: None,
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
 
-    fn selected_agent(&self) -> Option<&serde_json::Value> {
-        self.sidebar_state.selected().and_then(|i| self.agents.get(i))
+    fn active_agent(&self) -> Option<&serde_json::Value> {
+        self.agents.get(self.selected_agent)
     }
 
-    fn selected_name(&self) -> String {
-        self.selected_agent()
+    fn active_name(&self) -> String {
+        self.active_agent()
             .and_then(|a| a["name"].as_str())
             .unwrap_or("—")
             .to_string()
     }
 
-    fn composer_targets(&self) -> Vec<String> {
-        std::iter::once("DALANG".to_string())
-            .chain(self.agents.iter().filter_map(|a| {
-                a["name"].as_str().map(abbrev)
-            }))
+    fn active_short(&self) -> String {
+        abbrev(&self.active_name())
+    }
+
+    fn active_chat(&self) -> &[ChatMsg] {
+        let name = self.active_name();
+        self.chat.get(&name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    fn run_count_for(&self, agent_name: &str) -> usize {
+        let agent_id = self.agents.iter()
+            .find(|a| a["name"].as_str() == Some(agent_name))
+            .and_then(|a| a["id"].as_str())
+            .unwrap_or("");
+        self.executions.iter()
+            .filter(|e| e["agent_id"].as_str() == Some(agent_id))
+            .count()
+    }
+
+    fn runs_for_active(&self) -> Vec<&serde_json::Value> {
+        let agent_id = self.active_agent()
+            .and_then(|a| a["id"].as_str())
+            .unwrap_or("");
+        self.executions.iter()
+            .filter(|e| e["agent_id"].as_str() == Some(agent_id))
             .collect()
     }
 
-    fn composer_target_label(&self) -> String {
-        let targets = self.composer_targets();
-        targets
-            .get(self.composer_to_idx)
-            .cloned()
-            .unwrap_or_else(|| "DALANG".to_string())
+    fn next_run_num(&self) -> usize {
+        let name = self.active_name();
+        self.chat.get(&name).map(|v| v.len() + 1).unwrap_or(1)
     }
 
-    fn composer_target_id(&self) -> String {
-        if self.composer_to_idx == 0 {
-            self.agents
-                .iter()
-                .find(|a| {
-                    a["name"]
-                        .as_str()
-                        .map(|n| n.contains("dalang"))
-                        .unwrap_or(false)
-                })
-                .and_then(|a| a["name"].as_str())
-                .unwrap_or("dalang")
-                .to_string()
-        } else {
-            self.agents
-                .get(self.composer_to_idx - 1)
-                .and_then(|a| a["name"].as_str())
-                .unwrap_or("")
-                .to_string()
-        }
+    fn select_agent(&mut self, idx: usize) {
+        self.selected_agent = idx;
+        self.scroll = 0;
+        self.agent_tab = AgentTab::Chat;
+        self.focus = Focus::Content;
     }
 
     async fn refresh(&mut self) {
@@ -169,100 +218,143 @@ impl App {
         if let Ok(DaemonResponse::AgentList { agents }) =
             daemon_request(&self.config, DaemonRequest::ListAgents).await
         {
-            let prev = self.sidebar_state.selected().unwrap_or(0);
             self.agents = agents;
             if !self.agents.is_empty() {
-                self.sidebar_state
-                    .select(Some(prev.min(self.agents.len() - 1)));
+                self.selected_agent = self.selected_agent.min(self.agents.len() - 1);
             }
         }
 
         if let Ok(DaemonResponse::ExecutionList { executions }) =
-            daemon_request(&self.config, DaemonRequest::ListExecutions { limit: 40 }).await
+            daemon_request(&self.config, DaemonRequest::ListExecutions { limit: 50 }).await
         {
             self.executions = executions;
         }
 
-        self.refresh_logs().await;
+        self.poll_pending().await;
     }
 
-    async fn refresh_logs(&mut self) {
-        let name = self.selected_name();
-        if name == "—" {
-            return;
-        }
-        if let Ok(DaemonResponse::ExecutionLog { lines }) = daemon_request(
-            &self.config,
-            DaemonRequest::GetLogs {
-                agent_id: name,
-                execution_id: None,
-                lines: 200,
-            },
-        )
-        .await
+    async fn poll_pending(&mut self) {
+        let pending = match &self.pending {
+            Some(p) => (p.exec_id.clone(), p.agent_name.clone(), p.msg_idx),
+            None => return,
+        };
+
+        if let Ok(DaemonResponse::ExecutionResult { result }) =
+            daemon_request(&self.config, DaemonRequest::GetExecution { id: pending.0.clone() }).await
         {
-            self.log_lines = lines;
+            let status = result["status"].as_str().unwrap_or("running");
+            match status {
+                "completed" => {
+                    let raw_output = result["output"].as_str().unwrap_or("").to_string();
+                    let response = extract_task_complete(&raw_output);
+                    let started = result["started_at"].as_str().unwrap_or("").to_string();
+                    let completed = result["completed_at"].as_str().unwrap_or("");
+                    let duration = if !started.is_empty() && !completed.is_empty() {
+                        // rough duration from timestamps (seconds)
+                        None // compute later if needed
+                    } else {
+                        None
+                    };
+
+                    if let Some(msgs) = self.chat.get_mut(&pending.1) {
+                        if let Some(msg) = msgs.get_mut(pending.2) {
+                            msg.response = Some(response);
+                            msg.status = ExecStatus::Completed;
+                            msg.duration_secs = duration;
+                        }
+                    }
+                    self.pending = None;
+                }
+                "failed" | "cancelled" => {
+                    let err = result["error"].as_str().unwrap_or("unknown error").to_string();
+                    if let Some(msgs) = self.chat.get_mut(&pending.1) {
+                        if let Some(msg) = msgs.get_mut(pending.2) {
+                            msg.response = Some(format!("✗ {}", err));
+                            msg.status = ExecStatus::Failed(err);
+                        }
+                    }
+                    self.pending = None;
+                }
+                _ => {} // still running, keep pending
+            }
         }
     }
 
-    fn sidebar_next(&mut self) {
-        if self.agents.is_empty() {
-            return;
-        }
-        let i = self.sidebar_state.selected().unwrap_or(0);
-        self.sidebar_state
-            .select(Some((i + 1).min(self.agents.len() - 1)));
-        self.reset_main();
-    }
-
-    fn sidebar_prev(&mut self) {
-        if self.agents.is_empty() {
-            return;
-        }
-        let i = self.sidebar_state.selected().unwrap_or(0);
-        self.sidebar_state.select(Some(i.saturating_sub(1)));
-        self.reset_main();
-    }
-
-    fn reset_main(&mut self) {
-        self.log_lines.clear();
-        self.log_scroll = 0;
-        self.last_refresh = Instant::now() - Duration::from_secs(60);
-    }
-
-    async fn send_composer(&mut self) {
+    async fn send_message(&mut self) {
         let input = self.composer_input.trim().to_string();
         if input.is_empty() {
             return;
         }
-        let agent_id = self.composer_target_id();
-        if agent_id.is_empty() {
-            self.set_status("✗ no agent found for target");
+        if !self.daemon_ok {
+            self.set_status("✗ daemon not running");
             return;
         }
+        if self.pending.is_some() {
+            self.set_status("✗ waiting for previous response...");
+            return;
+        }
+
+        let agent_name = self.active_name();
+        if agent_name == "—" {
+            self.set_status("✗ no agent selected");
+            return;
+        }
+
+        let run_num = self.next_run_num();
+
         match daemon_request(
             &self.config,
             DaemonRequest::RunAgent {
-                id: agent_id.clone(),
-                input: Some(input),
+                id: agent_name.clone(),
+                input: Some(input.clone()),
             },
         )
         .await
         {
             Ok(DaemonResponse::ExecutionStarted { execution_id }) => {
-                let short = &execution_id[..execution_id.len().min(8)];
-                self.set_status(&format!("▶ {} started ({})", agent_id, short));
+                let msg = ChatMsg {
+                    run_num,
+                    input: input.clone(),
+                    response: None,
+                    status: ExecStatus::Running,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    duration_secs: None,
+                };
+                let msgs = self.chat.entry(agent_name.clone()).or_default();
+                let msg_idx = msgs.len();
+                msgs.push(msg);
+
+                self.pending = Some(Pending {
+                    exec_id: execution_id,
+                    agent_name,
+                    msg_idx,
+                });
+                self.composer_input.clear();
+                self.scroll = u16::MAX;
             }
             Ok(DaemonResponse::Error { message }) => self.set_status(&format!("✗ {}", message)),
             Err(e) => self.set_status(&format!("✗ {}", e)),
             _ => {}
         }
-        self.composer_input.clear();
-        self.last_refresh = Instant::now() - Duration::from_secs(60);
     }
 
     fn set_status(&mut self, msg: &str) {
         self.status_msg = Some((msg.to_string(), Instant::now()));
+    }
+
+    fn agent_next(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        let next = (self.selected_agent + 1).min(self.agents.len() - 1);
+        self.select_agent(next);
+    }
+
+    fn agent_prev(&mut self) {
+        if self.selected_agent == 0 {
+            return;
+        }
+        self.select_agent(self.selected_agent - 1);
     }
 }
 
@@ -282,7 +374,7 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     loop {
         terminal.draw(|f| render(f, &mut app))?;
 
-        if event::poll(POLL_MS)? {
+        if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 if handle_key(&mut app, key.code, key.modifiers).await {
                     break;
@@ -290,14 +382,19 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
             }
         }
 
+        // Expire status messages
         if let Some((_, t)) = &app.status_msg {
             if t.elapsed() > Duration::from_secs(4) {
                 app.status_msg = None;
             }
         }
 
-        if app.last_refresh.elapsed() >= REFRESH_SECS {
-            app.refresh().await;
+        // Periodic refresh or pending poll
+        if app.last_refresh.elapsed() >= REFRESH || app.pending.is_some() {
+            app.poll_pending().await;
+            if app.last_refresh.elapsed() >= REFRESH {
+                app.refresh().await;
+            }
         }
     }
 
@@ -309,42 +406,54 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     use KeyCode::*;
     match (&app.focus, code, mods) {
+        // Global quit
         (_, Char('c'), KeyModifiers::CONTROL) => return true,
-        (Focus::Sidebar | Focus::Main, Char('q'), _) => return true,
+        (Focus::Content, Char('q'), _) => return true,
 
-        // Focus transitions
-        (Focus::Sidebar, Tab | Right | Enter, _) => {
-            app.focus = Focus::Main;
-            app.log_scroll = 0;
-        }
-        (Focus::Main, Left | Esc, _) => app.focus = Focus::Sidebar,
-        (Focus::Main, Tab, _) | (Focus::Main, Char('i'), _) => app.focus = Focus::Composer,
-        (Focus::Composer, Esc, _) => app.focus = Focus::Sidebar,
+        // Agent tab switching
+        (Focus::Content, Right | Char('l'), _) => app.agent_next(),
+        (Focus::Content, Left | Char('h'), _) => app.agent_prev(),
 
-        // Sidebar
-        (Focus::Sidebar, Down | Char('j'), _) => app.sidebar_next(),
-        (Focus::Sidebar, Up | Char('k'), _) => app.sidebar_prev(),
+        // Sub-tab switching
+        (Focus::Content, Char('1'), _) => {
+            app.agent_tab = AgentTab::Chat;
+            app.scroll = u16::MAX;
+        }
+        (Focus::Content, Char('2'), _) => {
+            app.agent_tab = AgentTab::Runs;
+            app.scroll = 0;
+        }
+        (Focus::Content, Char('3'), _) => {
+            app.agent_tab = AgentTab::Config;
+            app.scroll = 0;
+        }
 
-        // Main scroll + tab switch
-        (Focus::Main, Down | Char('j'), _) => {
-            app.log_scroll = app.log_scroll.saturating_add(1)
+        // Scroll
+        (Focus::Content, Down | Char('j'), _) => {
+            app.scroll = app.scroll.saturating_add(1)
         }
-        (Focus::Main, Up | Char('k'), _) => {
-            app.log_scroll = app.log_scroll.saturating_sub(1)
+        (Focus::Content, Up | Char('k'), _) => {
+            app.scroll = app.scroll.saturating_sub(1)
         }
-        (Focus::Main, Char('1'), _) => app.tab = MainTab::Execution,
-        (Focus::Main, Char('2'), _) => app.tab = MainTab::RawLogs,
+        (Focus::Content, Char('g'), _) => app.scroll = 0,
+        (Focus::Content, Char('G'), _) => app.scroll = u16::MAX,
+
+        // Enter composer
+        (Focus::Content, Tab | Char('i'), _)
+            if app.agent_tab == AgentTab::Chat =>
+        {
+            app.focus = Focus::Composer;
+        }
+
+        // Leave composer
+        (Focus::Composer, Esc, _) => app.focus = Focus::Content,
 
         // Composer input
         (Focus::Composer, Char(c), _) => app.composer_input.push(c),
         (Focus::Composer, Backspace, _) => {
             app.composer_input.pop();
         }
-        (Focus::Composer, Enter, _) => app.send_composer().await,
-        (Focus::Composer, Tab, _) => {
-            let max = app.composer_targets().len().max(1);
-            app.composer_to_idx = (app.composer_to_idx + 1) % max;
-        }
+        (Focus::Composer, Enter, _) => app.send_message().await,
 
         _ => {}
     }
@@ -355,27 +464,41 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
 
 fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    let has_composer = app.agent_tab == AgentTab::Chat;
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(4),
-    ])
-    .split(area);
+    let rows = if has_composer {
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(0),
+        ])
+        .split(area)
+    };
 
     render_topbar(f, app, rows[0]);
+    render_agent_tabs(f, app, rows[1]);
+    render_sub_tabs(f, app, rows[2]);
 
-    let cols = Layout::horizontal([
-        Constraint::Length(24),
-        Constraint::Fill(1),
-        Constraint::Length(26),
-    ])
-    .split(rows[1]);
+    match app.agent_tab {
+        AgentTab::Chat => render_chat(f, app, rows[3]),
+        AgentTab::Runs => render_runs(f, app, rows[3]),
+        AgentTab::Config => render_config(f, app, rows[3]),
+    }
 
-    render_sidebar(f, app, cols[0]);
-    render_center(f, app, cols[1]);
-    render_right(f, app, cols[2]);
-    render_composer(f, app, rows[2]);
+    if has_composer && rows[4].height > 0 {
+        render_composer(f, app, rows[4]);
+    }
 }
 
 // ── Topbar ─────────────────────────────────────────────────────────────────────
@@ -388,302 +511,402 @@ fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         app.daemon_version.clone()
     };
-    let left = Line::from(vec![
-        Span::styled(
-            "agenta ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("v{ver}"), Style::default().fg(Color::DarkGray)),
-    ]);
 
-    let (dot, dot_color) = if app.daemon_ok {
-        ("●", Color::Green)
-    } else {
-        ("✗", Color::Red)
-    };
-    let n = app.agents.len();
-    let right = Line::from(vec![
-        Span::styled(format!("daemon {dot}  "), Style::default().fg(dot_color)),
-        Span::styled(
-            format!("{n} agents  q:quit  tab:focus"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-
-    f.render_widget(Paragraph::new(left), cols[0]);
     f.render_widget(
-        Paragraph::new(right).alignment(Alignment::Right),
+        Paragraph::new(Line::from(vec![
+            Span::styled("agenta ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("v{ver}"), Style::default().fg(Color::DarkGray)),
+        ])),
+        cols[0],
+    );
+
+    let (dot, col) = if app.daemon_ok { ("●", Color::Green) } else { ("✗", Color::Red) };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("daemon {dot}  "), Style::default().fg(col)),
+            Span::styled(
+                "←/→:agent  1/2/3:tab  j/k:scroll  q:quit",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]))
+        .alignment(Alignment::Right),
         cols[1],
     );
 }
 
-// ── Sidebar ────────────────────────────────────────────────────────────────────
+// ── Agent tabs ─────────────────────────────────────────────────────────────────
 
-fn status_dot(status: &str) -> Span<'static> {
-    match status.to_lowercase().as_str() {
-        "running" => Span::styled("▶", Style::default().fg(Color::Green)),
-        "failed" | "error" => Span::styled("✗", Style::default().fg(Color::Red)),
-        _ => Span::styled("●", Style::default().fg(Color::DarkGray)),
+fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans: Vec<Span> = vec![];
+    let max_width = area.width as usize;
+    let mut used = 0usize;
+
+    for (i, agent) in app.agents.iter().enumerate() {
+        let name = agent["name"].as_str().unwrap_or("?");
+        let short = abbrev(name);
+        let status = agent["status"].as_str().unwrap_or("");
+
+        let dot = match status {
+            "running" | "Running" => Span::styled("▶ ", Style::default().fg(Color::Green)),
+            "failed"  | "Failed"  => Span::styled("✗ ", Style::default().fg(Color::Red)),
+            _                     => Span::styled("● ", Style::default().fg(Color::DarkGray)),
+        };
+
+        // Width estimate: 2(dot) + name + 2(padding) + 2(separator)
+        let tab_width = 2 + short.len() + 4;
+        if used + tab_width + 4 > max_width && i < app.agents.len() - 1 {
+            spans.push(Span::styled("···", Style::default().fg(Color::DarkGray)));
+            break;
+        }
+
+        if i == app.selected_agent {
+            spans.push(Span::styled(
+                " ",
+                Style::default().bg(Color::DarkGray),
+            ));
+            spans.push(dot);
+            spans.push(Span::styled(
+                short,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "  ",
+                Style::default().bg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::styled("  ", Style::default()));
+            spans.push(dot);
+            spans.push(Span::styled(short, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("  ", Style::default()));
+        }
+
+        used += tab_width;
     }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::from_u32(0x161616))),
+        area,
+    );
 }
 
-fn mode_tag(mode: &str) -> Span<'static> {
-    match mode.to_lowercase().as_str() {
-        "scheduled" => Span::styled("sched", Style::default().fg(Color::Blue)),
-        "continuous" => Span::styled("cont ", Style::default().fg(Color::Yellow)),
-        _ => Span::styled("once ", Style::default().fg(Color::DarkGray)),
-    }
-}
+// ── Sub-tabs ───────────────────────────────────────────────────────────────────
 
-fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Sidebar;
-    let border = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let block = Block::default()
-        .title(" agents ")
-        .borders(Borders::ALL)
-        .border_style(border);
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if app.agents.is_empty() {
-        f.render_widget(
-            Paragraph::new(if app.daemon_ok {
-                "no agents"
-            } else {
-                "daemon offline\nagenta daemon start"
-            })
-            .style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
-        return;
-    }
-
-    let items: Vec<ListItem> = app
-        .agents
-        .iter()
-        .map(|a| {
-            let name = a["name"].as_str().unwrap_or("?");
-            let status = a["status"].as_str().unwrap_or("");
-            let mode = a["execution_mode"].as_str().unwrap_or("");
-            let short = abbrev(name);
-            ListItem::new(Line::from(vec![
-                status_dot(status),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:<6} ", short),
-                    Style::default().fg(Color::White),
-                ),
-                mode_tag(mode),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(list, inner, &mut app.sidebar_state);
-}
-
-// ── Center ─────────────────────────────────────────────────────────────────────
-
-fn log_line_style(line: &str) -> Style {
-    if line.contains("TOOL_CALL:") || line.contains("TOOL_CALL :") {
-        Style::default().fg(Color::Yellow)
-    } else if line.contains("TASK_COMPLETE:") {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if line.to_lowercase().contains("error")
-        || line.to_lowercase().contains("failed")
-        || line.contains("✗")
-    {
-        Style::default().fg(Color::Red)
-    } else if line.contains("→") || line.contains("->") || line.starts_with('{') {
-        Style::default().fg(Color::Cyan)
-    } else if line.starts_with('[') || line.starts_with("20") {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::White)
-    }
-}
-
-fn render_center(f: &mut Frame, app: &App, area: Rect) {
-    let focused = app.focus == Focus::Main;
-    let border = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let name = app.selected_name();
-    let short = abbrev(&name);
-    let model = app
-        .selected_agent()
+fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let short = app.active_short();
+    let model = app.active_agent()
         .and_then(|a| a["model"].as_str())
         .unwrap_or("—");
 
-    let block = Block::default()
-        .title(format!(" {} · {} ", short, model))
-        .borders(Borders::ALL)
-        .border_style(border);
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let tab_area = Rect {
-        height: 1,
-        ..inner
-    };
-    let content_area = Rect {
-        y: inner.y + 1,
-        height: inner.height.saturating_sub(1),
-        ..inner
+    let tab_style = |t: AgentTab| -> Style {
+        if app.agent_tab == t {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     };
 
-    // Tab bar
-    let t1 = if app.tab == MainTab::Execution {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED)
+    let pending_indicator = if app.pending.is_some() {
+        Span::styled(" ▶", Style::default().fg(Color::Yellow))
     } else {
-        Style::default().fg(Color::DarkGray)
+        Span::raw("")
     };
-    let t2 = if app.tab == MainTab::RawLogs {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let tab_line = Line::from(vec![
-        Span::styled("[1] execution  ", t1),
-        Span::styled("[2] raw logs  ", t2),
-        Span::styled("j/k:scroll  ←:sidebar  i:compose", Style::default().fg(Color::DarkGray)),
+
+    let line = Line::from(vec![
+        Span::styled(format!(" {}  · ", short), Style::default().fg(Color::DarkGray)),
+        Span::styled("[1] chat  ", tab_style(AgentTab::Chat)),
+        Span::styled("[2] runs  ", tab_style(AgentTab::Runs)),
+        Span::styled("[3] config  ", tab_style(AgentTab::Config)),
+        Span::styled(
+            format!("  {}", model),
+            Style::default().fg(Color::DarkGray),
+        ),
+        pending_indicator,
     ]);
-    f.render_widget(Paragraph::new(tab_line), tab_area);
 
-    if app.log_lines.is_empty() {
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Color::from_u32(0x111111))),
+        area,
+    );
+}
+
+// ── Chat view ──────────────────────────────────────────────────────────────────
+
+fn render_chat(f: &mut Frame, app: &App, area: Rect) {
+    let msgs = app.active_chat();
+    let short = app.active_short();
+
+    if msgs.is_empty() {
+        let hint = format!(
+            "  no conversation yet\n  press i or Tab to start chatting with {}",
+            short
+        );
         f.render_widget(
-            Paragraph::new(if app.daemon_ok {
-                "select an agent and press → to view logs"
-            } else {
-                "daemon not running"
-            })
-            .style(Style::default().fg(Color::DarkGray)),
-            content_area,
+            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            area,
         );
         return;
     }
 
-    let style_fn: fn(&str) -> Style = match app.tab {
-        MainTab::Execution => log_line_style,
-        MainTab::RawLogs => |_| Style::default().fg(Color::DarkGray),
-    };
+    let mut lines: Vec<Line> = vec![];
 
-    let lines: Vec<Line> = app
-        .log_lines
-        .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), style_fn(l))))
-        .collect();
+    for msg in msgs {
+        // Run separator
+        let ts = fmt_ts(&msg.started_at);
+        lines.push(Line::from(Span::styled(
+            format!("  ── run #{} · {} ──", msg.run_num, ts),
+            Style::default().fg(Color::from_u32(0x333333)),
+        )));
+        lines.push(Line::from(""));
+
+        // User message
+        lines.push(Line::from(vec![
+            Span::styled("  you", Style::default().fg(Color::DarkGray)),
+            Span::styled(" › ", Style::default().fg(Color::DarkGray)),
+            Span::styled(msg.input.clone(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(""));
+
+        // Agent response
+        match &msg.status {
+            ExecStatus::Running => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}", short),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(" › ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("thinking...", Style::default().fg(Color::DarkGray)),
+                ]));
+                lines.push(Line::from(
+                    Span::styled("  ▶ running", Style::default().fg(Color::Yellow)),
+                ));
+            }
+            ExecStatus::Completed => {
+                if let Some(resp) = &msg.response {
+                    for (i, part) in resp.lines().enumerate() {
+                        if i == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  {}", short),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(" › ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(part.to_string(), Style::default().fg(Color::White)),
+                            ]));
+                        } else {
+                            let indent = " ".repeat(short.len() + 6);
+                            lines.push(Line::from(Span::styled(
+                                format!("{}{}", indent, part),
+                                Style::default().fg(Color::White),
+                            )));
+                        }
+                    }
+                }
+                lines.push(Line::from(
+                    Span::styled("  ✓ completed", Style::default().fg(Color::from_u32(0x3b6d11))),
+                ));
+            }
+            ExecStatus::Failed(err) => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}", short),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(" › ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("failed: {}", err),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
+                lines.push(Line::from(
+                    Span::styled("  ✗ failed", Style::default().fg(Color::Red)),
+                ));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Auto-scroll to bottom: clamp scroll to max possible
+    let total = lines.len() as u16;
+    let visible = area.height;
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.scroll.min(max_scroll);
 
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((app.log_scroll, 0)),
-        content_area,
+            .scroll((scroll, 0)),
+        area,
     );
 }
 
-// ── Right panel ────────────────────────────────────────────────────────────────
+// ── Runs view ──────────────────────────────────────────────────────────────────
 
-fn render_right(f: &mut Frame, app: &App, area: Rect) {
-    let selected_name = app.selected_name();
-    let short = abbrev(&selected_name);
+fn render_runs(f: &mut Frame, app: &App, area: Rect) {
+    let runs = app.runs_for_active();
 
-    let block = Block::default()
-        .title(format!(" runs · {} ", short))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let agent_runs: Vec<&serde_json::Value> = app
-        .executions
-        .iter()
-        .filter(|e| {
-            e["agent_name"]
-                .as_str()
-                .or_else(|| e["agent_id"].as_str())
-                .map(|n| n == selected_name)
-                .unwrap_or(false)
-        })
-        .take(25)
-        .collect();
-
-    if agent_runs.is_empty() {
+    if runs.is_empty() {
         f.render_widget(
-            Paragraph::new("no runs yet").style(Style::default().fg(Color::DarkGray)),
-            inner,
+            Paragraph::new("  no runs yet").style(Style::default().fg(Color::DarkGray)),
+            area,
         );
         return;
     }
 
-    let items: Vec<ListItem> = agent_runs
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let status = e["status"].as_str().unwrap_or("?");
-            let ts = e["created_at"]
-                .as_str()
-                .or_else(|| e["started_at"].as_str())
-                .map(short_ts)
-                .unwrap_or_else(|| "—".to_string());
+    let mut lines: Vec<Line> = vec![];
 
-            let (badge, badge_color) = match status {
-                "completed" | "done" => ("✓", Color::Green),
-                "running" => ("▶", Color::Yellow),
-                "failed" | "error" => ("✗", Color::Red),
-                _ => ("·", Color::DarkGray),
-            };
+    for (i, e) in runs.iter().enumerate() {
+        let status = e["status"].as_str().unwrap_or("?");
+        let ts = e["started_at"]
+            .as_str()
+            .map(fmt_ts)
+            .unwrap_or_else(|| "—".to_string());
+        let input_preview: String = e["input"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(50)
+            .collect();
+        let output_preview: String = e["output"]
+            .as_str()
+            .map(|o| extract_task_complete(o))
+            .unwrap_or_default()
+            .chars()
+            .take(60)
+            .collect();
 
-            let preview = e["output"]
-                .as_str()
-                .map(|s| s.chars().take(20).collect::<String>())
-                .unwrap_or_default();
+        let (badge, badge_color) = match status {
+            "completed" => ("✓", Color::Green),
+            "running"   => ("▶", Color::Yellow),
+            "failed"    => ("✗", Color::Red),
+            "cancelled" => ("○", Color::DarkGray),
+            _           => ("·", Color::DarkGray),
+        };
 
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("#{:<3}", i + 1),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(badge, Style::default().fg(badge_color)),
-                    Span::raw("  "),
-                    Span::styled(ts, Style::default().fg(Color::DarkGray)),
-                ]),
-                Line::from(Span::styled(
-                    format!("     {}", preview),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
+        let num = format!("#{}", runs.len() - i);
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<5}", num), Style::default().fg(Color::DarkGray)),
+            Span::styled(badge, Style::default().fg(badge_color)),
+            Span::raw("  "),
+            Span::styled(ts, Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                format!("in  › {}", input_preview),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("        "),
+            Span::styled(
+                if output_preview.is_empty() {
+                    "out › —".to_string()
+                } else {
+                    format!("out › {}", output_preview)
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
 
-    f.render_widget(List::new(items), inner);
+    let total = lines.len() as u16;
+    let max_scroll = total.saturating_sub(area.height);
+    let scroll = app.scroll.min(max_scroll);
+
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)),
+        area,
+    );
+}
+
+// ── Config view ────────────────────────────────────────────────────────────────
+
+fn render_config(f: &mut Frame, app: &App, area: Rect) {
+    let agent = match app.active_agent() {
+        Some(a) => a,
+        None => {
+            f.render_widget(
+                Paragraph::new("  no agent selected").style(Style::default().fg(Color::DarkGray)),
+                area,
+            );
+            return;
+        }
+    };
+
+    let fields: &[(&str, &str)] = &[
+        ("name",     "name"),
+        ("model",    "model"),
+        ("provider", "provider"),
+        ("mode",     "execution_mode"),
+        ("schedule", "schedule"),
+        ("memory",   "memory_enabled"),
+        ("deep",     "deep_agent"),
+        ("status",   "status"),
+    ];
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    for (label, key) in fields {
+        let val = match &agent[key] {
+            serde_json::Value::Null | serde_json::Value::Bool(false) => {
+                Span::styled("—", Style::default().fg(Color::DarkGray))
+            }
+            serde_json::Value::Bool(true) => {
+                Span::styled("yes", Style::default().fg(Color::Green))
+            }
+            serde_json::Value::String(s) if s.is_empty() => {
+                Span::styled("—", Style::default().fg(Color::DarkGray))
+            }
+            serde_json::Value::String(s) => {
+                Span::styled(s.clone(), Style::default().fg(Color::White))
+            }
+            other => Span::styled(other.to_string(), Style::default().fg(Color::White)),
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:12}", format!("{}:", label)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            val,
+        ]));
+    }
+
+    // Tool count
+    let tool_count = app.run_count_for(&app.active_name());
+    lines.push(Line::from(vec![
+        Span::styled("  runs:       ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            tool_count.to_string(),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    // System prompt preview
+    if let Some(prompt) = agent["system_prompt"].as_str() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  prompt:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for chunk in prompt.chars().collect::<Vec<_>>().chunks(60) {
+            let s: String = chunk.iter().collect();
+            lines.push(Line::from(Span::styled(
+                format!("    {}", s),
+                Style::default().fg(Color::from_u32(0x555555)),
+            )));
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).scroll((app.scroll, 0)),
+        area,
+    );
 }
 
 // ── Composer ───────────────────────────────────────────────────────────────────
@@ -696,69 +919,59 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .border_style(border);
+    let short = app.active_short();
+    let model = app.active_agent()
+        .and_then(|a| a["model"].as_str())
+        .unwrap_or("—");
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(border),
+        area,
+    );
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let inner = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
 
-    // Status / To: line
-    let header = if let Some((msg, _)) = &app.status_msg {
-        let color = if msg.starts_with('✗') {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        Line::from(Span::styled(msg.clone(), Style::default().fg(color)))
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+
+    // Status / context line
+    let context = if let Some((msg, _)) = &app.status_msg {
+        let color = if msg.starts_with('✗') { Color::Red } else { Color::Green };
+        Line::from(Span::styled(format!("  {}", msg), Style::default().fg(color)))
+    } else if app.pending.is_some() {
+        Line::from(Span::styled(
+            format!("  ▶ waiting for {} to respond...", short),
+            Style::default().fg(Color::Yellow),
+        ))
     } else {
-        let target = app.composer_target_label();
         Line::from(vec![
-            Span::styled("to: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("[{} ▾]", target),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                format!("  talking to "),
+                Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                "  tab:switch",
+                short.clone(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", model),
                 Style::default().fg(Color::DarkGray),
             ),
         ])
     };
-    f.render_widget(Paragraph::new(header), rows[0]);
+    f.render_widget(Paragraph::new(context), rows[0]);
 
     // Input line
-    let cursor = if focused { "▌" } else { " " };
+    let cursor = if focused { "▌" } else { "" };
     let input_line = Line::from(vec![
-        Span::styled("› ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            app.composer_input.clone(),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("  › ", Style::default().fg(Color::Cyan)),
+        Span::styled(app.composer_input.clone(), Style::default().fg(Color::White)),
         Span::styled(cursor, Style::default().fg(Color::Cyan)),
     ]);
     f.render_widget(Paragraph::new(input_line), rows[1]);
-
-    // Hint
-    let hint = if focused {
-        "  enter:send  esc:cancel"
-    } else {
-        "  press tab to focus  ·  enter to send"
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        rows[2],
-    );
 }
