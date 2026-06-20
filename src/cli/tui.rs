@@ -21,8 +21,10 @@ use super::commands::daemon_request;
 
 const REFRESH: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
+const TYPEWRITER_SPEED: usize = 8; // chars revealed per tick
 const STOP_WORDS: &[&str] = &["and", "for", "of", "the", "a", "an", "to", "in"];
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SIDEBAR_W: u16 = 22;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -42,12 +44,11 @@ fn abbrev(name: &str) -> String {
 }
 
 fn fmt_ts(ts: &str) -> String {
-    // "2026-06-19T10:01:23.456Z" → "Jun 19 10:01"
     if ts.len() < 16 {
         return ts.to_string();
     }
-    let date = &ts[..10]; // 2026-06-19
-    let time = &ts[11..16]; // 10:01
+    let date = &ts[..10];
+    let time = &ts[11..16];
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() < 3 {
         return format!("{} {}", date, time);
@@ -68,8 +69,66 @@ fn extract_task_complete(text: &str) -> String {
             return after.to_string();
         }
     }
-    // Return raw output if no TASK_COMPLETE marker
     text.trim().to_string()
+}
+
+fn strip_timestamp(line: &str) -> &str {
+    let s = line.trim();
+    if s.starts_with('[') {
+        if let Some(pos) = s.find("] ") {
+            return &s[pos + 2..];
+        }
+    }
+    s
+}
+
+fn is_meaningful_log(line: &str) -> bool {
+    let s = strip_timestamp(line);
+    if s.is_empty() { return false; }
+    // Skip noisy internal lines
+    !s.starts_with("Starting agent")
+        && !s.starts_with("Agent loop")
+        && !s.starts_with("Iteration ")
+        && !s.starts_with("TASK_COMPLETE")
+        && !s.starts_with('{')
+        && !s.starts_with('[')
+        && !s.contains("execution_id")
+        && s.len() > 3
+}
+
+// ── Pixel-art robot logo ──────────────────────────────────────────────────────
+
+fn robot_logo<'a>() -> Vec<Line<'a>> {
+    let b = Style::default().fg(Color::Rgb(82, 110, 130));   // body
+    let e = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD); // eyes
+    let m = Style::default().fg(Color::Rgb(55, 75, 90));     // mouth/details
+    let h = Style::default().fg(Color::Green);               // heart
+    let c = Style::default().fg(Color::Yellow);              // bitcoin
+    let a = Style::default().fg(Color::Red);                 // antenna tip
+
+    vec![
+        Line::from(vec![Span::raw("      "), Span::styled("▮", a)]),
+        Line::from(vec![Span::styled("  ████████  ", b)]),
+        Line::from(vec![
+            Span::styled("  █ ", b),
+            Span::styled("◉", e),
+            Span::styled("  ", b),
+            Span::styled("◉", e),
+            Span::styled(" █  ", b),
+        ]),
+        Line::from(vec![Span::styled("  █ ", b), Span::styled("─────", m), Span::styled(" █  ", b)]),
+        Line::from(vec![Span::styled("  ████████  ", b)]),
+        Line::from(vec![Span::styled("    ████    ", b)]),
+        Line::from(vec![Span::styled(" ██████████ ", b)]),
+        Line::from(vec![
+            Span::styled(" █  ", b),
+            Span::styled("♥", h),
+            Span::styled("   ", b),
+            Span::styled("₿", c),
+            Span::styled("  █ ", b),
+        ]),
+        Line::from(vec![Span::styled(" ██████████ ", b)]),
+    ]
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -88,7 +147,7 @@ struct ChatMsg {
     response: Option<String>,
     status: ExecStatus,
     started_at: String,
-    duration_secs: Option<i64>,
+    typewriter_pos: usize, // how many chars of response to reveal
 }
 
 struct Pending {
@@ -129,7 +188,7 @@ struct App {
     status_msg: Option<(String, Instant)>,
     last_refresh: Instant,
     spinner_tick: usize,
-    log_hint: Option<String>,
+    stream_lines: Vec<String>, // live log lines while pending
 }
 
 impl App {
@@ -151,7 +210,7 @@ impl App {
             status_msg: None,
             last_refresh: Instant::now() - Duration::from_secs(60),
             spinner_tick: 0,
-            log_hint: None,
+            stream_lines: vec![],
         }
     }
 
@@ -242,73 +301,98 @@ impl App {
         let pending = match &self.pending {
             Some(p) => (p.exec_id.clone(), p.agent_name.clone(), p.msg_idx),
             None => {
-                self.log_hint = None;
+                self.stream_lines.clear();
                 return;
             }
         };
 
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
 
-        // Fetch latest log line as live hint
+        // Poll logs for live streaming display
         if let Ok(DaemonResponse::ExecutionLog { lines }) = daemon_request(
             &self.config,
             DaemonRequest::GetLogs {
                 agent_id: pending.1.clone(),
                 execution_id: Some(pending.0.clone()),
-                lines: 20,
+                lines: 30,
             },
         )
         .await
         {
-            let hint = lines.iter().rev()
-                .find(|l| {
-                    let trimmed = l.trim();
-                    !trimmed.is_empty()
-                        && !trimmed.starts_with("TASK_COMPLETE")
-                        && !trimmed.contains("Starting agent")
-                })
-                .map(|l| {
-                    // Strip leading timestamp/bracket noise: [2026-06-20 10:01:23] TEXT
-                    let s = l.trim();
-                    if let Some(rest) = s.strip_prefix('[') {
-                        if let Some(pos) = rest.find("] ") {
-                            return rest[pos + 2..].chars().take(80).collect::<String>();
+            self.stream_lines = lines.iter()
+                .filter(|l| is_meaningful_log(l))
+                .map(|l| strip_timestamp(l).chars().take(70).collect::<String>())
+                .collect();
+
+            // Check if TASK_COMPLETE appeared in logs before execution record updates
+            let tc = lines.iter().rev().find_map(|l| {
+                let s = strip_timestamp(l);
+                if let Some(pos) = s.find("TASK_COMPLETE:") {
+                    let after = s[pos + "TASK_COMPLETE:".len()..].trim();
+                    if !after.is_empty() { return Some(after.to_string()); }
+                }
+                None
+            });
+            if let Some(response) = tc {
+                if let Some(msgs) = self.chat.get_mut(&pending.1) {
+                    if let Some(msg) = msgs.get_mut(pending.2) {
+                        if msg.status == ExecStatus::Running {
+                            msg.response = Some(response);
+                            // keep Running so typewriter starts; mark Completed below
                         }
                     }
-                    s.chars().take(80).collect::<String>()
-                });
-            self.log_hint = hint;
+                }
+            }
         }
 
+        // Check execution status
         if let Ok(DaemonResponse::ExecutionResult { result }) =
             daemon_request(&self.config, DaemonRequest::GetExecution { id: pending.0.clone() }).await
         {
             let status = result["status"].as_str().unwrap_or("running");
             match status {
                 "completed" => {
-                    let raw_output = result["output"].as_str().unwrap_or("").to_string();
-                    let response = extract_task_complete(&raw_output);
+                    let raw = result["output"].as_str().unwrap_or("").to_string();
+                    let response = extract_task_complete(&raw);
                     if let Some(msgs) = self.chat.get_mut(&pending.1) {
                         if let Some(msg) = msgs.get_mut(pending.2) {
                             msg.response = Some(response);
                             msg.status = ExecStatus::Completed;
+                            msg.typewriter_pos = 0; // start typewriter reveal
                         }
                     }
                     self.pending = None;
-                    self.log_hint = None;
+                    self.stream_lines.clear();
                 }
                 "failed" | "cancelled" => {
                     let err = result["error"].as_str().unwrap_or("unknown error").to_string();
                     if let Some(msgs) = self.chat.get_mut(&pending.1) {
                         if let Some(msg) = msgs.get_mut(pending.2) {
-                            msg.response = Some(format!("✗ {}", err));
+                            msg.response = Some(format!("failed: {}", err));
                             msg.status = ExecStatus::Failed(err);
                         }
                     }
                     self.pending = None;
-                    self.log_hint = None;
+                    self.stream_lines.clear();
                 }
-                _ => {} // still running
+                _ => {}
+            }
+        }
+    }
+
+    fn advance_typewriter(&mut self) {
+        let name = self.active_name();
+        if let Some(msgs) = self.chat.get_mut(&name) {
+            for msg in msgs.iter_mut() {
+                if msg.status == ExecStatus::Completed {
+                    if let Some(resp) = &msg.response {
+                        let len = resp.len();
+                        if msg.typewriter_pos < len {
+                            msg.typewriter_pos =
+                                (msg.typewriter_pos + TYPEWRITER_SPEED).min(len);
+                        }
+                    }
+                }
             }
         }
     }
@@ -351,7 +435,7 @@ impl App {
                     response: None,
                     status: ExecStatus::Running,
                     started_at: chrono::Utc::now().to_rfc3339(),
-                    duration_secs: None,
+                    typewriter_pos: 0,
                 };
                 let msgs = self.chat.entry(agent_name.clone()).or_default();
                 let msg_idx = msgs.len();
@@ -376,18 +460,18 @@ impl App {
     }
 
     fn agent_next(&mut self) {
-        if self.agents.is_empty() {
-            return;
-        }
+        if self.agents.is_empty() { return; }
         let next = (self.selected_agent + 1).min(self.agents.len() - 1);
         self.select_agent(next);
     }
 
     fn agent_prev(&mut self) {
-        if self.selected_agent == 0 {
-            return;
-        }
+        if self.selected_agent == 0 { return; }
         self.select_agent(self.selected_agent - 1);
+    }
+
+    fn total_runs(&self) -> usize {
+        self.executions.len()
     }
 }
 
@@ -405,6 +489,7 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     app.refresh().await;
 
     loop {
+        app.advance_typewriter();
         terminal.draw(|f| render(f, &mut app))?;
 
         if event::poll(POLL)? {
@@ -415,19 +500,18 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
             }
         }
 
-        // Expire status messages
         if let Some((_, t)) = &app.status_msg {
             if t.elapsed() > Duration::from_secs(4) {
                 app.status_msg = None;
             }
         }
 
-        // Periodic refresh or pending poll
-        if app.last_refresh.elapsed() >= REFRESH || app.pending.is_some() {
+        if app.pending.is_some() {
             app.poll_pending().await;
-            if app.last_refresh.elapsed() >= REFRESH {
-                app.refresh().await;
-            }
+        }
+
+        if app.last_refresh.elapsed() >= REFRESH {
+            app.refresh().await;
         }
     }
 
@@ -439,53 +523,28 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     use KeyCode::*;
     match (&app.focus, code, mods) {
-        // Global quit
         (_, Char('c'), KeyModifiers::CONTROL) => return true,
         (Focus::Content, Char('q'), _) => return true,
 
-        // Agent tab switching
         (Focus::Content, Right | Char('l'), _) => app.agent_next(),
         (Focus::Content, Left | Char('h'), _) => app.agent_prev(),
 
-        // Sub-tab switching
-        (Focus::Content, Char('1'), _) => {
-            app.agent_tab = AgentTab::Chat;
-            app.scroll = u16::MAX;
-        }
-        (Focus::Content, Char('2'), _) => {
-            app.agent_tab = AgentTab::Runs;
-            app.scroll = 0;
-        }
-        (Focus::Content, Char('3'), _) => {
-            app.agent_tab = AgentTab::Config;
-            app.scroll = 0;
-        }
+        (Focus::Content, Char('1'), _) => { app.agent_tab = AgentTab::Chat; app.scroll = u16::MAX; }
+        (Focus::Content, Char('2'), _) => { app.agent_tab = AgentTab::Runs; app.scroll = 0; }
+        (Focus::Content, Char('3'), _) => { app.agent_tab = AgentTab::Config; app.scroll = 0; }
 
-        // Scroll
-        (Focus::Content, Down | Char('j'), _) => {
-            app.scroll = app.scroll.saturating_add(1)
-        }
-        (Focus::Content, Up | Char('k'), _) => {
-            app.scroll = app.scroll.saturating_sub(1)
-        }
+        (Focus::Content, Down | Char('j'), _) => { app.scroll = app.scroll.saturating_add(1); }
+        (Focus::Content, Up | Char('k'), _)   => { app.scroll = app.scroll.saturating_sub(1); }
         (Focus::Content, Char('g'), _) => app.scroll = 0,
         (Focus::Content, Char('G'), _) => app.scroll = u16::MAX,
 
-        // Enter composer
-        (Focus::Content, Tab | Char('i'), _)
-            if app.agent_tab == AgentTab::Chat =>
-        {
+        (Focus::Content, Tab | Char('i'), _) if app.agent_tab == AgentTab::Chat => {
             app.focus = Focus::Composer;
         }
 
-        // Leave composer
         (Focus::Composer, Esc, _) => app.focus = Focus::Content,
-
-        // Composer input
         (Focus::Composer, Char(c), _) => app.composer_input.push(c),
-        (Focus::Composer, Backspace, _) => {
-            app.composer_input.pop();
-        }
+        (Focus::Composer, Backspace, _) => { app.composer_input.pop(); }
         (Focus::Composer, Enter, _) => app.send_message().await,
 
         _ => {}
@@ -498,36 +557,35 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
 fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let has_composer = app.agent_tab == AgentTab::Chat;
+    let composer_h = if has_composer { 5 } else { 0 };
 
-    let rows = if has_composer {
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(5),
-        ])
-        .split(area)
-    } else {
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(0),
-        ])
-        .split(area)
-    };
+    let rows = Layout::vertical([
+        Constraint::Length(1),            // topbar
+        Constraint::Length(1),            // agent tabs
+        Constraint::Length(1),            // sub-tabs
+        Constraint::Fill(1),              // content
+        Constraint::Length(composer_h),   // composer
+    ])
+    .split(area);
 
     render_topbar(f, app, rows[0]);
     render_agent_tabs(f, app, rows[1]);
     render_sub_tabs(f, app, rows[2]);
 
+    // Split content into main + right sidebar
+    let [main_area, sidebar_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(SIDEBAR_W),
+    ])
+    .areas(rows[3]);
+
     match app.agent_tab {
-        AgentTab::Chat => render_chat(f, app, rows[3]),
-        AgentTab::Runs => render_runs(f, app, rows[3]),
-        AgentTab::Config => render_config(f, app, rows[3]),
+        AgentTab::Chat   => render_chat(f, app, main_area),
+        AgentTab::Runs   => render_runs(f, app, main_area),
+        AgentTab::Config => render_config(f, app, main_area),
     }
+
+    render_sidebar(f, app, sidebar_area);
 
     if has_composer && rows[4].height > 0 {
         render_composer(f, app, rows[4]);
@@ -537,41 +595,35 @@ fn render(f: &mut Frame, app: &mut App) {
 // ── Topbar ─────────────────────────────────────────────────────────────────────
 
 fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(area);
+    let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(area);
 
-    let ver = if app.daemon_version.is_empty() {
-        "—".to_string()
-    } else {
-        app.daemon_version.clone()
-    };
+    let ver = if app.daemon_version.is_empty() { "—".to_string() } else { app.daemon_version.clone() };
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("agenta ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{ver}"), Style::default().fg(Color::DarkGray)),
         ])),
-        cols[0],
+        left,
     );
 
     let (dot, col) = if app.daemon_ok { ("●", Color::Green) } else { ("✗", Color::Red) };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("daemon {dot}  "), Style::default().fg(col)),
-            Span::styled(
-                "←/→:agent  1/2/3:tab  j/k:scroll  q:quit",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("←/→:agent  1/2/3:tab  j/k:scroll  q:quit", Style::default().fg(Color::DarkGray)),
         ]))
         .alignment(Alignment::Right),
-        cols[1],
+        right,
     );
 }
 
 // ── Agent tabs ─────────────────────────────────────────────────────────────────
 
 fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
+    // Reserve sidebar width so tabs don't bleed over the sidebar
+    let max_width = area.width.saturating_sub(SIDEBAR_W) as usize;
     let mut spans: Vec<Span> = vec![];
-    let max_width = area.width as usize;
     let mut used = 0usize;
 
     for (i, agent) in app.agents.iter().enumerate() {
@@ -579,14 +631,13 @@ fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
         let short = abbrev(name);
         let status = agent["status"].as_str().unwrap_or("");
 
-        let dot = match status {
-            "running" | "Running" => Span::styled("▶ ", Style::default().fg(Color::Green)),
-            "failed"  | "Failed"  => Span::styled("✗ ", Style::default().fg(Color::Red)),
-            _                     => Span::styled("● ", Style::default().fg(Color::DarkGray)),
+        let (dot_str, dot_color) = match status {
+            "running" | "Running" => ("▶ ", Color::Green),
+            "failed"  | "Failed"  => ("✗ ", Color::Red),
+            _                     => ("● ", Color::DarkGray),
         };
 
-        // Width estimate: 2(dot) + name + 2(padding) + 2(separator)
-        let tab_width = 2 + short.len() + 4;
+        let tab_width = 2 + 2 + short.len() + 2;
         if used + tab_width + 4 > max_width && i < app.agents.len() - 1 {
             spans.push(Span::styled("···", Style::default().fg(Color::DarkGray)));
             break;
@@ -594,17 +645,15 @@ fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
 
         if i == app.selected_agent {
             spans.push(Span::raw("  "));
-            spans.push(dot);
+            spans.push(Span::styled(dot_str, Style::default().fg(Color::Cyan)));
             spans.push(Span::styled(
                 short,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ));
             spans.push(Span::raw("  "));
         } else {
             spans.push(Span::raw("  "));
-            spans.push(dot);
+            spans.push(Span::styled(dot_str, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(short, Style::default().fg(Color::DarkGray)));
             spans.push(Span::raw("  "));
         }
@@ -613,8 +662,7 @@ fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(
-        Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(Color::from_u32(0x161616))),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::from_u32(0x161616))),
         area,
     );
 }
@@ -623,9 +671,7 @@ fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
     let short = app.active_short();
-    let model = app.active_agent()
-        .and_then(|a| a["model"].as_str())
-        .unwrap_or("—");
+    let model = app.active_agent().and_then(|a| a["model"].as_str()).unwrap_or("—");
 
     let tab_style = |t: AgentTab| -> Style {
         if app.agent_tab == t {
@@ -636,25 +682,22 @@ fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let pending_indicator = if app.pending.is_some() {
-        Span::styled(" ▶", Style::default().fg(Color::Yellow))
+        let spin = SPINNER[app.spinner_tick % SPINNER.len()];
+        Span::styled(format!(" {}", spin), Style::default().fg(Color::Yellow))
     } else {
         Span::raw("")
     };
 
-    let line = Line::from(vec![
-        Span::styled(format!(" {}  · ", short), Style::default().fg(Color::DarkGray)),
-        Span::styled("[1] chat  ", tab_style(AgentTab::Chat)),
-        Span::styled("[2] runs  ", tab_style(AgentTab::Runs)),
-        Span::styled("[3] config  ", tab_style(AgentTab::Config)),
-        Span::styled(
-            format!("  {}", model),
-            Style::default().fg(Color::DarkGray),
-        ),
-        pending_indicator,
-    ]);
-
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::from_u32(0x111111))),
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {}  · ", short), Style::default().fg(Color::DarkGray)),
+            Span::styled("[1] chat  ", tab_style(AgentTab::Chat)),
+            Span::styled("[2] runs  ", tab_style(AgentTab::Runs)),
+            Span::styled("[3] config  ", tab_style(AgentTab::Config)),
+            Span::styled(format!("  {}", model), Style::default().fg(Color::DarkGray)),
+            pending_indicator,
+        ]))
+        .style(Style::default().bg(Color::from_u32(0x111111))),
         area,
     );
 }
@@ -666,12 +709,12 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
     let short = app.active_short();
 
     if msgs.is_empty() {
-        let hint = format!(
-            "  no conversation yet\n  press i or Tab to start chatting with {}",
-            short
-        );
         f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(format!(
+                "\n  no conversation yet\n  press i or Tab to chat with {}",
+                short
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
             area,
         );
         return;
@@ -679,12 +722,11 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = vec![];
 
-    for msg in msgs {
-        // Run separator
+    for (msg_i, msg) in msgs.iter().enumerate() {
         let ts = fmt_ts(&msg.started_at);
         lines.push(Line::from(Span::styled(
             format!("  ── run #{} · {} ──", msg.run_num, ts),
-            Style::default().fg(Color::from_u32(0x333333)),
+            Style::default().fg(Color::from_u32(0x2a2a2a)),
         )));
         lines.push(Line::from(""));
 
@@ -696,86 +738,88 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         ]));
         lines.push(Line::from(""));
 
-        // Agent response
         match &msg.status {
             ExecStatus::Running => {
                 let spin = SPINNER[app.spinner_tick % SPINNER.len()];
+                // Show latest stream lines
+                let stream_slice = {
+                    let len = app.stream_lines.len();
+                    &app.stream_lines[len.saturating_sub(4)..]
+                };
+                for sline in stream_slice {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", sline),
+                        Style::default().fg(Color::from_u32(0x3a3a3a)),
+                    )));
+                }
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", short),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled(format!("  {}", short), Style::default().fg(Color::Cyan)),
                     Span::styled(" › ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("{} thinking...", spin),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
-                if let Some(hint) = &app.log_hint {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {}", hint),
-                        Style::default().fg(Color::from_u32(0x444444)),
-                    )));
-                }
-                lines.push(Line::from(
-                    Span::styled("  ▶ running", Style::default().fg(Color::Yellow)),
-                ));
+                lines.push(Line::from(Span::styled("  ▶ running", Style::default().fg(Color::Yellow))));
             }
             ExecStatus::Completed => {
                 if let Some(resp) = &msg.response {
-                    for (i, part) in resp.lines().enumerate() {
+                    let is_latest = msg_i == msgs.len() - 1;
+                    // Typewriter: reveal up to typewriter_pos chars if this is the latest
+                    let display: &str = if is_latest && msg.typewriter_pos < resp.len() {
+                        &resp[..msg.typewriter_pos]
+                    } else {
+                        resp.as_str()
+                    };
+                    let is_animating = is_latest && msg.typewriter_pos < resp.len();
+
+                    for (i, part) in display.lines().enumerate() {
                         if i == 0 {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("  {}", short),
-                                    Style::default().fg(Color::Cyan),
-                                ),
+                            let mut spans = vec![
+                                Span::styled(format!("  {}", short), Style::default().fg(Color::Cyan)),
                                 Span::styled(" › ", Style::default().fg(Color::DarkGray)),
                                 Span::styled(part.to_string(), Style::default().fg(Color::White)),
-                            ]));
+                            ];
+                            if is_animating && i == display.lines().count() - 1 {
+                                spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
+                            }
+                            lines.push(Line::from(spans));
                         } else {
                             let indent = " ".repeat(short.len() + 6);
-                            lines.push(Line::from(Span::styled(
+                            let mut spans = vec![Span::styled(
                                 format!("{}{}", indent, part),
                                 Style::default().fg(Color::White),
-                            )));
+                            )];
+                            if is_animating && i == display.lines().count() - 1 {
+                                spans.push(Span::styled("▌", Style::default().fg(Color::Cyan)));
+                            }
+                            lines.push(Line::from(spans));
                         }
                     }
                 }
-                lines.push(Line::from(
-                    Span::styled("  ✓ completed", Style::default().fg(Color::from_u32(0x3b6d11))),
-                ));
+                lines.push(Line::from(Span::styled(
+                    "  ✓ completed",
+                    Style::default().fg(Color::Rgb(59, 109, 17)),
+                )));
             }
             ExecStatus::Failed(err) => {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {}", short),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled(format!("  {}", short), Style::default().fg(Color::Cyan)),
                     Span::styled(" › ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("failed: {}", err),
-                        Style::default().fg(Color::Red),
-                    ),
+                    Span::styled(format!("failed: {}", err), Style::default().fg(Color::Red)),
                 ]));
-                lines.push(Line::from(
-                    Span::styled("  ✗ failed", Style::default().fg(Color::Red)),
-                ));
+                lines.push(Line::from(Span::styled("  ✗ failed", Style::default().fg(Color::Red))));
             }
         }
         lines.push(Line::from(""));
     }
 
-    // Auto-scroll to bottom: clamp scroll to max possible
     let total = lines.len() as u16;
-    let visible = area.height;
-    let max_scroll = total.saturating_sub(visible);
+    let max_scroll = total.saturating_sub(area.height);
     let scroll = app.scroll.min(max_scroll);
 
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
         area,
     );
 }
@@ -797,22 +841,13 @@ fn render_runs(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, e) in runs.iter().enumerate() {
         let status = e["status"].as_str().unwrap_or("?");
-        let ts = e["started_at"]
-            .as_str()
-            .map(fmt_ts)
-            .unwrap_or_else(|| "—".to_string());
-        let input_preview: String = e["input"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(50)
-            .collect();
-        let output_preview: String = e["output"]
-            .as_str()
+        let ts = e["started_at"].as_str().map(fmt_ts).unwrap_or_else(|| "—".to_string());
+        let input_preview: String = e["input"].as_str().unwrap_or("").chars().take(55).collect();
+        let output_preview: String = e["output"].as_str()
             .map(|o| extract_task_complete(o))
             .unwrap_or_default()
             .chars()
-            .take(60)
+            .take(65)
             .collect();
 
         let (badge, badge_color) = match status {
@@ -832,33 +867,20 @@ fn render_runs(f: &mut Frame, app: &App, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             Span::raw("        "),
-            Span::styled(
-                format!("in  › {}", input_preview),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("in  › {}", input_preview), Style::default().fg(Color::White)),
         ]));
         lines.push(Line::from(vec![
             Span::raw("        "),
             Span::styled(
-                if output_preview.is_empty() {
-                    "out › —".to_string()
-                } else {
-                    format!("out › {}", output_preview)
-                },
+                if output_preview.is_empty() { "out › —".to_string() } else { format!("out › {}", output_preview) },
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
         lines.push(Line::from(""));
     }
 
-    let total = lines.len() as u16;
-    let max_scroll = total.saturating_sub(area.height);
-    let scroll = app.scroll.min(max_scroll);
-
-    f.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)),
-        area,
-    );
+    let max_scroll = (lines.len() as u16).saturating_sub(area.height);
+    f.render_widget(Paragraph::new(lines).scroll((app.scroll.min(max_scroll), 0)), area);
 }
 
 // ── Config view ────────────────────────────────────────────────────────────────
@@ -893,94 +915,130 @@ fn render_config(f: &mut Frame, app: &App, area: Rect) {
             serde_json::Value::Null | serde_json::Value::Bool(false) => {
                 Span::styled("—", Style::default().fg(Color::DarkGray))
             }
-            serde_json::Value::Bool(true) => {
-                Span::styled("yes", Style::default().fg(Color::Green))
-            }
+            serde_json::Value::Bool(true) => Span::styled("yes", Style::default().fg(Color::Green)),
             serde_json::Value::String(s) if s.is_empty() => {
                 Span::styled("—", Style::default().fg(Color::DarkGray))
             }
-            serde_json::Value::String(s) => {
-                Span::styled(s.clone(), Style::default().fg(Color::White))
-            }
+            serde_json::Value::String(s) => Span::styled(s.clone(), Style::default().fg(Color::White)),
             other => Span::styled(other.to_string(), Style::default().fg(Color::White)),
         };
-
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:12}", format!("{}:", label)),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("  {:12}", format!("{}:", label)), Style::default().fg(Color::DarkGray)),
             val,
         ]));
     }
 
-    // Tool count
-    let tool_count = app.run_count_for(&app.active_name());
+    let runs = app.run_count_for(&app.active_name());
     lines.push(Line::from(vec![
         Span::styled("  runs:       ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            tool_count.to_string(),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(runs.to_string(), Style::default().fg(Color::White)),
     ]));
 
-    // System prompt preview
     if let Some(prompt) = agent["system_prompt"].as_str() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  prompt:",
-            Style::default().fg(Color::DarkGray),
-        )));
-        for chunk in prompt.chars().collect::<Vec<_>>().chunks(60) {
+        lines.push(Line::from(Span::styled("  prompt:", Style::default().fg(Color::DarkGray))));
+        for chunk in prompt.chars().collect::<Vec<_>>().chunks(58) {
             let s: String = chunk.iter().collect();
             lines.push(Line::from(Span::styled(
                 format!("    {}", s),
-                Style::default().fg(Color::from_u32(0x555555)),
+                Style::default().fg(Color::from_u32(0x444444)),
             )));
         }
     }
 
+    f.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), area);
+}
+
+// ── Right sidebar ──────────────────────────────────────────────────────────────
+
+fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    if area.width < 14 { return; }
+
+    // Subtle left border
     f.render_widget(
-        Paragraph::new(lines).scroll((app.scroll, 0)),
+        Block::default().borders(Borders::LEFT).border_style(Style::default().fg(Color::from_u32(0x222222))),
         area,
     );
+
+    let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(1), ..area };
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    // Robot logo
+    for logo_line in robot_logo() {
+        lines.push(logo_line);
+    }
+
+    lines.push(Line::from(""));
+
+    // "agenta" title
+    lines.push(Line::from(Span::styled(
+        " agenta",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        " AI Agent Runtime",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines.push(Line::from(""));
+
+    // Version
+    let ver = if app.daemon_version.is_empty() { "—".into() } else { format!("v{}", app.daemon_version) };
+    lines.push(Line::from(vec![
+        Span::styled(" version  ", Style::default().fg(Color::from_u32(0x444444))),
+        Span::styled(ver, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Daemon status
+    let (dot, dcol) = if app.daemon_ok { ("●", Color::Green) } else { ("✗", Color::Red) };
+    lines.push(Line::from(vec![
+        Span::styled(" daemon   ", Style::default().fg(Color::from_u32(0x444444))),
+        Span::styled(dot, Style::default().fg(dcol)),
+    ]));
+
+    // Agent count
+    lines.push(Line::from(vec![
+        Span::styled(" agents   ", Style::default().fg(Color::from_u32(0x444444))),
+        Span::styled(app.agents.len().to_string(), Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Total runs
+    lines.push(Line::from(vec![
+        Span::styled(" runs     ", Style::default().fg(Color::from_u32(0x444444))),
+        Span::styled(app.total_runs().to_string(), Style::default().fg(Color::DarkGray)),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Composer ───────────────────────────────────────────────────────────────────
 
 fn render_composer(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Composer;
-    let border = if focused {
+    let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::from_u32(0x2a2a2a))
     };
 
     let short = app.active_short();
-    let model = app.active_agent()
-        .and_then(|a| a["model"].as_str())
-        .unwrap_or("—");
+    let model = app.active_agent().and_then(|a| a["model"].as_str()).unwrap_or("—");
 
     f.render_widget(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(border),
+        Block::default().borders(Borders::TOP).border_style(border_style),
         area,
     );
 
-    let inner = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
-    };
+    let inner = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
 
-    let rows = Layout::vertical([
-        Constraint::Length(1), // context / status
-        Constraint::Length(1), // log hint (only when pending)
-        Constraint::Length(1), // blank spacer
-        Constraint::Length(1), // input line
+    let [ctx_row, hint_row, _spacer, input_row] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
     ])
-    .split(inner);
+    .areas(inner);
 
     // Context / status line
     let context = if let Some((msg, _)) = &app.status_msg {
@@ -989,45 +1047,38 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
     } else if app.pending.is_some() {
         let spin = SPINNER[app.spinner_tick % SPINNER.len()];
         Line::from(vec![
-            Span::styled(
-                format!("  {} waiting for ", spin),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("  {} waiting for ", spin), Style::default().fg(Color::Yellow)),
             Span::styled(short.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(" to respond...", Style::default().fg(Color::Yellow)),
         ])
     } else {
         Line::from(vec![
             Span::styled("  talking to ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                short.clone(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {}", model),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(short.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" · {}", model), Style::default().fg(Color::DarkGray)),
         ])
     };
-    f.render_widget(Paragraph::new(context), rows[0]);
+    f.render_widget(Paragraph::new(context), ctx_row);
 
-    // Live log hint while pending
-    if let Some(hint) = &app.log_hint {
+    // Log hint line
+    if let Some(hint) = app.stream_lines.last() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("    {}", hint),
-                Style::default().fg(Color::from_u32(0x444444)),
+                Style::default().fg(Color::from_u32(0x3a3a3a)),
             ))),
-            rows[1],
+            hint_row,
         );
     }
 
     // Input line
     let cursor = if focused { "▌" } else { "" };
-    let input_line = Line::from(vec![
-        Span::styled("  › ", Style::default().fg(Color::Cyan)),
-        Span::styled(app.composer_input.clone(), Style::default().fg(Color::White)),
-        Span::styled(cursor, Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(input_line), rows[3]);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  › ", Style::default().fg(Color::Cyan)),
+            Span::styled(app.composer_input.clone(), Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(Color::Cyan)),
+        ])),
+        input_row,
+    );
 }
