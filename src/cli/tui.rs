@@ -96,38 +96,46 @@ fn is_meaningful_log(line: &str) -> bool {
         && s.len() > 3
 }
 
-// ── Pixel-art robot logo ──────────────────────────────────────────────────────
+// ── Robot logo (box-drawing, clean) ──────────────────────────────────────────
 
 fn robot_logo<'a>() -> Vec<Line<'a>> {
-    let b = Style::default().fg(Color::Rgb(82, 110, 130));   // body
+    let f = Style::default().fg(Color::Rgb(90, 120, 145)); // frame
     let e = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD); // eyes
-    let m = Style::default().fg(Color::Rgb(55, 75, 90));     // mouth/details
-    let h = Style::default().fg(Color::Green);               // heart
-    let c = Style::default().fg(Color::Yellow);              // bitcoin
-    let a = Style::default().fg(Color::Red);                 // antenna tip
+    let g = Style::default().fg(Color::Rgb(55, 80, 95));  // grill
+    let h = Style::default().fg(Color::Green);             // heart
+    let b = Style::default().fg(Color::Yellow);            // bitcoin
+    let a = Style::default().fg(Color::Red);               // antenna
 
+    // Each line is padded to fit the sidebar
     vec![
-        Line::from(vec![Span::raw("      "), Span::styled("▮", a)]),
-        Line::from(vec![Span::styled("  ████████  ", b)]),
         Line::from(vec![
-            Span::styled("  █ ", b),
-            Span::styled("◉", e),
-            Span::styled("  ", b),
-            Span::styled("◉", e),
-            Span::styled(" █  ", b),
+            Span::raw("       "),
+            Span::styled("●", a),
         ]),
-        Line::from(vec![Span::styled("  █ ", b), Span::styled("─────", m), Span::styled(" █  ", b)]),
-        Line::from(vec![Span::styled("  ████████  ", b)]),
-        Line::from(vec![Span::styled("    ████    ", b)]),
-        Line::from(vec![Span::styled(" ██████████ ", b)]),
+        Line::from(vec![Span::styled("  ┌─────────┐", f)]),
         Line::from(vec![
-            Span::styled(" █  ", b),
+            Span::styled("  │ ", f),
+            Span::styled("◉", e),
+            Span::styled("     ", f),
+            Span::styled("◉", e),
+            Span::styled(" │", f),
+        ]),
+        Line::from(vec![
+            Span::styled("  │  ", f),
+            Span::styled("─────", g),
+            Span::styled("  │", f),
+        ]),
+        Line::from(vec![Span::styled("  └─────────┘", f)]),
+        Line::from(vec![Span::styled("     │   │   ", f)]),
+        Line::from(vec![Span::styled("  ┌─────────┐", f)]),
+        Line::from(vec![
+            Span::styled("  │  ", f),
             Span::styled("♥", h),
-            Span::styled("   ", b),
-            Span::styled("₿", c),
-            Span::styled("  █ ", b),
+            Span::styled("   ", f),
+            Span::styled("₿", b),
+            Span::styled("  │", f),
         ]),
-        Line::from(vec![Span::styled(" ██████████ ", b)]),
+        Line::from(vec![Span::styled("  └─────────┘", f)]),
     ]
 }
 
@@ -572,10 +580,10 @@ fn render(f: &mut Frame, app: &mut App) {
     render_agent_tabs(f, app, rows[1]);
     render_sub_tabs(f, app, rows[2]);
 
-    // Split content into main + right sidebar
-    let [main_area, sidebar_area] = Layout::horizontal([
-        Constraint::Fill(1),
+    // Split content: left sidebar + main
+    let [sidebar_area, main_area] = Layout::horizontal([
         Constraint::Length(SIDEBAR_W),
+        Constraint::Fill(1),
     ])
     .areas(rows[3]);
 
@@ -621,8 +629,7 @@ fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
 // ── Agent tabs ─────────────────────────────────────────────────────────────────
 
 fn render_agent_tabs(f: &mut Frame, app: &App, area: Rect) {
-    // Reserve sidebar width so tabs don't bleed over the sidebar
-    let max_width = area.width.saturating_sub(SIDEBAR_W) as usize;
+    let max_width = area.width as usize;
     let mut spans: Vec<Span> = vec![];
     let mut used = 0usize;
 
@@ -954,13 +961,13 @@ fn render_config(f: &mut Frame, app: &App, area: Rect) {
 fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
     if area.width < 14 { return; }
 
-    // Subtle left border
+    // Subtle right border dividing sidebar from main content
     f.render_widget(
-        Block::default().borders(Borders::LEFT).border_style(Style::default().fg(Color::from_u32(0x222222))),
+        Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(Color::from_u32(0x222222))),
         area,
     );
 
-    let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(1), ..area };
+    let inner = Rect { width: area.width.saturating_sub(1), ..area };
 
     let mut lines: Vec<Line> = vec![Line::from("")];
 
