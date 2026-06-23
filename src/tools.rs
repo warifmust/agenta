@@ -10,24 +10,47 @@ pub struct ToolInvocation {
     pub parameters: serde_json::Value,
 }
 
-/// Names of tools handled natively by the daemon — no bash script needed.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["spawn_agent"];
+/// Names of tools handled natively by the runtime — no external script needed.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "spawn_agent",
+    "read_file",
+    "write_file",
+    "list_files",
+];
 
 pub fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOL_NAMES.contains(&name)
 }
 
-/// Descriptions injected into deep agent prompts so the LLM knows built-in tools exist.
+/// Descriptions injected into every agent's system prompt.
 pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
-    vec![(
-        "spawn_agent",
-        "Spawn a temporary sub-agent to handle a specific sub-task. \
-         The sub-agent runs synchronously and returns its result. \
-         Use this when a task is too large or specialised to handle alone. \
-         Parameters: {\"role\": \"<system prompt for sub-agent>\", \
-         \"input\": \"<task to give the sub-agent>\", \
-         \"model\": \"<optional — defaults to your model>\"}",
-    )]
+    vec![
+        (
+            "read_file",
+            "Read the contents of a file. \
+             Parameters: {\"path\": \"<file path>\"}",
+        ),
+        (
+            "write_file",
+            "Write content to a file, creating it if it doesn't exist. \
+             Parameters: {\"path\": \"<file path>\", \"content\": \"<text to write>\"}",
+        ),
+        (
+            "list_files",
+            "List files in a directory. \
+             Parameters: {\"path\": \"<directory path>\", \"pattern\": \"<optional glob, e.g. *.md>\"}",
+        ),
+        (
+            "spawn_agent",
+            "Spawn a sub-agent to handle a specific sub-task and return its output. \
+             Use `name` to delegate to an existing named agent (e.g. CORAL, WILL), \
+             or `role` to spin up a throwaway agent with a custom system prompt. \
+             Parameters: {\"name\": \"<existing agent name OR omit>\", \
+             \"role\": \"<system prompt if no name>\", \
+             \"input\": \"<task>\", \
+             \"model\": \"<optional — defaults to caller model>\"}",
+        ),
+    ]
 }
 
 /// Expand a leading `~` to the real home directory.

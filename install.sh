@@ -145,12 +145,33 @@ install_from_cargo() {
   cargo install --git "https://github.com/${REPO}.git" ${git_ref} --locked --force
 }
 
+bootstrap() {
+  local bin="${INSTALL_DIR}/agenta"
+  # Fallback to PATH if install dir binary not found
+  if ! [ -x "$bin" ]; then
+    bin="$(command -v agenta 2>/dev/null || true)"
+  fi
+  if [ -z "$bin" ] || ! [ -x "$bin" ]; then
+    echo "Info: skipping bootstrap — agenta binary not found."
+    return
+  fi
+
+  echo ""
+  echo "Starting agenta daemon for bootstrap..."
+  "$bin" daemon start 2>/dev/null || true
+  sleep 2
+
+  "$bin" setup
+}
+
 main() {
   if install_from_release; then
+    bootstrap
     return 0
   fi
   echo "Info: release binary not available, using cargo install fallback."
   install_from_cargo
+  bootstrap
 }
 
 main "$@"

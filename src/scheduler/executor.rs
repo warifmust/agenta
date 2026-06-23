@@ -138,32 +138,18 @@ impl AgentExecutor {
         input_text: &str,
         execution: &mut ExecutionResult,
     ) -> anyhow::Result<String> {
-        let has_tools = self.agent_has_available_tools(agent).await?;
-        if let Some(config) = &agent.deep_agent_config {
-            let deep = crate::scheduler::DeepAgentExecutor::new(self, config)?;
-            if !has_tools {
-                deep.execute_deep(agent, input_text, execution).await
-            } else {
-                deep.execute_deep_with_tools(agent, input_text, execution).await
+        // All agents run through the deep harness (tool loop + memory + sub-agents).
+        // deep_agent_config controls iteration limits; fall back to default if not set.
+        let config_owned;
+        let config = match &agent.deep_agent_config {
+            Some(c) => c,
+            None => {
+                config_owned = crate::core::DeepAgentConfig::default();
+                &config_owned
             }
-        } else {
-            match agent.execution_mode {
-                ExecutionMode::Once | ExecutionMode::Scheduled | ExecutionMode::Triggered => {
-                    if !has_tools {
-                        self.execute_single(agent, input_text, execution).await
-                    } else {
-                        self.execute_with_tools(agent, input_text, execution).await
-                    }
-                }
-                ExecutionMode::Continuous => {
-                    if !has_tools {
-                        self.execute_single(agent, input_text, execution).await
-                    } else {
-                        self.execute_with_tools(agent, input_text, execution).await
-                    }
-                }
-            }
-        }
+        };
+        let deep = crate::scheduler::DeepAgentExecutor::new(self, config)?;
+        deep.execute_deep_with_tools(agent, input_text, execution).await
     }
 
     async fn agent_has_available_tools(&self, agent: &Agent) -> anyhow::Result<bool> {

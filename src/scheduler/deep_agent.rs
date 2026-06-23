@@ -3,6 +3,15 @@ use regex::Regex;
 use std::sync::Arc;
 use tracing::info;
 
+fn expand_home(path: &str) -> String {
+    if path.starts_with("~/") || path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
 use crate::core::{
     Agent, DeepAgentConfig, ExecutionMode, ExecutionResult, Storage, ToolCall,
 };
@@ -238,7 +247,14 @@ impl DeepAgentExecutor {
 
             // Check for tool call
             if content.contains("TOOL_CALL:") {
-                if let Some(tool_result) = self.handle_tool_call(agent, &content).await {
+                if let Some(raw_result) = self.handle_tool_call(agent, &content).await {
+                    // Truncate large tool outputs so they don't fill the context window.
+                    const MAX_TOOL_OUTPUT: usize = 8_000;
+                    let tool_result = if raw_result.len() > MAX_TOOL_OUTPUT {
+                        format!("{}… [truncated, {} chars total]", &raw_result[..MAX_TOOL_OUTPUT], raw_result.len())
+                    } else {
+                        raw_result
+                    };
                     context.push_str(&format!("\nAction: {}\nResult: {}", content, tool_result));
 
                     execution.tool_calls.push(ToolCall {
@@ -314,24 +330,101 @@ impl DeepAgentExecutor {
         parameters: &serde_json::Value,
     ) -> Option<String> {
         match tool_name {
+            "read_file"   => self.builtin_read_file(parameters).await,
+            "write_file"  => self.builtin_write_file(parameters).await,
+            "list_files"  => self.builtin_list_files(parameters).await,
             "spawn_agent" => self.spawn_subagent(parent, parameters).await,
-            _ => Some(format!("Unknown built-in tool: {}", tool_name)),
+            _             => Some(format!("Unknown built-in tool: {}", tool_name)),
         }
     }
 
-    /// Spawn an ephemeral sub-agent, run it synchronously, return its output.
-    /// The sub-agent is never persisted — it exists only for the duration of this call.
+    async fn builtin_read_file(&self, params: &serde_json::Value) -> Option<String> {
+        let raw = params.get("path")?.as_str()?;
+        let path = expand_home(raw);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => Some(content),
+            Err(e) => Some(format!("Error reading {}: {}", path, e)),
+        }
+    }
+
+    async fn builtin_write_file(&self, params: &serde_json::Value) -> Option<String> {
+        let raw = params.get("path")?.as_str()?;
+        let path = expand_home(raw);
+        let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        match tokio::fs::write(&path, content).await {
+            Ok(_) => Some(format!("Written {} bytes to {}", content.len(), path)),
+            Err(e) => Some(format!("Error writing {}: {}", path, e)),
+        }
+    }
+
+    async fn builtin_list_files(&self, params: &serde_json::Value) -> Option<String> {
+        let raw = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let dir = expand_home(raw);
+        let pattern = params.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(e) => return Some(format!("Error listing {}: {}", dir, e)),
+        };
+        let glob_pat = glob::Pattern::new(pattern).ok();
+        let mut names: Vec<String> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if glob_pat.as_ref().map_or(true, |p| p.matches(&name)) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        if names.is_empty() {
+            Some(format!("No files matching '{}' in {}", pattern, dir))
+        } else {
+            Some(names.join("\n"))
+        }
+    }
+
+    /// Spawn a sub-agent — either a named DB agent or an ephemeral one.
     async fn spawn_subagent(
         &self,
         parent: &Agent,
         parameters: &serde_json::Value,
     ) -> Option<String> {
-        let role = parameters.get("role")?.as_str()?.to_string();
         let input = parameters
             .get("input")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // If `name` is given, delegate to an existing DB agent.
+        if let Some(agent_name) = parameters.get("name").and_then(|v| v.as_str()) {
+            let task_preview = if input.len() > 80 {
+                format!("{}…", &input[..80])
+            } else {
+                input.clone()
+            };
+            let spawn_msg = parent
+                .deep_agent_config
+                .as_ref()
+                .and_then(|c| c.subagent_spawn_message.as_deref())
+                .unwrap_or("⚙️ Delegating to {agent}: {task}")
+                .replace("{agent}", agent_name)
+                .replace("{task}", &task_preview);
+            self.notify(spawn_msg);
+
+            let named = match self.storage.get_agent_by_name(agent_name).await {
+                Ok(Some(a)) => a,
+                _ => return Some(format!("Agent not found: {}", agent_name)),
+            };
+            let executor = AgentExecutor::new(self.storage.clone(), self.backend.clone());
+            return match executor.execute_ephemeral(&named, Some(input)).await {
+                Ok(out) => Some(out),
+                Err(e) => Some(format!("Agent {} failed: {}", agent_name, e)),
+            };
+        }
+
+        // Fallback: ephemeral throwaway agent from `role`.
+        let role = parameters.get("role")?.as_str()?.to_string();
         let model = parameters
             .get("model")
             .and_then(|v| v.as_str())

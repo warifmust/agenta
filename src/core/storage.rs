@@ -8,7 +8,7 @@ use sqlx::{
 use std::path::Path;
 
 use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource, ScriptDefinition, ScriptExecution, ScriptExecutionStatus};
-use super::error::Result;
+use super::error::{AgentaError, Result};
 
 /// Storage trait - can be implemented for different backends
 #[async_trait]
@@ -159,6 +159,7 @@ impl SqliteStorage {
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled INTEGER NOT NULL DEFAULT 0,
+                is_system INTEGER NOT NULL DEFAULT 0,
                 provider TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -181,6 +182,13 @@ impl SqliteStorage {
         // Migration: add provider column if it doesn't exist (SQLite)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN provider TEXT"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add is_system column if it doesn't exist (SQLite)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0"
         )
         .execute(&self.pool)
         .await;
@@ -345,6 +353,7 @@ impl PostgresStorage {
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                is_system BOOLEAN NOT NULL DEFAULT FALSE,
                 provider TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -367,6 +376,13 @@ impl PostgresStorage {
         // Migration: add provider column if it doesn't exist (Postgres)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider TEXT"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add is_system column if it doesn't exist (Postgres)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE"
         )
         .execute(&self.pool)
         .await;
@@ -506,8 +522,8 @@ impl Storage for SqliteStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                memory_enabled, provider, status, created_at, updated_at, last_run, run_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             "#,
         )
         .bind(&agent.id)
@@ -523,6 +539,7 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
+        .bind(if agent.is_system { 1i64 } else { 0i64 })
         .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
@@ -542,7 +559,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = ?1
             "#,
         )
@@ -560,7 +577,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = ?1
             "#,
         )
@@ -624,7 +641,17 @@ impl Storage for SqliteStorage {
     async fn delete_agent(
         &self, id: &str
     ) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM agents WHERE id = ?1")
+        // Refuse to delete system agents
+        let is_sys: Option<i64> = sqlx::query_scalar(
+            "SELECT is_system FROM agents WHERE id = ?1 OR name = ?1"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if is_sys == Some(1) {
+            return Err(AgentaError::SystemAgent("system agents cannot be deleted".into()));
+        }
+        let result = sqlx::query("DELETE FROM agents WHERE id = ?1 OR name = ?1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -638,8 +665,8 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
-            FROM agents ORDER BY created_at DESC
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
+            FROM agents WHERE is_system = 0 ORDER BY created_at DESC
             "#,
         )
         .fetch_all(&self.pool)
@@ -656,7 +683,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = ?1 ORDER BY created_at DESC
             "#,
         )
@@ -1106,7 +1133,7 @@ impl Storage for SqliteStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = ?1
             "#,
@@ -1129,8 +1156,8 @@ impl Storage for PostgresStorage {
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
                 execution_mode, trigger, schedule, deep_agent_config, environment,
-                memory_enabled, provider, status, created_at, updated_at, last_run, run_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             "#,
         )
         .bind(&agent.id)
@@ -1146,6 +1173,7 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(agent.memory_enabled)
+        .bind(agent.is_system)
         .bind(&agent.provider)
         .bind(serde_json::to_string(&agent.status)?)
         .bind(agent.created_at.to_rfc3339())
@@ -1165,7 +1193,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = $1
             "#,
         )
@@ -1183,7 +1211,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = $1
             "#,
         )
@@ -1247,7 +1275,17 @@ impl Storage for PostgresStorage {
     async fn delete_agent(
         &self, id: &str
     ) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM agents WHERE id = $1")
+        // Refuse to delete system agents
+        let is_sys: Option<bool> = sqlx::query_scalar(
+            "SELECT is_system FROM agents WHERE id = $1 OR name = $1"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if is_sys == Some(true) {
+            return Err(AgentaError::SystemAgent("system agents cannot be deleted".into()));
+        }
+        let result = sqlx::query("DELETE FROM agents WHERE id = $1 OR name = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1261,8 +1299,8 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
-            FROM agents ORDER BY created_at DESC
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
+            FROM agents WHERE is_system = FALSE ORDER BY created_at DESC
             "#,
         )
         .fetch_all(&self.pool)
@@ -1279,7 +1317,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = $1 ORDER BY created_at DESC
             "#,
         )
@@ -1729,7 +1767,7 @@ impl Storage for PostgresStorage {
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
                    execution_mode, trigger, schedule, deep_agent_config, environment,
-                   memory_enabled, provider, status, created_at, updated_at, last_run, run_count
+                   memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = $1
             "#,
@@ -1762,6 +1800,7 @@ fn row_to_agent_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Agent> {
         deep_agent_config: get_optional_str("deep_agent_config").and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(get_str("environment")?).ok()?,
         memory_enabled: get_i64("memory_enabled").unwrap_or(0) != 0,
+        is_system: get_i64("is_system").unwrap_or(0) != 0,
         provider: get_optional_str("provider").map(|s| s.to_string()),
         status: serde_json::from_str(get_str("status")?).ok()?,
         created_at: get_str("created_at")?.parse().ok()?,
@@ -1825,6 +1864,7 @@ fn row_to_agent_pg(row: &sqlx::postgres::PgRow) -> Option<Agent> {
             .and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(&environment).ok()?,
         memory_enabled: row.try_get::<bool, _>("memory_enabled").unwrap_or(false),
+        is_system: row.try_get::<bool, _>("is_system").unwrap_or(false),
         provider: get_optional_string("provider"),
         status: serde_json::from_str(&status).ok()?,
         created_at: created_at.parse().ok()?,

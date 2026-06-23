@@ -145,7 +145,7 @@ pub enum Commands {
         max_tokens: Option<u32>,
 
         /// New execution mode
-        #[arg(short, long)]
+        #[arg(long)]
         mode: Option<String>,
 
         /// New schedule
@@ -295,6 +295,9 @@ pub enum Commands {
 
     /// Run diagnostics and check system health
     Doctor,
+
+    /// First-time setup wizard
+    Setup,
 }
 
 #[derive(Subcommand)]

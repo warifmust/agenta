@@ -48,4 +48,7 @@ pub enum AgentaError {
 
     #[error("Unknown error: {0}")]
     Unknown(String),
+
+    #[error("Cannot delete system agent: {0}")]
+    SystemAgent(String),
 }

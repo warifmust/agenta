@@ -542,7 +542,7 @@ fn print_agent_detail(agent: &serde_json::Value) {
         ("Mode",     "execution_mode"),
         ("Schedule", "schedule"),
         ("Memory",   "memory_enabled"),
-        ("Deep",     "deep_agent"),
+        ("Deep",     "deep_agent_config"),
     ];
 
     println!();
@@ -551,6 +551,8 @@ fn print_agent_detail(agent: &serde_json::Value) {
             serde_json::Value::Null => "-".to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::String(s) => s.clone(),
+            // deep_agent_config is an object — show "true" if set, "-" if null
+            serde_json::Value::Object(_) if *key == "deep_agent_config" => "true".to_string(),
             other => other.to_string(),
         };
         println!("  {:12} {}", format!("{label}:").bold(), val);

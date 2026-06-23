@@ -339,6 +339,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
         }
 
+        Commands::Setup => bootstrap_mind(&config).await,
+
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
 
         Commands::Export { id, output, format } => {
@@ -650,7 +652,107 @@ async fn handle_daemon_command(
             tokio::time::sleep(Duration::from_secs(2)).await;
             daemon_start(&config, false).await
         }
+
     }
+}
+
+pub async fn mind_exists(config: &AppConfig) -> bool {
+    matches!(
+        daemon_request(config, DaemonRequest::GetAgent { id: "MIND".into() }).await,
+        Ok(DaemonResponse::AgentDetails { .. })
+    )
+}
+
+async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
+    // Check if MIND already exists
+    match daemon_request(config, DaemonRequest::GetAgent { id: "MIND".into() }).await {
+        Ok(DaemonResponse::AgentDetails { .. }) => {
+            println!("{}", "MIND system agent already exists — nothing to do.".green());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    println!("{}", "Welcome to agenta! Let's set up your MIND system agent.".bold());
+    println!();
+
+    // Provider selection
+    println!("Which provider will MIND use?");
+    println!("  1) ollama    (local, no API key needed)");
+    println!("  2) deepseek  (cloud, requires API key)");
+    println!("  3) openrouter (cloud, requires API key)");
+    println!("  4) openai    (cloud, requires API key)");
+    print!("Choice [1-4]: ");
+    std::io::stdout().flush()?;
+
+    let mut choice = String::new();
+    std::io::stdin().read_line(&mut choice)?;
+    let provider = match choice.trim() {
+        "2" => "deepseek",
+        "3" => "openrouter",
+        "4" => "openai",
+        _   => "ollama",
+    };
+
+    // Model selection
+    let model = if provider == "ollama" {
+        println!();
+        println!("Enter model name (e.g. qwen3:latest, gemma4:31b-c, llama3.1:8b):");
+        print!("Model: ");
+        std::io::stdout().flush()?;
+        let mut m = String::new();
+        std::io::stdin().read_line(&mut m)?;
+        let m = m.trim().to_string();
+        if m.is_empty() { "qwen3:latest".to_string() } else { m }
+    } else {
+        println!();
+        let default_model = match provider {
+            "deepseek"   => "deepseek-chat",
+            "openrouter" => "anthropic/claude-3.5-haiku",
+            "openai"     => "gpt-4o-mini",
+            _            => "gpt-4o-mini",
+        };
+        println!("Enter model name (press Enter for default: {}):", default_model);
+        print!("Model: ");
+        std::io::stdout().flush()?;
+        let mut m = String::new();
+        std::io::stdin().read_line(&mut m)?;
+        let m = m.trim().to_string();
+        if m.is_empty() { default_model.to_string() } else { m }
+    };
+
+    // Build MIND agent
+    let mut mind = Agent::new(
+        "MIND".to_string(),
+        model,
+        "You are MIND — Maintenance, Inference, and Development agent. \
+Your primary role is to generate shell scripts and tools for the agenta ecosystem. \
+When asked to create a tool, output a well-structured bash script that accomplishes the task. \
+Support multiple languages (Python, Node.js, etc.) when the task warrants it. \
+Always validate inputs and handle errors gracefully. \
+Suggest test commands for any tool you create.".to_string(),
+    );
+    mind.is_system = true;
+    mind.provider = Some(provider.to_string());
+    mind.status = AgentStatus::Active;
+
+    let agent_value = serde_json::to_value(&mind)?;
+    match daemon_request(config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
+        DaemonResponse::Success { .. } => {
+            println!();
+            println!("{}", "✓ MIND system agent created successfully.".green().bold());
+            println!("  Provider : {}", provider);
+            println!("  Model    : {}", mind.model);
+            println!();
+            println!("Run {} to open the dashboard.", "agenta".cyan());
+        }
+        DaemonResponse::Error { message } => {
+            return Err(anyhow!("Failed to create MIND: {}", message));
+        }
+        _ => return Err(anyhow!("Unexpected response from daemon")),
+    }
+
+    Ok(())
 }
 
 async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {

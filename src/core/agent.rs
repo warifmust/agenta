@@ -310,6 +310,8 @@ pub struct Agent {
     pub environment: Vec<AgentEnv>,
     #[serde(default)]
     pub memory_enabled: bool,
+    #[serde(default)]
+    pub is_system: bool,
     pub status: AgentStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -332,9 +334,13 @@ impl Agent {
             execution_mode: ExecutionMode::Once,
             trigger: None,
             schedule: None,
-            deep_agent_config: None,
+            deep_agent_config: Some(DeepAgentConfig {
+                allow_sub_agents: true,
+                ..DeepAgentConfig::default()
+            }),
             environment: vec![],
-            memory_enabled: false,
+            memory_enabled: true,
+            is_system: false,
             status: AgentStatus::Draft,
             created_at: now,
             updated_at: now,

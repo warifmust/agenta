@@ -43,7 +43,12 @@ async fn main() {
             }
         }
         None => {
-            // No subcommand — open TUI
+            // First-run guard: if MIND doesn't exist, prompt setup before opening TUI
+            if !cli::commands::mind_exists(&config).await {
+                eprintln!("Looks like this is your first time here.");
+                eprintln!("Run {} to get started.", "agenta setup");
+                std::process::exit(0);
+            }
             if let Err(e) = cli::tui::run_tui(config).await {
                 eprintln!("TUI error: {}", e);
                 std::process::exit(1);
