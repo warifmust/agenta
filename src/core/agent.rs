@@ -435,7 +435,13 @@ mod tests {
         assert_eq!(agent.status, AgentStatus::Draft);
         assert_eq!(agent.run_count, 0);
         assert!(!agent.id.is_empty());
-        assert!(!agent.is_deep_agent());
+        // all new agents are deep harness agents with memory by default
+        assert!(agent.is_deep_agent());
+        assert!(agent.memory_enabled);
+        // sub-agent spawning enabled by default
+        let dac = agent.deep_agent_config.as_ref().unwrap();
+        assert!(dac.allow_sub_agents);
+        assert_eq!(dac.max_iterations, 10);
         // provider defaults to None — resolved from config at runtime
         assert!(agent.provider.is_none());
     }

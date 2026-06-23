@@ -1,4 +1,4 @@
-use super::{Commands, ScriptCommands, ToolCommands, ViewCommands};
+use super::{Commands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
     ExecutionResult, ScriptDefinition, ToolDefinition, ToolResource,
@@ -339,7 +339,10 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
         }
 
-        Commands::Setup => bootstrap_mind(&config).await,
+        Commands::Setup { target } => match target {
+            None                          => bootstrap_mind(&config).await,
+            Some(SetupCommands::Telegram) => setup_telegram(&config).await,
+        },
 
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
 
@@ -663,26 +666,144 @@ pub async fn mind_exists(config: &AppConfig) -> bool {
     )
 }
 
-async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
-    // Check if MIND already exists
-    match daemon_request(config, DaemonRequest::GetAgent { id: "MIND".into() }).await {
-        Ok(DaemonResponse::AgentDetails { .. }) => {
-            println!("{}", "MIND system agent already exists — nothing to do.".green());
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    println!("{}", "Welcome to agenta! Let's set up your MIND system agent.".bold());
+/// Interactive wizard to add a Telegram bot entry to config.toml.
+/// Can be called from the main setup wizard or standalone via `agenta setup telegram`.
+async fn setup_telegram(config: &AppConfig) -> Result<()> {
+    println!();
+    println!("{}", "  Telegram Setup".bold().cyan());
+    println!("  Connect a Telegram bot to an agent.");
+    println!();
+    println!("  1. Open Telegram and chat with @BotFather");
+    println!("  2. Send /newbot and follow the prompts");
+    println!("  3. Copy the token it gives you (looks like 123456:ABC...)");
     println!();
 
-    // Provider selection
-    println!("Which provider will MIND use?");
-    println!("  1) ollama    (local, no API key needed)");
-    println!("  2) deepseek  (cloud, requires API key)");
-    println!("  3) openrouter (cloud, requires API key)");
-    println!("  4) openai    (cloud, requires API key)");
-    print!("Choice [1-4]: ");
+    print!("  Bot token: ");
+    std::io::stdout().flush()?;
+    let mut token = String::new();
+    std::io::stdin().read_line(&mut token)?;
+    let token = token.trim().to_string();
+
+    if token.is_empty() {
+        println!("  {} No token entered — skipping Telegram setup.", "⚠".yellow());
+        return Ok(());
+    }
+
+    // List agents so user can pick
+    let agents: Vec<String> = match daemon_request(config, DaemonRequest::ListAgents).await {
+        Ok(DaemonResponse::AgentList { agents }) => agents
+            .iter()
+            .filter_map(|a: &serde_json::Value| {
+                a.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+            })
+            .collect(),
+        _ => vec![],
+    };
+
+    let default_agent = if agents.is_empty() {
+        println!("  No agents found — you can set the agent name manually.");
+        print!("  Agent name: ");
+        std::io::stdout().flush()?;
+        let mut a = String::new();
+        std::io::stdin().read_line(&mut a)?;
+        a.trim().to_string()
+    } else {
+        println!("  Which agent should handle messages from this bot?");
+        for (i, name) in agents.iter().enumerate() {
+            println!("    {})  {}", (i + 1).to_string().cyan(), name.bold());
+        }
+        print!("  Choice [1]: ");
+        std::io::stdout().flush()?;
+        let mut choice = String::new();
+        std::io::stdin().read_line(&mut choice)?;
+        let idx: usize = choice.trim().parse().unwrap_or(1);
+        agents.get(idx.saturating_sub(1)).cloned().unwrap_or_else(|| agents[0].clone())
+    };
+
+    if default_agent.is_empty() {
+        println!("  {} No agent selected — skipping.", "⚠".yellow());
+        return Ok(());
+    }
+
+    print!("  Friendly bot name (optional, press Enter to skip): ");
+    std::io::stdout().flush()?;
+    let mut label = String::new();
+    std::io::stdin().read_line(&mut label)?;
+    let label = label.trim().to_string();
+    let bot_name = if label.is_empty() { None } else { Some(label) };
+
+    // Read existing config.toml, append the new bot, write back
+    let config_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".agenta")
+        .join("config.toml");
+
+    let toml_content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut doc: toml::Value = toml_content.parse().unwrap_or(toml::Value::Table(toml::map::Map::new()));
+
+    let new_bot = {
+        let mut m = toml::map::Map::new();
+        m.insert("token".into(), toml::Value::String(token.clone()));
+        m.insert("default_agent".into(), toml::Value::String(default_agent.clone()));
+        if let Some(ref n) = bot_name {
+            m.insert("name".into(), toml::Value::String(n.clone()));
+        }
+        toml::Value::Table(m)
+    };
+
+    if let toml::Value::Table(ref mut root) = doc {
+        let bots = root
+            .entry("telegram_bots")
+            .or_insert_with(|| toml::Value::Array(vec![]));
+        if let toml::Value::Array(ref mut arr) = bots {
+            arr.push(new_bot);
+        }
+    }
+
+    std::fs::write(&config_path, toml::to_string_pretty(&doc)?)?;
+
+    println!();
+    println!("  {} bot added to ~/.agenta/config.toml", "✓ Telegram".green());
+    println!("  Token  : {}…", &token[..token.len().min(12)]);
+    println!("  Agent  : {}", default_agent.cyan());
+    if let Some(ref n) = bot_name {
+        println!("  Name   : {}", n);
+    }
+    println!();
+    println!("  Restart the daemon to activate: {}", "agenta daemon restart".cyan());
+    println!();
+
+    Ok(())
+}
+
+async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
+    // ── Step 0: already set up? ───────────────────────────────────────────────
+    let already_have_mind = matches!(
+        daemon_request(config, DaemonRequest::GetAgent { id: "MIND".into() }).await,
+        Ok(DaemonResponse::AgentDetails { .. })
+    );
+    if already_have_mind {
+        println!("{}", "MIND already exists — nothing to do.".green());
+        println!("Run {} to open the dashboard.", "agenta".cyan());
+        return Ok(());
+    }
+
+    // ── Welcome ───────────────────────────────────────────────────────────────
+    println!();
+    println!("{}", "  Welcome to agenta!".bold().cyan());
+    println!("  Let's get you set up. This takes about a minute.");
+    println!();
+
+    // ── Step 1: Provider ─────────────────────────────────────────────────────
+    println!("{}", "  Step 1/3 — AI Provider".bold());
+    println!("  Which provider do you want to use?");
+    println!();
+    println!("    {}  {} — local, no API key needed", "1)".cyan(), "Ollama".bold());
+    println!("    {}  {} — cloud, fast & cheap", "2)".cyan(), "DeepSeek".bold());
+    println!("    {}  {} — cloud, 300+ models", "3)".cyan(), "OpenRouter".bold());
+    println!("    {}  {} — cloud, GPT models", "4)".cyan(), "OpenAI".bold());
+    println!();
+    print!("  Choice [1]: ");
     std::io::stdout().flush()?;
 
     let mut choice = String::new();
@@ -693,38 +814,107 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
         "4" => "openai",
         _   => "ollama",
     };
+    println!("  {} {}", "✓ Provider:".green(), provider);
+    println!();
 
-    // Model selection
-    let model = if provider == "ollama" {
-        println!();
-        println!("Enter model name (e.g. qwen3:latest, gemma4:31b-c, llama3.1:8b):");
-        print!("Model: ");
-        std::io::stdout().flush()?;
-        let mut m = String::new();
-        std::io::stdin().read_line(&mut m)?;
-        let m = m.trim().to_string();
-        if m.is_empty() { "qwen3:latest".to_string() } else { m }
-    } else {
-        println!();
-        let default_model = match provider {
-            "deepseek"   => "deepseek-chat",
-            "openrouter" => "anthropic/claude-3.5-haiku",
-            "openai"     => "gpt-4o-mini",
-            _            => "gpt-4o-mini",
+    // ── Step 2: API key (cloud providers only) ────────────────────────────────
+    let api_key = if provider != "ollama" {
+        let (key_url, env_var) = match provider {
+            "deepseek"    => ("platform.deepseek.com/api_keys", "DEEPSEEK_API_KEY"),
+            "openrouter"  => ("openrouter.ai/keys",             "OPENROUTER_API_KEY"),
+            _             => ("platform.openai.com/api-keys",   "OPENAI_API_KEY"),
         };
-        println!("Enter model name (press Enter for default: {}):", default_model);
-        print!("Model: ");
+        println!("{}", "  Step 2/3 — API Key".bold());
+        println!("  Get your key at: {}", key_url.cyan());
+        print!("  API key: ");
         std::io::stdout().flush()?;
-        let mut m = String::new();
-        std::io::stdin().read_line(&mut m)?;
-        let m = m.trim().to_string();
-        if m.is_empty() { default_model.to_string() } else { m }
-    };
 
-    // Build MIND agent
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key)?;
+        let key = key.trim().to_string();
+
+        if !key.is_empty() {
+            // Append to ~/.agenta/.env
+            let env_path = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".agenta")
+                .join(".env");
+            let entry = format!("{}={}\n", env_var, key);
+            // Remove existing line for this var, then append
+            let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+            let filtered: String = existing
+                .lines()
+                .filter(|l| !l.starts_with(&format!("{}=", env_var)))
+                .map(|l| format!("{}\n", l))
+                .collect();
+            std::fs::write(&env_path, format!("{}{}", filtered, entry))?;
+            println!("  {} saved to ~/.agenta/.env", "✓ Key".green());
+        } else {
+            println!("  {} — you can add it later to ~/.agenta/.env", "⚠ Skipped".yellow());
+        }
+        println!();
+        Some(key)
+    } else {
+        None
+    };
+    let _ = api_key; // used for env write, not needed further
+
+    // ── Step 3: Model ────────────────────────────────────────────────────────
+    let default_model = match provider {
+        "deepseek"    => "deepseek-chat",
+        "openrouter"  => "anthropic/claude-3.5-haiku",
+        "openai"      => "gpt-4o-mini",
+        _             => "qwen3:latest",
+    };
+    println!("{}", "  Step 3/3 — Model".bold());
+    println!("  Which model? (press Enter for {})", default_model.cyan());
+    print!("  Model: ");
+    std::io::stdout().flush()?;
+
+    let mut model_input = String::new();
+    std::io::stdin().read_line(&mut model_input)?;
+    let model = {
+        let m = model_input.trim();
+        if m.is_empty() { default_model.to_string() } else { m.to_string() }
+    };
+    println!("  {} {}", "✓ Model:".green(), model);
+    println!();
+
+    // ── Write config.toml ────────────────────────────────────────────────────
+    let config_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".agenta")
+        .join("config.toml");
+
+    if !config_path.exists() {
+        // Write a fresh config with the chosen provider as default
+        let default_cfg = AppConfig {
+            default_provider: Some(provider.to_string()),
+            ..AppConfig::default()
+        };
+        let toml_str = toml::to_string_pretty(&default_cfg)?;
+        std::fs::create_dir_all(config_path.parent().unwrap())?;
+        std::fs::write(&config_path, toml_str)?;
+        println!("  {} ~/.agenta/config.toml", "✓ Config written to".green());
+    }
+
+    // ── Start daemon if needed ────────────────────────────────────────────────
+    let daemon_running = is_daemon_running(config).await;
+    if !daemon_running {
+        print!("  Starting daemon... ");
+        std::io::stdout().flush()?;
+        daemon_start(config, false).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("{}", "✓".green());
+    }
+
+    // ── Reload config (picks up .env written above) ───────────────────────────
+    let fresh_config = AppConfig::load().unwrap_or_else(|_| config.clone());
+
+    // ── Create MIND ───────────────────────────────────────────────────────────
     let mut mind = Agent::new(
         "MIND".to_string(),
-        model,
+        model.clone(),
         "You are MIND — Maintenance, Inference, and Development agent. \
 Your primary role is to generate shell scripts and tools for the agenta ecosystem. \
 When asked to create a tool, output a well-structured bash script that accomplishes the task. \
@@ -737,20 +927,34 @@ Suggest test commands for any tool you create.".to_string(),
     mind.status = AgentStatus::Active;
 
     let agent_value = serde_json::to_value(&mind)?;
-    match daemon_request(config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
+    match daemon_request(&fresh_config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
         DaemonResponse::Success { .. } => {
-            println!();
-            println!("{}", "✓ MIND system agent created successfully.".green().bold());
-            println!("  Provider : {}", provider);
-            println!("  Model    : {}", mind.model);
-            println!();
-            println!("Run {} to open the dashboard.", "agenta".cyan());
+            println!("  {} MIND", "✓ Created system agent".green());
         }
         DaemonResponse::Error { message } => {
             return Err(anyhow!("Failed to create MIND: {}", message));
         }
         _ => return Err(anyhow!("Unexpected response from daemon")),
     }
+
+    // ── Optional: Telegram ────────────────────────────────────────────────────
+    println!("  Set up Telegram bot? [y/N]: ");
+    print!("  ");
+    std::io::stdout().flush()?;
+    let mut tg = String::new();
+    std::io::stdin().read_line(&mut tg)?;
+    if tg.trim().eq_ignore_ascii_case("y") {
+        setup_telegram(&fresh_config).await?;
+    }
+
+    // ── Done ─────────────────────────────────────────────────────────────────
+    println!();
+    println!("{}", "  All done!".bold().green());
+    println!("  Provider : {}", provider.cyan());
+    println!("  Model    : {}", model.cyan());
+    println!();
+    println!("  Run {} to open the dashboard.", "agenta".cyan().bold());
+    println!();
 
     Ok(())
 }

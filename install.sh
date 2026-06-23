@@ -157,10 +157,6 @@ bootstrap() {
   fi
 
   echo ""
-  echo "Starting agenta daemon for bootstrap..."
-  "$bin" daemon start 2>/dev/null || true
-  sleep 2
-
   "$bin" setup
 }
 

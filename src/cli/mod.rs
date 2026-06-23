@@ -62,7 +62,7 @@ pub enum Commands {
         max_tokens: u32,
 
         /// Execution mode (once, scheduled, triggered, continuous)
-        #[arg(short, long, default_value = "once")]
+        #[arg(short = 'x', long, default_value = "once")]
         mode: String,
 
         /// Cron schedule (for scheduled mode)
@@ -296,8 +296,17 @@ pub enum Commands {
     /// Run diagnostics and check system health
     Doctor,
 
-    /// First-time setup wizard
-    Setup,
+    /// First-time setup wizard (run without args), or configure a sub-system
+    Setup {
+        #[command(subcommand)]
+        target: Option<SetupCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SetupCommands {
+    /// Add or update a Telegram bot for an agent
+    Telegram,
 }
 
 #[derive(Subcommand)]

@@ -115,3 +115,47 @@ pub async fn run_tool(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_tools_are_builtin() {
+        assert!(is_builtin_tool("read_file"));
+        assert!(is_builtin_tool("write_file"));
+        assert!(is_builtin_tool("list_files"));
+    }
+
+    #[test]
+    fn spawn_agent_is_builtin() {
+        assert!(is_builtin_tool("spawn_agent"));
+    }
+
+    #[test]
+    fn unknown_tool_is_not_builtin() {
+        assert!(!is_builtin_tool("tavily_search"));
+        assert!(!is_builtin_tool(""));
+        assert!(!is_builtin_tool("read_file_v2"));
+    }
+
+    #[test]
+    fn builtin_tool_descriptions_covers_all_builtins() {
+        let descs = builtin_tool_descriptions();
+        let names: Vec<&str> = descs.iter().map(|(n, _)| *n).collect();
+        for builtin in BUILTIN_TOOL_NAMES {
+            assert!(
+                names.contains(builtin),
+                "missing description for built-in tool: {}", builtin
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_tool_descriptions_are_non_empty() {
+        for (name, desc) in builtin_tool_descriptions() {
+            assert!(!name.is_empty(), "tool name should not be empty");
+            assert!(!desc.is_empty(), "description for '{}' should not be empty", name);
+        }
+    }
+}
