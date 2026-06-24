@@ -1,4 +1,4 @@
-use super::{Commands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
+use super::{Commands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
     ExecutionResult, ScriptDefinition, ToolDefinition, ToolResource,
@@ -167,6 +167,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             memory: new_memory,
             provider: new_provider,
             tools: new_tools,
+            add_tool: new_add_tool,
+            remove_tool: new_remove_tool,
             spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -214,6 +216,28 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 agent.tools = read_tool_definitions(&tools_arg)?;
                 if let Some(config) = agent.deep_agent_config.as_mut() {
                     config.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+                }
+            }
+            if let Some(tool_name) = new_add_tool {
+                let tool = read_installed_tool(&tool_name)?;
+                // Replace if already present, otherwise append
+                if let Some(pos) = agent.tools.iter().position(|t| t.name == tool.name) {
+                    agent.tools[pos] = tool;
+                } else {
+                    agent.tools.push(tool);
+                }
+                if let Some(cfg) = agent.deep_agent_config.as_mut() {
+                    cfg.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+                }
+            }
+            if let Some(tool_name) = new_remove_tool {
+                let before = agent.tools.len();
+                agent.tools.retain(|t| t.name != tool_name);
+                if agent.tools.len() == before {
+                    println!("{} Tool '{}' was not attached to this agent.", "!".yellow(), tool_name);
+                }
+                if let Some(cfg) = agent.deep_agent_config.as_mut() {
+                    cfg.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
                 }
             }
             if let Some(msg) = new_spawn_message {
@@ -342,6 +366,12 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         Commands::Setup { target } => match target {
             None                          => bootstrap_mind(&config).await,
             Some(SetupCommands::Telegram) => setup_telegram(&config).await,
+        },
+
+        Commands::Pull { target } => match target {
+            PullCommands::Tool { name, version, attach } => {
+                pull_tool(&config, &name, &version, attach.as_deref()).await
+            }
         },
 
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
@@ -1857,4 +1887,204 @@ echo "tool {name} received: $INPUT"
     }
 
     Ok(format!("/usr/bin/env bash {}", path.display()))
+}
+
+pub(crate) fn read_installed_tool(name: &str) -> Result<ToolDefinition> {
+    let install_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("Cannot determine home directory"))?
+        .join(".agenta/tools")
+        .join(name);
+
+    let manifest_path = install_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(anyhow!(
+            "Tool '{}' is not installed. Run: agenta pull tool {}",
+            name, name
+        ));
+    }
+
+    let content = std::fs::read_to_string(&manifest_path)?;
+    let value: serde_json::Value = serde_json::from_str(&content)?;
+
+    let tool_name = value.get("name").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("manifest.json missing 'name'"))?
+        .to_string();
+    let description = value.get("description").and_then(|v| v.as_str())
+        .unwrap_or("").to_string();
+    let parameters = value.get("parameters").cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+    let handler_file = value.get("handler").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("manifest.json missing 'handler'"))?;
+
+    let handler_path = install_dir.join(handler_file);
+    let handler = format!("/usr/bin/env bash {}", handler_path.display());
+
+    Ok(ToolDefinition { name: tool_name, description, parameters, handler: Some(handler) })
+}
+
+async fn pull_tool(config: &AppConfig, name: &str, version: &str, attach: Option<&str>) -> Result<()> {
+    let base = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+        config.registry_owner, config.registry_repo, version, name
+    );
+
+    println!("Pulling tool {} from registry ({}@{})...", name.cyan(), config.registry_repo, version);
+
+    // 1. Fetch manifest
+    let client = reqwest::Client::new();
+    let manifest_url = format!("{}/manifest.json", base);
+    let resp = client
+        .get(&manifest_url)
+        .send()
+        .await
+        .context("Failed to reach registry")?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow!("Tool '{}' not found in registry. Check available tools at https://github.com/{}/{}", name, config.registry_owner, config.registry_repo));
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow!("Registry returned {}", resp.status()));
+    }
+
+    let manifest: serde_json::Value = resp.json().await.context("Invalid manifest.json")?;
+
+    let handler_file = manifest
+        .get("handler")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("manifest.json missing 'handler' field"))?
+        .to_string();
+
+    let description = manifest
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let env_vars: Vec<String> = manifest
+        .get("env")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    // 2. Fetch handler script
+    let handler_url = format!("{}/{}", base, handler_file);
+    let script_bytes = client
+        .get(&handler_url)
+        .send()
+        .await
+        .context("Failed to download handler script")?
+        .bytes()
+        .await?;
+
+    // 3. Write to ~/.agenta/tools/<name>/
+    let install_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("Cannot determine home directory"))?
+        .join(".agenta/tools")
+        .join(name);
+
+    tokio::fs::create_dir_all(&install_dir).await?;
+
+    // Write manifest
+    let manifest_path = install_dir.join("manifest.json");
+    tokio::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).await?;
+
+    // Write handler script
+    let handler_path = install_dir.join(&handler_file);
+    tokio::fs::write(&handler_path, &script_bytes).await?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&handler_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&handler_path, perms)?;
+    }
+
+    // 4. Register as ToolResource in the daemon DB
+    let parameters = manifest
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+    let tool_val = serde_json::json!({
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+        "handler": format!("/usr/bin/env bash {}", handler_path.display()),
+    });
+    if let Err(e) = daemon_request(config, DaemonRequest::CreateTool { tool: tool_val }).await {
+        // Non-fatal — daemon may not be running, files are still on disk
+        eprintln!("{} Could not register with daemon: {}", "!".yellow(), e);
+    }
+
+    println!("{} Tool installed: {}", "✓".green(), name.cyan());
+    println!("  Location : {}", install_dir.display());
+    println!("  Handler  : {}", handler_path.display());
+    if !description.is_empty() {
+        println!("  About    : {}", description);
+    }
+
+    if !env_vars.is_empty() {
+        println!("\n{} Required environment variables (add to ~/.agenta/.env):", "!".yellow());
+        for var in &env_vars {
+            let home = dirs::home_dir().unwrap_or_default();
+            let env_file = home.join(".agenta/.env");
+            let already_set = std::fs::read_to_string(&env_file)
+                .map(|s| s.contains(var.as_str()))
+                .unwrap_or(false);
+            if already_set {
+                println!("  {} {} (already set)", "✓".green(), var);
+            } else {
+                println!("  {} {} {}", "✗".red(), var, "(not set)".dimmed());
+            }
+        }
+    }
+
+    if let Some(agent_name) = attach {
+        println!("\nAttaching to {}...", agent_name.cyan());
+        attach_tool_to_agent(config, name, agent_name).await?;
+    } else {
+        println!("\nAttach to an agent:");
+        println!("  agenta pull tool {} --attach <agent>", name);
+        println!("  agenta update <agent> --add-tool {}", name);
+    }
+
+    Ok(())
+}
+
+async fn attach_tool_to_agent(config: &AppConfig, tool_name: &str, agent_name: &str) -> Result<()> {
+    let tool = read_installed_tool(tool_name)?;
+
+    let get_request = DaemonRequest::GetAgent { id: agent_name.to_string() };
+    let mut agent: Agent = match daemon_request(config, get_request).await? {
+        DaemonResponse::AgentDetails { agent } => serde_json::from_value(agent)?,
+        DaemonResponse::Error { message } => return Err(anyhow!("{}", message)),
+        _ => return Err(anyhow!("Unexpected response")),
+    };
+
+    let action = if let Some(pos) = agent.tools.iter().position(|t| t.name == tool.name) {
+        agent.tools[pos] = tool;
+        "updated"
+    } else {
+        agent.tools.push(tool);
+        "added"
+    };
+
+    if let Some(cfg) = agent.deep_agent_config.as_mut() {
+        cfg.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+    }
+
+    agent.touch();
+
+    match daemon_request(config, DaemonRequest::UpdateAgent {
+        id: agent.id.clone(),
+        agent: serde_json::to_value(agent)?,
+    }).await? {
+        DaemonResponse::Success { .. } => {
+            println!("{} Tool '{}' {} on agent {}", "✓".green(), tool_name.cyan(), action, agent_name.cyan());
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(anyhow!("{}", message)),
+        _ => Err(anyhow!("Unexpected response")),
+    }
 }

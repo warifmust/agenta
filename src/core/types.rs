@@ -138,7 +138,16 @@ pub struct AppConfig {
     /// Defaults to system local timezone if not set.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// GitHub owner of the agenta-tools registry (default: agenta-tools)
+    #[serde(default = "default_registry_owner")]
+    pub registry_owner: String,
+    /// GitHub repo of the agenta-tools registry (default: agenta-tools)
+    #[serde(default = "default_registry_repo")]
+    pub registry_repo: String,
 }
+
+fn default_registry_owner() -> String { "agenta-tools".to_string() }
+fn default_registry_repo() -> String { "agenta-tools".to_string() }
 
 fn default_provider() -> Option<String> {
     Some("ollama".to_string())
@@ -174,6 +183,8 @@ impl Default for AppConfig {
             api_port: 8789,
             api_token: None,
             timezone: None,
+            registry_owner: default_registry_owner(),
+            registry_repo: default_registry_repo(),
         }
     }
 }

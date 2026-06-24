@@ -106,12 +106,18 @@ pub async fn run_tool(
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, _)   => stdout,
+            (true, false) => stderr,
+            (true, true)  => String::new(),
+        };
         Err(anyhow!(
             "Tool {} failed ({}): {}",
             tool_name,
             output.status,
-            stderr
+            detail
         ))
     }
 }

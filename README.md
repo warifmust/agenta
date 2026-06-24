@@ -140,17 +140,39 @@ Two panels: **Agents** on the left, **Chat** on the right. Select an agent, type
 
 ### Keyboard Reference
 
+**Agents panel**
+
 | Key | Action |
 |-----|--------|
 | `↑` `↓` | Move between agents |
-| `Tab` | Switch between Agents and Chat panels |
+| `Tab` | Switch to Tools panel |
+| `n` | Create new agent |
+| `v` | View agent details |
+| `e` | Edit agent |
+| `d` | Delete agent |
+| `a` | Attach an installed tool to the selected agent |
+
+**Chat panel**
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch to Agents panel |
 | `i` | Enter compose mode |
 | `Enter` | Send message |
 | `Esc` | Exit compose mode |
-| `n` | Create new agent |
-| `v` | View full agent details (model, prompt, config) |
-| `e` | Edit agent |
-| `d` | Delete agent |
+
+**Tools panel**
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Move between tools |
+| `p` | Pull a tool from the registry |
+| `d` | Delete tool |
+
+**Global**
+
+| Key | Action |
+|-----|--------|
 | `q` | Quit |
 
 After an agent responds, the dashboard automatically drops back into compose mode — no extra keypresses needed to continue the conversation.
@@ -198,6 +220,10 @@ default_agent = "CORAL"
 # REST API
 api_port  = 8789
 api_token = "replace-with-a-strong-token"
+
+# Tool registry — override to use a private or forked registry
+# registry_owner = "agenta-tools"
+# registry_repo  = "agenta-tools"
 ```
 
 ### Secrets
@@ -218,23 +244,24 @@ Reference them in `config.toml` with a `$` prefix (e.g. `api_key = "$DEEPSEEK_AP
 ## ⌨️ Core Commands
 
 ```bash
-agenta setup       # First-time setup wizard (provider, model, MIND, optional Telegram)
+agenta setup           # First-time setup wizard (provider, model, MIND, optional Telegram)
 agenta setup telegram  # Add a Telegram bot to an existing install
-agenta create      # Create an agent
-agenta get         # Show agent details
-agenta list        # List all agents
-agenta update      # Update agent config
-agenta delete      # Delete an agent
-agenta run         # Run an agent once
-agenta stop        # Stop a running agent
-agenta logs        # View execution logs
-agenta export      # Export agents to JSON/YAML
-agenta import      # Import agents from file
-agenta view        # View runtime data (executions, etc.)
-agenta tool        # Manage tools (create/get/list/update/delete/run/logs)
-agenta script      # Manage scripts (create/get/list/update/delete/run/logs)
-agenta daemon      # start / stop / status / restart daemon
-agenta upgrade     # Upgrade to the latest (or a specific) version
+agenta create          # Create an agent
+agenta get             # Show agent details
+agenta list            # List all agents
+agenta update          # Update agent config
+agenta delete          # Delete an agent
+agenta run             # Run an agent once
+agenta stop            # Stop a running agent
+agenta logs            # View execution logs
+agenta export          # Export agents to JSON/YAML
+agenta import          # Import agents from file
+agenta view            # View runtime data (executions, etc.)
+agenta pull tool       # Pull and install a tool from the registry
+agenta tool            # Manage tools (create/get/list/update/delete/run/logs)
+agenta script          # Manage scripts (create/get/list/update/delete/run/logs)
+agenta daemon          # start / stop / status / restart daemon
+agenta upgrade         # Upgrade to the latest (or a specific) version
 ```
 
 ---
@@ -404,17 +431,41 @@ Tool output is capped at 8,000 characters to protect the context window.
 
 ### External Tools
 
-Attach shell-script tools to give agents web search, API access, or anything else:
+Tools are shell scripts with a `manifest.json` that describes the interface. They live in `~/.agenta/tools/<name>/` and appear in the dashboard Tools panel automatically.
+
+**Pull a tool from the registry:**
 
 ```bash
-agenta tool create \
-  --name web-search \
-  --description "Search the web for current information" \
-  --parameters '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}' \
-  --handler "~/.agenta/tools/tavily_search.sh"
+agenta pull tool tavily_search
+agenta pull tool system_monitor
+agenta pull tool send_telegram
+```
 
+**Pull and immediately attach to an agent:**
+
+```bash
+agenta pull tool tavily_search --attach CORAL
+```
+
+**Attach an already-installed tool to an agent:**
+
+```bash
+agenta update CORAL --add-tool tavily_search
+```
+
+**Remove a tool from an agent (keeps it installed):**
+
+```bash
+agenta update CORAL --remove-tool tavily_search
+```
+
+**Replace all tools from a JSON file (legacy):**
+
+```bash
 agenta update CORAL --tools ~/.agenta/tools/search_tools.json
 ```
+
+See [agenta-tools](https://github.com/agenta-tools/agenta-tools) for the full tool registry and instructions for writing your own tools.
 
 ---
 
@@ -684,5 +735,7 @@ Hard refresh the browser tab or reopen the Swagger URL after daemon restart.
 - Built-in tools (`read_file`, `write_file`, `list_files`, `spawn_agent`) require no registration.
 - Sub-agents spawned with `role` are ephemeral — not saved to the database, not listable.
 - Sub-agents spawned with `name` delegate to a real existing agent.
-- Tools live in `~/.agenta/tools/` — decoupled from the repo, safe across upgrades.
+- Tools live in `~/.agenta/tools/` — decoupled from the repo, safe across upgrades. Any subfolder with a `manifest.json` appears in the dashboard Tools panel automatically.
+- Pull tools from the registry with `agenta pull tool <name>` or `p` in the Tools panel. Attach with `--attach <agent>` or `a` in the Agents panel.
+- The tool registry defaults to `agenta-tools/agenta-tools` on GitHub. Override with `registry_owner` / `registry_repo` in `config.toml`.
 - MIND is a protected system agent — hidden from `agenta list`, cannot be deleted.

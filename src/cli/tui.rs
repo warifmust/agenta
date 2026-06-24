@@ -16,8 +16,8 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::core::{AppConfig, DaemonRequest, DaemonResponse};
-use super::commands::daemon_request;
+use crate::core::{Agent, AppConfig, DaemonRequest, DaemonResponse};
+use super::commands::{daemon_request, read_installed_tool};
 
 const REFRESH: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
@@ -161,6 +161,7 @@ enum AgentMode {
     WizardModel { name: String, model: String },
     EditModel { agent_id: String, agent_name: String, model: String },
     ConfirmDelete { agent_id: String, agent_name: String },
+    AttachTool { agent_id: String, agent_name: String, input: String },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -171,6 +172,8 @@ enum ToolMode {
     Generating { name: String },
     Done { summary: String },
     ConfirmDelete { tool_id: String, tool_name: String },
+    PullName(String),
+    PullAttach { name: String, input: String },
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -336,13 +339,15 @@ impl App {
             self.executions = executions;
         }
 
-        if let Ok(DaemonResponse::ToolList { tools }) =
-            daemon_request(&self.config, DaemonRequest::ListTools).await
-        {
-            self.tools = tools;
-            if !self.tools.is_empty() {
-                self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
-            }
+        self.tools = merge_tools(
+            load_installed_tools(),
+            match daemon_request(&self.config, DaemonRequest::ListTools).await {
+                Ok(DaemonResponse::ToolList { tools }) => tools,
+                _ => vec![],
+            },
+        );
+        if !self.tools.is_empty() {
+            self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
         }
 
         self.poll_pending().await;
@@ -457,14 +462,9 @@ impl App {
                     self.tool_mode = ToolMode::Done { summary };
                     self.tool_pending = None;
                     self.tool_stream_lines.clear();
-                    // Refresh tool list
-                    if let Ok(DaemonResponse::ToolList { tools }) =
-                        daemon_request(&self.config, DaemonRequest::ListTools).await
-                    {
-                        self.tools = tools;
-                        if !self.tools.is_empty() {
-                            self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
-                        }
+                    self.tools = merge_tools(load_installed_tools(), match daemon_request(&self.config, DaemonRequest::ListTools).await { Ok(DaemonResponse::ToolList { tools }) => tools, _ => vec![] });
+                    if !self.tools.is_empty() {
+                        self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
                     }
                 }
                 "failed" | "cancelled" => {
@@ -618,13 +618,9 @@ impl App {
         match daemon_request(&self.config, DaemonRequest::DeleteTool { id: tool_id }).await {
             Ok(DaemonResponse::Success { .. }) => {
                 self.set_status("✓ tool deleted");
-                if let Ok(DaemonResponse::ToolList { tools }) =
-                    daemon_request(&self.config, DaemonRequest::ListTools).await
-                {
-                    self.tools = tools;
-                    if !self.tools.is_empty() {
-                        self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
-                    }
+                self.tools = merge_tools(load_installed_tools(), match daemon_request(&self.config, DaemonRequest::ListTools).await { Ok(DaemonResponse::ToolList { tools }) => tools, _ => vec![] });
+                if !self.tools.is_empty() {
+                    self.selected_tool = self.selected_tool.min(self.tools.len() - 1);
                 }
             }
             Ok(DaemonResponse::Error { message }) => self.set_status(&format!("✗ {}", message)),
@@ -633,6 +629,202 @@ impl App {
         }
         self.tool_mode = ToolMode::List;
     }
+
+    async fn do_pull_tool(&mut self, name: String) {
+        match registry_pull(&name, &self.config.registry_owner, &self.config.registry_repo).await {
+            Ok(manifest) => {
+                // Register as a ToolResource in the DB so the panel shows it
+                let tool_name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+                let description = manifest.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let parameters = manifest.get("parameters").cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}));
+                let install_dir = dirs::home_dir().unwrap_or_default().join(".agenta/tools").join(&name);
+                let handler_file = manifest.get("handler").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let handler = format!("/usr/bin/env bash {}", install_dir.join(&handler_file).display());
+
+                let tool_val = serde_json::json!({
+                    "name": tool_name,
+                    "description": description,
+                    "parameters": parameters,
+                    "handler": handler,
+                });
+                let _ = daemon_request(&self.config, DaemonRequest::CreateTool { tool: tool_val }).await;
+
+                self.tools = merge_tools(load_installed_tools(), match daemon_request(&self.config, DaemonRequest::ListTools).await { Ok(DaemonResponse::ToolList { tools }) => tools, _ => vec![] });
+                self.set_status(&format!("✓ '{}' installed", name));
+                self.tool_mode = ToolMode::PullAttach { name, input: String::new() };
+            }
+            Err(e) => {
+                self.set_status(&format!("✗ pull failed: {}", e));
+                self.tool_mode = ToolMode::List;
+            }
+        }
+    }
+
+    async fn do_attach_tool(&mut self, agent_id: String, agent_name: String, tool_name: String) {
+        let tool = match read_installed_tool(&tool_name) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(&format!("✗ {}", e));
+                self.agent_mode = AgentMode::List;
+                return;
+            }
+        };
+
+        let mut agent: Agent = match daemon_request(
+            &self.config, DaemonRequest::GetAgent { id: agent_id.clone() }
+        ).await {
+            Ok(DaemonResponse::AgentDetails { agent }) => match serde_json::from_value(agent) {
+                Ok(a) => a,
+                Err(e) => { self.set_status(&format!("✗ {}", e)); self.agent_mode = AgentMode::List; return; }
+            },
+            Ok(DaemonResponse::Error { message }) => {
+                self.set_status(&format!("✗ {}", message)); self.agent_mode = AgentMode::List; return;
+            }
+            Err(e) => { self.set_status(&format!("✗ {}", e)); self.agent_mode = AgentMode::List; return; }
+            _ => { self.agent_mode = AgentMode::List; return; }
+        };
+
+        let action = if let Some(pos) = agent.tools.iter().position(|t| t.name == tool.name) {
+            agent.tools[pos] = tool;
+            "updated"
+        } else {
+            agent.tools.push(tool);
+            "attached"
+        };
+        if let Some(cfg) = agent.deep_agent_config.as_mut() {
+            cfg.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+        }
+        agent.touch();
+
+        match daemon_request(&self.config, DaemonRequest::UpdateAgent {
+            id: agent.id.clone(),
+            agent: serde_json::to_value(agent).unwrap_or_default(),
+        }).await {
+            Ok(DaemonResponse::Success { .. }) => {
+                self.set_status(&format!("✓ '{}' {} on {}", tool_name, action, agent_name));
+                self.refresh().await;
+            }
+            Ok(DaemonResponse::Error { message }) => self.set_status(&format!("✗ {}", message)),
+            Err(e) => self.set_status(&format!("✗ {}", e)),
+            _ => {}
+        }
+        self.agent_mode = AgentMode::List;
+    }
+
+    async fn do_attach_tool_by_name(&mut self, tool_name: String, agent_name: String) {
+        // Resolve agent by name first
+        let agents = self.agents.clone();
+        let agent_val = agents.iter().find(|a| {
+            a["name"].as_str().map(|n| n.eq_ignore_ascii_case(&agent_name)).unwrap_or(false)
+        });
+        let agent_id = match agent_val.and_then(|a| a["id"].as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                self.set_status(&format!("✗ agent '{}' not found", agent_name));
+                self.tool_mode = ToolMode::List;
+                return;
+            }
+        };
+        let aname = agent_name.clone();
+        self.do_attach_tool(agent_id, aname, tool_name).await;
+        self.tool_mode = ToolMode::List;
+    }
+}
+
+// ── Installed tools (disk scan) ───────────────────────────────────────────────
+
+fn load_installed_tools() -> Vec<serde_json::Value> {
+    let tools_dir = match dirs::home_dir() {
+        Some(h) => h.join(".agenta/tools"),
+        None => return vec![],
+    };
+    let Ok(entries) = std::fs::read_dir(&tools_dir) else { return vec![]; };
+
+    let mut tools = vec![];
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() { continue; }
+        let Ok(content) = std::fs::read_to_string(&manifest_path) else { continue; };
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) else { continue; };
+
+        // Resolve handler to absolute path if it's just a filename
+        if let Some(handler) = val.get("handler").and_then(|v| v.as_str()) {
+            if !handler.starts_with('/') && !handler.starts_with("/usr") {
+                let abs = format!("/usr/bin/env bash {}", path.join(handler).display());
+                val["handler"] = serde_json::Value::String(abs);
+            }
+        }
+        // Ensure fields the renderer expects
+        if val.get("enabled").is_none() {
+            val["enabled"] = serde_json::Value::Bool(true);
+        }
+        tools.push(val);
+    }
+    tools.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+    tools
+}
+
+fn merge_tools(
+    disk: Vec<serde_json::Value>,
+    db: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for t in disk.iter().chain(db.iter()) {
+        let name = t["name"].as_str().unwrap_or("").to_string();
+        if seen.insert(name) {
+            out.push(t.clone());
+        }
+    }
+    out.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    out
+}
+
+// ── Registry pull ─────────────────────────────────────────────────────────────
+
+async fn registry_pull(name: &str, owner: &str, repo: &str) -> anyhow::Result<serde_json::Value> {
+    let base = format!(
+        "https://raw.githubusercontent.com/{}/{}/main/{}",
+        owner, repo, name
+    );
+    let client = reqwest::Client::new();
+
+    let resp = client.get(format!("{}/manifest.json", base)).send().await
+        .map_err(|e| anyhow::anyhow!("Registry unreachable: {}", e))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("'{}' not found in registry", name));
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("Registry returned {}", resp.status()));
+    }
+    let manifest: serde_json::Value = resp.json().await
+        .map_err(|_| anyhow::anyhow!("Invalid manifest.json"))?;
+
+    let handler_file = manifest.get("handler").and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("manifest.json missing 'handler'"))?.to_string();
+
+    let script_bytes = client.get(format!("{}/{}", base, handler_file)).send().await?.bytes().await?;
+
+    let install_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .join(".agenta/tools").join(name);
+    tokio::fs::create_dir_all(&install_dir).await?;
+    tokio::fs::write(install_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?).await?;
+    let handler_path = install_dir.join(&handler_file);
+    tokio::fs::write(&handler_path, &script_bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&handler_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&handler_path, perms)?;
+    }
+    Ok(manifest)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -790,6 +982,29 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             return false;
         }
+        AgentMode::AttachTool { agent_id, agent_name, input } => {
+            match code {
+                KeyCode::Esc => app.agent_mode = AgentMode::List,
+                KeyCode::Enter => {
+                    let tool = input.trim().to_string();
+                    if !tool.is_empty() {
+                        let id = agent_id.clone();
+                        let aname = agent_name.clone();
+                        app.do_attach_tool(id, aname, tool).await;
+                    }
+                }
+                KeyCode::Char(c) if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT => {
+                    let mut s = input; s.push(c);
+                    app.agent_mode = AgentMode::AttachTool { agent_id, agent_name, input: s };
+                }
+                KeyCode::Backspace => {
+                    let mut s = input; s.pop();
+                    app.agent_mode = AgentMode::AttachTool { agent_id, agent_name, input: s };
+                }
+                _ => {}
+            }
+            return false;
+        }
         AgentMode::List => {}
     }
 
@@ -862,6 +1077,45 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             return false;
         }
+        ToolMode::PullName(current) => {
+            match code {
+                KeyCode::Esc => app.tool_mode = ToolMode::List,
+                KeyCode::Enter => {
+                    let name = current.trim().to_string();
+                    if !name.is_empty() {
+                        app.do_pull_tool(name).await;
+                    }
+                }
+                KeyCode::Char(c) if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT => {
+                    let mut s = current; s.push(c);
+                    app.tool_mode = ToolMode::PullName(s);
+                }
+                KeyCode::Backspace => { let mut s = current; s.pop(); app.tool_mode = ToolMode::PullName(s); }
+                _ => {}
+            }
+            return false;
+        }
+        ToolMode::PullAttach { name, input } => {
+            match code {
+                KeyCode::Esc => app.tool_mode = ToolMode::List,
+                KeyCode::Enter => {
+                    let agent = input.trim().to_string();
+                    if agent.is_empty() {
+                        app.tool_mode = ToolMode::List;
+                    } else {
+                        let n = name.clone();
+                        app.do_attach_tool_by_name(n, agent).await;
+                    }
+                }
+                KeyCode::Char(c) if mods == KeyModifiers::NONE || mods == KeyModifiers::SHIFT => {
+                    let mut s = input; s.push(c);
+                    app.tool_mode = ToolMode::PullAttach { name, input: s };
+                }
+                KeyCode::Backspace => { let mut s = input; s.pop(); app.tool_mode = ToolMode::PullAttach { name, input: s }; }
+                _ => {}
+            }
+            return false;
+        }
         ToolMode::List => {}
     }
 
@@ -891,6 +1145,15 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             KeyCode::Enter => app.active_panel = Panel::Chat,
             KeyCode::Char('n') => {
                 app.agent_mode = AgentMode::WizardName(String::new());
+            }
+            KeyCode::Char('a') => {
+                if let Some(agent) = app.agents.get(app.selected_agent) {
+                    let agent_id = agent["id"].as_str().unwrap_or("").to_string();
+                    let agent_name = agent["name"].as_str().unwrap_or("?").to_string();
+                    if !agent_id.is_empty() {
+                        app.agent_mode = AgentMode::AttachTool { agent_id, agent_name, input: String::new() };
+                    }
+                }
             }
             KeyCode::Char('e') => {
                 if let Some(agent) = app.agents.get(app.selected_agent) {
@@ -953,6 +1216,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             KeyCode::Char('n') => {
                 app.tool_mode = ToolMode::WizardName(String::new());
+            }
+            KeyCode::Char('p') => {
+                app.tool_mode = ToolMode::PullName(String::new());
             }
             KeyCode::Char('d') => {
                 if let Some(tool) = app.tools.get(app.selected_tool) {
@@ -1060,6 +1326,9 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         AgentMode::ConfirmDelete { agent_name, .. } => {
             return render_agent_confirm_delete(f, agent_name, inner);
         }
+        AgentMode::AttachTool { agent_name, input, .. } => {
+            return render_agent_attach_tool(f, agent_name, input, inner);
+        }
         AgentMode::List => {}
     }
 
@@ -1129,16 +1398,22 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" [n]", Style::default().fg(Color::Cyan)),
-            Span::styled(" new  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[v]", Style::default().fg(Color::Cyan)),
-            Span::styled(" view  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[e]", Style::default().fg(Color::Cyan)),
-            Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[d]", Style::default().fg(Color::Cyan)),
-            Span::styled(" delete", Style::default().fg(Color::DarkGray)),
-        ])),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" [n]", Style::default().fg(Color::Cyan)),
+                Span::styled(" new  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[v]", Style::default().fg(Color::Cyan)),
+                Span::styled(" view  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[e]", Style::default().fg(Color::Cyan)),
+                Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[d]", Style::default().fg(Color::Cyan)),
+                Span::styled(" delete", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [a]", Style::default().fg(Color::Cyan)),
+                Span::styled(" attach tool", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]),
         footer_area,
     );
 }
@@ -1596,6 +1871,8 @@ fn render_tools(f: &mut Frame, app: &App, area: Rect) {
         ToolMode::Generating { name } => render_tools_generating(f, app, name, inner),
         ToolMode::Done { summary } => render_tools_done(f, summary, inner),
         ToolMode::ConfirmDelete { tool_name, .. } => render_tools_confirm_delete(f, tool_name, inner),
+        ToolMode::PullName(name) => render_tools_pull_name(f, name, inner),
+        ToolMode::PullAttach { name, input } => render_tools_pull_attach(f, name, input, inner),
     }
 }
 
@@ -1659,12 +1936,16 @@ fn render_tools_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).scroll((scroll.min(max_scroll), 0)), list_area);
 
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" [n]", Style::default().fg(Color::Cyan)),
-            Span::styled(" new  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[d]", Style::default().fg(Color::Cyan)),
-            Span::styled(" delete", Style::default().fg(Color::DarkGray)),
-        ])),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" [n]", Style::default().fg(Color::Cyan)),
+                Span::styled(" new  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[p]", Style::default().fg(Color::Cyan)),
+                Span::styled(" pull  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[d]", Style::default().fg(Color::Cyan)),
+                Span::styled(" delete", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]),
         footer_area,
     );
 }
@@ -1795,4 +2076,73 @@ fn render_tools_confirm_delete(f: &mut Frame, tool_name: &str, area: Rect) {
         ]),
     ];
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_tools_pull_name(f: &mut Frame, name: &str, area: Rect) {
+    let cursor = if name.is_empty() { "▌" } else { "" };
+    f.render_widget(Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(" Pull from registry", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled(" Tool name:", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(Color::Cyan)),
+            Span::styled(name, Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " e.g. tavily_search, find_file",
+            Style::default().fg(Color::from_u32(0x444444)),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(" [Enter] pull  [Esc] cancel", Style::default().fg(Color::from_u32(0x3a3a3a)))),
+    ]), area);
+}
+
+fn render_tools_pull_attach(f: &mut Frame, tool_name: &str, agent_input: &str, area: Rect) {
+    let cursor = if agent_input.is_empty() { "▌" } else { "" };
+    f.render_widget(Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" ✓ ", Style::default().fg(Color::Green)),
+            Span::styled(tool_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" installed", Style::default().fg(Color::Green)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" Attach to agent (optional):", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(Color::Cyan)),
+            Span::styled(agent_input, Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" [Enter] attach  [Esc] skip", Style::default().fg(Color::from_u32(0x3a3a3a)))),
+    ]), area);
+}
+
+fn render_agent_attach_tool(f: &mut Frame, agent_name: &str, input: &str, area: Rect) {
+    let cursor = if input.is_empty() { "▌" } else { "" };
+    f.render_widget(Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(" Attach tool", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled(" agent: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(abbrev(agent_name), Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" Installed tool name:", Style::default().fg(Color::DarkGray))),
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(Color::Cyan)),
+            Span::styled(input, Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Tool must be installed first (Tools panel → [p])",
+            Style::default().fg(Color::from_u32(0x444444)),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(" [Enter] attach  [Esc] cancel", Style::default().fg(Color::from_u32(0x3a3a3a)))),
+    ]), area);
 }

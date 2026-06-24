@@ -160,9 +160,17 @@ pub enum Commands {
         #[arg(long)]
         provider: Option<String>,
 
-        /// Tool definitions (comma-separated file paths)
+        /// Replace all tools from file paths (comma-separated)
         #[arg(long)]
         tools: Option<String>,
+
+        /// Add (or update) a single installed tool by name, e.g. --add-tool tavily_search
+        #[arg(long, value_name = "TOOL_NAME")]
+        add_tool: Option<String>,
+
+        /// Remove a tool from the agent by name, e.g. --remove-tool tavily_search
+        #[arg(long, value_name = "TOOL_NAME")]
+        remove_tool: Option<String>,
 
         /// Custom sub-agent spawn notification message (deep agents only).
         /// Use {task} as a placeholder for the task description.
@@ -300,6 +308,29 @@ pub enum Commands {
     Setup {
         #[command(subcommand)]
         target: Option<SetupCommands>,
+    },
+
+    /// Pull a tool or agent from the agenta registry
+    Pull {
+        #[command(subcommand)]
+        target: PullCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PullCommands {
+    /// Install a tool from agenta-tools registry
+    Tool {
+        /// Tool name (e.g. tavily_search)
+        name: String,
+
+        /// Version tag or branch (default: main)
+        #[arg(long, default_value = "main")]
+        version: String,
+
+        /// Attach the tool to an agent after installing
+        #[arg(long, value_name = "AGENT")]
+        attach: Option<String>,
     },
 }
 
