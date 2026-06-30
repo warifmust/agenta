@@ -53,9 +53,10 @@ fn fmt_ts(ts: &str) -> String {
 }
 
 fn extract_task_complete(text: &str) -> String {
-    if let Some(pos) = text.rfind("TASK_COMPLETE:") {
-        let after = text[pos + "TASK_COMPLETE:".len()..].trim();
-        if !after.is_empty() { return after.to_string(); }
+    // Strip the TASK_COMPLETE: marker but keep the whole message — models vary on
+    // whether the answer comes before or after it (see deep_agent.rs).
+    if text.contains("TASK_COMPLETE:") {
+        return text.replacen("TASK_COMPLETE:", "", 1).trim().to_string();
     }
     text.trim().to_string()
 }

@@ -162,9 +162,13 @@ impl DeepAgentExecutor {
             });
 
             // ── Task complete ─────────────────────────────────────────────────
-            if let Some(idx) = content.find("TASK_COMPLETE:") {
+            // TASK_COMPLETE: is a "done" signal, not a position marker. Models vary
+            // on whether they write the answer before or after it (e.g. gemma puts it
+            // after; DeepSeek puts the full answer before and only a closer after).
+            // Strip the marker and keep the whole message so we never drop the body.
+            if content.contains("TASK_COMPLETE:") {
                 info!("Agent {} completed at iteration {}", agent.name, iteration + 1);
-                return Ok(content[idx + 14..].trim().to_string());
+                return Ok(content.replacen("TASK_COMPLETE:", "", 1).trim().to_string());
             }
 
             // ── Stop condition ────────────────────────────────────────────────
