@@ -169,10 +169,11 @@ impl ScriptExecution {
 }
 
 /// Execution mode for the agent
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     /// One-time execution
+    #[default]
     Once,
     /// Scheduled execution (cron-like)
     Scheduled,
@@ -212,6 +213,7 @@ pub enum TriggerType {
 
 /// Deep agent configuration for multi-step reasoning
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
 pub struct DeepAgentConfig {
     /// Maximum number of iterations
     pub max_iterations: u32,
@@ -244,9 +246,10 @@ impl Default for DeepAgentConfig {
 }
 
 /// Agent status
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
+    #[default]
     Draft,
     Active,
     Paused,
@@ -292,8 +295,10 @@ pub struct AgentEnv {
 /// An AI Agent definition
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Agent {
+    #[serde(default = "new_uuid")]
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub description: Option<String>,
     pub model: String, // e.g., "llama2", "deepseek/deepseek-chat", etc.
     /// Provider override for this agent. None = use global default_provider from config.
@@ -301,22 +306,38 @@ pub struct Agent {
     #[serde(default)]
     pub provider: Option<String>,
     pub system_prompt: String,
+    #[serde(default)]
     pub config: AgentConfig,
+    #[serde(default)]
     pub tools: Vec<ToolDefinition>,
+    #[serde(default)]
     pub execution_mode: ExecutionMode,
+    #[serde(default)]
     pub trigger: Option<TriggerType>,
+    #[serde(default)]
     pub schedule: Option<String>, // cron expression
+    #[serde(default)]
     pub deep_agent_config: Option<DeepAgentConfig>,
+    #[serde(default)]
     pub environment: Vec<AgentEnv>,
     #[serde(default)]
     pub memory_enabled: bool,
     #[serde(default)]
     pub is_system: bool,
+    #[serde(default)]
     pub status: AgentStatus,
+    #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
     pub last_run: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub run_count: u64,
+}
+
+fn new_uuid() -> String {
+    Uuid::new_v4().to_string()
 }
 
 impl Agent {
@@ -420,6 +441,32 @@ impl ExecutionResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The interactive shell builds a minimal agent JSON (no id, partial
+    /// deep_agent_config). Deserializing it must fill server-owned fields from
+    /// defaults instead of erroring on `enable_reflection`, `id`, etc.
+    /// Values are intentionally generic placeholders — only the *shape* matters.
+    #[test]
+    fn deserializes_partial_agent_from_shell() {
+        let only_user_supplied_fields = json!({
+            "name": "test-agent",
+            "model": "test-model",
+            "system_prompt": "test prompt",
+            "execution_mode": "once",
+            "memory_enabled": true,
+            "provider": null,
+            "deep_agent_config": { "max_iterations": 10 }
+        });
+        let agent: Agent = serde_json::from_value(only_user_supplied_fields)
+            .expect("partial agent should deserialize");
+
+        // Server-owned fields are filled from defaults, not required in the input.
+        assert!(!agent.id.is_empty(), "id should be auto-generated");
+        assert_eq!(agent.status, AgentStatus::Draft);
+        let deep = agent.deep_agent_config.expect("deep config present");
+        assert_eq!(deep.max_iterations, 10, "supplied field is preserved");
+        assert!(deep.enable_reflection, "omitted field defaults to true");
+    }
 
     #[test]
     fn agent_new_sets_expected_defaults() {

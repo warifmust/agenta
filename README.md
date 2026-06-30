@@ -246,6 +246,7 @@ Reference them in `config.toml` with a `$` prefix (e.g. `api_key = "$DEEPSEEK_AP
 ```bash
 agenta setup           # First-time setup wizard (provider, model, MIND, optional Telegram)
 agenta setup telegram  # Add a Telegram bot to an existing install
+agenta shell           # Interactive shell — type / for the live command palette
 agenta create          # Create an agent
 agenta get             # Show agent details
 agenta list            # List all agents
@@ -642,20 +643,21 @@ When `database_url` is set, Agenta uses Postgres and ignores `database_path`.
 
 ## 🔧 Troubleshooting
 
-### Daemon won't start
+### Daemon won't start / `Address already in use`
+
+`agenta daemon restart` now reliably stops any running, stuck, or duplicate daemon —
+sweeping stray `agenta-daemon` processes and freeing the socket and ports — before
+starting a fresh one. A plain restart fixes most cases:
 
 ```bash
-agenta daemon status
-pkill -f agenta-daemon || true
-agenta daemon start
+agenta daemon restart
 ```
 
-### `Address already in use`
-
-A stale socket from a crashed daemon. Fix:
+If something is wedged badly, force a clean slate (`stop` is authoritative — it
+guarantees no `agenta-daemon` process survives):
 
 ```bash
-pkill -f agenta-daemon || true
+agenta daemon stop
 agenta daemon start
 ```
 

@@ -144,7 +144,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&pid_file);
 
     info!("Daemon stopped");
-    Ok(())
+
+    // Exit promptly. Background tasks (Telegram long-poll loops, scheduler, file
+    // watcher) would otherwise keep the tokio runtime alive after we return,
+    // leaving the process lingering for many seconds on a graceful shutdown.
+    std::process::exit(0);
 }
 
 /// Load ~/.agenta/.env into the current process environment.

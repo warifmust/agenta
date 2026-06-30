@@ -37,12 +37,6 @@ pub(crate) async fn daemon_request(config: &AppConfig, request: DaemonRequest) -
     Ok(response)
 }
 
-/// Check if daemon is running
-fn daemon_socket_exists(config: &AppConfig) -> bool {
-    let socket_path = Path::new(&config.socket_path);
-    socket_path.exists()
-}
-
 async fn is_daemon_running(config: &AppConfig) -> bool {
     matches!(
         daemon_request(config, DaemonRequest::Ping).await,
@@ -681,8 +675,10 @@ async fn handle_daemon_command(
         }
 
         super::DaemonCommands::Restart => {
+            // daemon_stop now waits for the process to fully exit and free its
+            // socket/ports, so start won't race a still-bound instance.
             daemon_stop(&config).await?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             daemon_start(&config, false).await
         }
 
@@ -989,16 +985,52 @@ Suggest test commands for any tool you create.".to_string(),
     Ok(())
 }
 
+/// Path to the daemon's pidfile (written by the daemon next to its socket).
+fn daemon_pid_file(config: &AppConfig) -> std::path::PathBuf {
+    Path::new(&config.socket_path).with_extension("pid")
+}
+
+/// Whether any `agenta-daemon` process is currently alive. Catches orphans not
+/// recorded in the pidfile (e.g. duplicates left by earlier failed restarts).
+fn daemon_processes_exist() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", "agenta-daemon"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Force-kill every `agenta-daemon` process to guarantee a clean slate.
+fn kill_all_daemons() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "agenta-daemon"])
+        .status();
+}
+
+/// Remove the daemon's socket + pidfile so a fresh start has a clean slate.
+fn cleanup_daemon_files(config: &AppConfig) {
+    let _ = std::fs::remove_file(&config.socket_path);
+    let _ = std::fs::remove_file(daemon_pid_file(config));
+}
+
 async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {
     if is_daemon_running(config).await {
         println!("Daemon is already running");
         return Ok(());
     }
 
-    // Cleanup stale socket if previous daemon crashed.
-    if daemon_socket_exists(config) {
-        let _ = std::fs::remove_file(&config.socket_path);
+    // We got here because nothing is responding on the socket. If any daemon
+    // process is still alive, it's an orphan (unresponsive, or holding ports
+    // 8789/8790 without a working socket) — sweep it so we never spawn a second
+    // daemon that collides.
+    if daemon_processes_exist() {
+        eprintln!("{}", "Found leftover daemon process(es); cleaning up...".yellow());
+        kill_all_daemons();
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    cleanup_daemon_files(config);
 
     let data_dir = std::path::Path::new(&config.database_path)
         .parent()
@@ -1018,12 +1050,17 @@ async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {
         // Ensure data directory exists
         std::fs::create_dir_all(data_dir)?;
 
-        // Start installed daemon binary directly (works outside repo and without cargo in PATH)
+        // Start installed daemon binary directly (works outside repo and without cargo in PATH).
+        // `process_group(0)` detaches it into its own process group so it survives the CLI
+        // exiting or being killed — without this, killing the foreground `agenta daemon …`
+        // command (or its job-control group) takes the daemon down with it.
         let daemon_bin = resolve_daemon_binary()?;
+        use std::os::unix::process::CommandExt;
         let _child = std::process::Command::new(daemon_bin)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?;
 
         // Wait for daemon to start
@@ -1035,39 +1072,48 @@ async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        return Err(anyhow!("Failed to start daemon"));
+        return Err(anyhow!(
+            "Daemon did not come up within timeout. Another process may be holding the socket \
+             or ports 8789/8790. Inspect with `pgrep -fl agenta-daemon` and `lsof -i :8789`, \
+             then run `agenta daemon stop` and try again."
+        ));
     }
 
     Ok(())
 }
 
 async fn daemon_stop(config: &AppConfig) -> Result<()> {
-    if !is_daemon_running(config).await {
+    // Authoritative: after this returns, NO agenta-daemon process is running.
+    if !is_daemon_running(config).await && !daemon_processes_exist() {
+        cleanup_daemon_files(config);
         println!("Daemon is not running");
         return Ok(());
     }
 
-    let request = DaemonRequest::Shutdown;
-    match daemon_request(config, request).await {
-        Ok(DaemonResponse::Success { message }) => {
-            println!("{}", message.green());
+    // Ask the daemon to shut down gracefully.
+    println!("Shutting down...");
+    let _ = daemon_request(config, DaemonRequest::Shutdown).await;
+
+    // Wait until no daemon process survives — including untracked orphans
+    // (duplicates from earlier failed restarts) the pidfile doesn't know about.
+    // Key off the process, not the socket file: the daemon doesn't unlink its
+    // socket on exit, so the file lingers and is cleaned up by cleanup_daemon_files.
+    for _ in 0..40 {
+        if !daemon_processes_exist() {
+            cleanup_daemon_files(config);
+            println!("{}", "Daemon stopped".green());
+            return Ok(());
         }
-        Ok(DaemonResponse::Error { message }) => {
-            eprintln!("{}", message.red());
-        }
-        Ok(_) => {
-            eprintln!("Unexpected response from daemon");
-        }
-        Err(_e) => {
-            // Daemon might be stuck, clean up socket
-            let socket_path = Path::new(&config.socket_path);
-            if socket_path.exists() {
-                std::fs::remove_file(socket_path)?;
-            }
-            println!("Daemon stopped (forced)");
-        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    // Survivors remain (orphans holding ports, or graceful stop didn't take) —
+    // force-kill every daemon to guarantee a clean slate.
+    eprintln!("{}", "Forcing shutdown of remaining daemon process(es)...".yellow());
+    kill_all_daemons();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cleanup_daemon_files(config);
+    println!("{}", "Daemon stopped".green());
     Ok(())
 }
 

@@ -1,39 +1,77 @@
+use std::io::{stdout, Write};
+
 use anyhow::Result;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    queue,
+    style::{Attribute, SetAttribute},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+};
 use owo_colors::OwoColorize;
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 
 use crate::core::{AppConfig, DaemonRequest, DaemonResponse};
 use super::commands::daemon_request;
+
+/// All slash commands: (command, description). Single source of truth for the
+/// live palette and `/help` so they can never drift apart.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/create-agent", "Create a new agent (guided wizard)"),
+    ("/update-agent", "Update an existing agent"),
+    ("/create-tool",  "Create a new tool (guided wizard)"),
+    ("/update-tool",  "Update an existing tool"),
+    ("/list",         "List all agents"),
+    ("/list-tools",   "List all tools"),
+    ("/get",          "Show agent details"),
+    ("/run",          "Run an agent"),
+    ("/stop",         "Stop a running agent"),
+    ("/logs",         "View agent logs"),
+    ("/delete",       "Delete an agent"),
+    ("/status",       "Show daemon status"),
+    ("/help",         "Show this help"),
+    ("/quit",         "Exit the shell"),
+];
+
+const PROMPT: &str = "agenta> ";
+
+/// Outcome of reading one line from the palette reader.
+enum LineResult {
+    Line(String),
+    Eof, // Ctrl-C / Ctrl-D → exit shell
+}
+
+/// Commands whose name starts with `prefix` (used to populate the dropdown).
+fn matches(prefix: &str) -> Vec<&'static (&'static str, &'static str)> {
+    if prefix.contains(' ') {
+        return vec![];
+    }
+    COMMANDS.iter().filter(|(cmd, _)| cmd.starts_with(prefix)).collect()
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run_shell(config: AppConfig) -> Result<()> {
     print_banner();
 
-    let mut rl = DefaultEditor::new()?;
-
-    // Load history
-    let history_path = history_file();
-    if let Some(ref p) = history_path {
-        let _ = rl.load_history(p);
-    }
+    let mut history: Vec<String> = load_history();
+    let mut reader = PaletteReader::new();
 
     loop {
-        match rl.readline("agenta> ") {
-            Ok(line) => {
+        match reader.read_line(&history)? {
+            LineResult::Eof => break,
+            LineResult::Line(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
                 }
-                let _ = rl.add_history_entry(&line);
-
+                if history.last().map(|h| h != &line).unwrap_or(true) {
+                    history.push(line.clone());
+                }
                 match dispatch(&line, &config).await {
-                    Ok(true) => break,  // /quit
+                    Ok(true) => break, // /quit
                     Ok(false) => {}
                     Err(e) => {
                         eprintln!("{}", format!("Error: {e}").red());
-                        // Check if daemon is down and give a hint
                         let msg = e.to_string();
                         if msg.contains("not running") || msg.contains("connect") {
                             eprintln!("{}", "  Hint: run `agenta daemon start` first".dimmed());
@@ -41,20 +79,236 @@ pub async fn run_shell(config: AppConfig) -> Result<()> {
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("Readline error: {e}");
-                break;
-            }
         }
     }
 
-    if let Some(ref p) = history_path {
-        let _ = rl.save_history(p);
-    }
-
+    save_history(&history);
     println!("Goodbye.");
     Ok(())
+}
+
+// ── Live palette line reader ────────────────────────────────────────────────────
+//
+// Reads a single line in raw mode. While the buffer starts with `/`, a dropdown
+// of matching commands renders directly below the prompt and filters as you type;
+// ↑/↓ move the highlight, Enter/Tab runs the highlighted command. When the buffer
+// isn't a slash-command, it behaves like an ordinary prompt (↑/↓ = history).
+
+struct PaletteReader {
+    buf: String,
+    cursor: usize,   // char index into buf
+    selected: usize, // index into the current matches
+    menu_rows: u16,  // rows the dropdown drew last render (for cleanup)
+    hist_idx: Option<usize>,
+}
+
+impl PaletteReader {
+    fn new() -> Self {
+        Self { buf: String::new(), cursor: 0, selected: 0, menu_rows: 0, hist_idx: None }
+    }
+
+    fn read_line(&mut self, history: &[String]) -> Result<LineResult> {
+        self.buf.clear();
+        self.cursor = 0;
+        self.selected = 0;
+        self.menu_rows = 0;
+        self.hist_idx = None;
+
+        enable_raw_mode()?;
+        let result = self.event_loop(history);
+        let _ = disable_raw_mode();
+        result
+    }
+
+    fn event_loop(&mut self, history: &[String]) -> Result<LineResult> {
+        self.render()?;
+        loop {
+            let ev = match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => k,
+                Event::Resize(..) => {
+                    self.render()?;
+                    continue;
+                }
+                _ => continue,
+            };
+
+            let menu = matches(&self.buf);
+            let menu_open = self.buf.starts_with('/') && !menu.is_empty();
+
+            match ev.code {
+                KeyCode::Char('c') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return self.finish_eof();
+                }
+                KeyCode::Char('d') if ev.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.buf.is_empty() =>
+                {
+                    return self.finish_eof();
+                }
+                KeyCode::Char(c) => {
+                    let idx = self.byte_idx();
+                    self.buf.insert(idx, c);
+                    self.cursor += 1;
+                    self.selected = 0;
+                    self.hist_idx = None;
+                }
+                KeyCode::Backspace => {
+                    if self.cursor > 0 {
+                        self.cursor -= 1;
+                        let idx = self.byte_idx();
+                        self.buf.remove(idx);
+                        self.selected = 0;
+                        self.hist_idx = None;
+                    }
+                }
+                KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    if self.cursor < self.buf.chars().count() {
+                        self.cursor += 1;
+                    }
+                }
+                KeyCode::Up => {
+                    if menu_open {
+                        self.selected = self.selected.saturating_sub(1);
+                    } else {
+                        self.history_prev(history);
+                    }
+                }
+                KeyCode::Down => {
+                    if menu_open {
+                        if self.selected + 1 < menu.len() {
+                            self.selected += 1;
+                        }
+                    } else {
+                        self.history_next(history);
+                    }
+                }
+                KeyCode::Esc => {
+                    self.buf.clear();
+                    self.cursor = 0;
+                    self.selected = 0;
+                }
+                KeyCode::Tab => {
+                    if menu_open {
+                        // Complete the buffer to the highlighted command (don't run yet).
+                        let chosen = menu[self.selected.min(menu.len() - 1)].0;
+                        self.buf = chosen.to_string();
+                        self.cursor = self.buf.chars().count();
+                        self.selected = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    let line = if menu_open {
+                        menu[self.selected.min(menu.len() - 1)].0.to_string()
+                    } else {
+                        self.buf.clone()
+                    };
+                    return self.finish_line(line);
+                }
+                _ => {}
+            }
+
+            self.render()?;
+        }
+    }
+
+    fn byte_idx(&self) -> usize {
+        self.buf
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.buf.len())
+    }
+
+    fn history_prev(&mut self, history: &[String]) {
+        if history.is_empty() {
+            return;
+        }
+        let next = match self.hist_idx {
+            None => history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.hist_idx = Some(next);
+        self.set_buf(history[next].clone());
+    }
+
+    fn history_next(&mut self, history: &[String]) {
+        match self.hist_idx {
+            Some(i) if i + 1 < history.len() => {
+                self.hist_idx = Some(i + 1);
+                self.set_buf(history[i + 1].clone());
+            }
+            Some(_) => {
+                self.hist_idx = None;
+                self.set_buf(String::new());
+            }
+            None => {}
+        }
+    }
+
+    fn set_buf(&mut self, s: String) {
+        self.cursor = s.chars().count();
+        self.buf = s;
+        self.selected = 0;
+    }
+
+    /// Clear the dropdown, commit the prompt line into scrollback, return the line.
+    fn finish_line(&mut self, line: String) -> Result<LineResult> {
+        let mut out = stdout();
+        self.clear_menu(&mut out)?;
+        queue!(out, cursor::MoveToColumn(0))?;
+        write!(out, "{}{}\r\n", PROMPT, self.buf)?;
+        out.flush()?;
+        Ok(LineResult::Line(line))
+    }
+
+    fn finish_eof(&mut self) -> Result<LineResult> {
+        let mut out = stdout();
+        self.clear_menu(&mut out)?;
+        write!(out, "\r\n")?;
+        out.flush()?;
+        Ok(LineResult::Eof)
+    }
+
+    fn clear_menu(&mut self, out: &mut impl Write) -> Result<()> {
+        queue!(out, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        self.menu_rows = 0;
+        Ok(())
+    }
+
+    fn render(&mut self) -> Result<()> {
+        let mut out = stdout();
+        let menu = matches(&self.buf);
+        let menu_open = self.buf.starts_with('/') && !menu.is_empty();
+
+        // Repaint from the prompt line down.
+        queue!(out, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        write!(out, "{}{}", PROMPT.green(), self.buf)?;
+
+        let rows = if menu_open { menu.len() as u16 } else { 0 };
+        if menu_open {
+            for (i, (cmd, desc)) in menu.iter().enumerate() {
+                write!(out, "\r\n")?;
+                let label = format!("  {:<16} {}", cmd, desc);
+                if i == self.selected.min(menu.len() - 1) {
+                    queue!(out, SetAttribute(Attribute::Reverse))?;
+                    write!(out, "{}", label)?;
+                    queue!(out, SetAttribute(Attribute::Reset))?;
+                } else {
+                    write!(out, "{}", label.dimmed())?;
+                }
+            }
+            // Move back up to the prompt line.
+            queue!(out, cursor::MoveUp(rows))?;
+        }
+        self.menu_rows = rows;
+
+        // Place the cursor at its column on the prompt line.
+        let col = (PROMPT.chars().count() + self.cursor) as u16;
+        queue!(out, cursor::MoveToColumn(col))?;
+        out.flush()?;
+        Ok(())
+    }
 }
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
@@ -97,7 +351,7 @@ fn print_banner() {
 }
 
 fn print_help() {
-    use comfy_table::{Table, Cell, CellAlignment};
+    use comfy_table::{Cell, Table};
 
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::NOTHING);
@@ -106,37 +360,15 @@ fn print_help() {
         Cell::new("Description").add_attribute(comfy_table::Attribute::Bold),
     ]);
 
-    let commands = vec![
-        ("/create-agent",  "Create a new agent (guided wizard)"),
-        ("/update-agent",  "Update an existing agent"),
-        ("/create-tool",   "Create a new tool (guided wizard)"),
-        ("/update-tool",   "Update an existing tool"),
-        ("",               ""),
-        ("/list",          "List all agents"),
-        ("/list-tools",    "List all tools"),
-        ("/get",           "Show agent details"),
-        ("/run",           "Run an agent"),
-        ("/stop",          "Stop a running agent"),
-        ("/logs",          "View agent logs"),
-        ("/delete",        "Delete an agent"),
-        ("",               ""),
-        ("/status",        "Show daemon status"),
-        ("/help",          "Show this help"),
-        ("/quit",          "Exit the shell"),
-    ];
-
-    for (cmd, desc) in commands {
-        if cmd.is_empty() {
-            table.add_row(vec![Cell::new(""), Cell::new("")]);
-        } else {
-            table.add_row(vec![
-                Cell::new(cmd).fg(comfy_table::Color::Cyan),
-                Cell::new(desc),
-            ]);
-        }
+    for (cmd, desc) in COMMANDS {
+        table.add_row(vec![
+            Cell::new(cmd).fg(comfy_table::Color::Cyan),
+            Cell::new(desc),
+        ]);
     }
 
     println!("{table}");
+    println!("{}", "  Tip: type / and press Tab to browse commands.".dimmed());
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -150,6 +382,24 @@ fn history_file() -> Option<String> {
             }
             p.to_str().map(|s| s.to_string())
         })
+}
+
+/// Load shell history (one command per line), capped to the last 1000 entries.
+fn load_history() -> Vec<String> {
+    let Some(path) = history_file() else { return vec![] };
+    let Ok(content) = std::fs::read_to_string(&path) else { return vec![] };
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    if lines.len() > 1000 {
+        lines = lines.split_off(lines.len() - 1000);
+    }
+    lines
+}
+
+fn save_history(history: &[String]) {
+    if let Some(path) = history_file() {
+        let tail = if history.len() > 1000 { &history[history.len() - 1000..] } else { history };
+        let _ = std::fs::write(path, tail.join("\n"));
+    }
 }
 
 async fn fetch_agents(config: &AppConfig) -> Result<Vec<serde_json::Value>> {
@@ -474,11 +724,62 @@ async fn picker_run(config: &AppConfig) -> Result<()> {
     }).await? {
         DaemonResponse::ExecutionStarted { execution_id } => {
             println!("{} Agent started. Execution ID: {}", "✓".green(), execution_id.dimmed());
+            wait_and_print_result(config, &execution_id).await?;
         }
         DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
         _ => {}
     }
 
+    Ok(())
+}
+
+/// Poll an execution until it reaches a terminal state, then print its output.
+async fn wait_and_print_result(config: &AppConfig, execution_id: &str) -> Result<()> {
+    use std::time::Duration;
+
+    print!("{}", "  Running".dimmed());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    // ~5 min ceiling (375 * 800ms); agents that run longer can be checked via /logs.
+    for _ in 0..375 {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        print!("{}", ".".dimmed());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let result = match daemon_request(
+            config,
+            DaemonRequest::GetExecution { id: execution_id.to_string() },
+        )
+        .await?
+        {
+            DaemonResponse::ExecutionResult { result } => result,
+            DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+            _ => continue,
+        };
+
+        let status = result["status"].as_str().unwrap_or("running");
+        match status {
+            "completed" => {
+                println!();
+                if let Some(output) = result["output"].as_str() {
+                    println!("\n{}\n{}", "Result:".bold().green(), output);
+                } else {
+                    println!("{}", "Completed (no output).".dimmed());
+                }
+                return Ok(());
+            }
+            "failed" | "cancelled" => {
+                println!();
+                let err = result["error"].as_str().unwrap_or(status);
+                println!("{} {}", "✗".red(), err);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    println!();
+    println!("{}", "Still running — check /logs for the result.".dimmed());
     Ok(())
 }
 
@@ -509,25 +810,79 @@ async fn picker_logs(config: &AppConfig) -> Result<()> {
     let names = agent_names(&agents);
     let selected = Select::new("Select agent:", names.iter().map(|s| s.as_str()).collect()).prompt()?;
 
-    match daemon_request(config, DaemonRequest::GetLogs {
-        agent_id: selected.to_string(),
-        execution_id: None,
-        lines: 50,
-    }).await? {
-        DaemonResponse::ExecutionLog { lines } => {
-            if lines.is_empty() {
-                println!("{}", "No logs found.".dimmed());
-            } else {
-                for line in lines {
-                    println!("{}", line);
-                }
-            }
-        }
-        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
-        _ => {}
+    // Resolve the chosen agent's id so we can filter its executions.
+    let agent_id = agents.iter()
+        .find(|a| a["name"].as_str() == Some(selected))
+        .and_then(|a| a["id"].as_str())
+        .map(|s| s.to_string());
+
+    // Pull recent executions (global) and keep only this agent's. They come newest-first.
+    let mut execs: Vec<serde_json::Value> =
+        match daemon_request(config, DaemonRequest::ListExecutions { limit: 100 }).await? {
+            DaemonResponse::ExecutionList { executions } => executions,
+            DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+            _ => vec![],
+        };
+    if let Some(ref aid) = agent_id {
+        execs.retain(|e| e["agent_id"].as_str() == Some(aid.as_str()));
+    }
+    if execs.is_empty() {
+        println!("{}", "No executions found for this agent.".dimmed());
+        return Ok(());
     }
 
+    // One execution → show it directly; many → let the user pick (latest at top).
+    let exec = if execs.len() == 1 {
+        &execs[0]
+    } else {
+        let labels: Vec<String> = execs.iter().map(exec_label).collect();
+        let chosen = Select::new("Select execution:", labels.clone()).prompt()?;
+        let idx = labels.iter().position(|l| l == &chosen).unwrap_or(0);
+        &execs[idx]
+    };
+
+    print_execution_detail(exec);
     Ok(())
+}
+
+/// Short one-line label for an execution menu entry: `[2026-06-30 09:47:00] dc688538 - completed`
+fn exec_label(e: &serde_json::Value) -> String {
+    let ts = e["started_at"].as_str().unwrap_or("");
+    let ts = ts.get(..19).unwrap_or(ts).replace('T', " ");
+    let id8: String = e["id"].as_str().unwrap_or("").chars().take(8).collect();
+    let status = e["status"].as_str().unwrap_or("unknown");
+    format!("[{}] {} - {}", ts, id8, status)
+}
+
+/// Full detail for a single execution, including its output.
+fn print_execution_detail(e: &serde_json::Value) {
+    let fmt_ts = |s: &str| s.get(..19).unwrap_or(s).replace('T', " ");
+    println!();
+    if let Some(id) = e["id"].as_str() {
+        println!("  {:11} {}", "Execution:".bold(), id);
+    }
+    if let Some(s) = e["started_at"].as_str() {
+        println!("  {:11} {}", "Started:".bold(), fmt_ts(s));
+    }
+    if let Some(s) = e["completed_at"].as_str() {
+        println!("  {:11} {}", "Completed:".bold(), fmt_ts(s));
+    }
+    if let Some(s) = e["status"].as_str() {
+        println!("  {:11} {}", "Status:".bold(), s);
+    }
+    if let Some(input) = e["input"].as_str() {
+        if !input.is_empty() {
+            println!("  {:11} {}", "Input:".bold(), input);
+        }
+    }
+    match e["error"].as_str() {
+        Some(err) if !err.is_empty() => println!("\n{} {}", "Error:".bold().red(), err),
+        _ => {}
+    }
+    match e["output"].as_str() {
+        Some(out) if !out.is_empty() => println!("\n{}\n{}", "Result:".bold().green(), out),
+        _ => println!("\n{}", "(no output)".dimmed()),
+    }
 }
 
 // ── Detail printer ────────────────────────────────────────────────────────────
