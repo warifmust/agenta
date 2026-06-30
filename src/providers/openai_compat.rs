@@ -27,7 +27,18 @@ struct OpenAIRequest {
 #[derive(Serialize, Deserialize)]
 struct OpenAIMessage {
     role: String,
+    // Responses can carry `content: null` (reasoning/MoE models like DeepSeek
+    // return null when emitting reasoning or tool calls). Treat null/missing as
+    // empty so deserialization never fails. Requests always set a real string.
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     content: String,
+}
+
+fn null_to_empty_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
