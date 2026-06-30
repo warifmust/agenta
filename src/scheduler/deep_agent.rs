@@ -385,6 +385,10 @@ impl DeepAgentExecutor {
 
         let mut sub_agent = Agent::new(format!("sub-{}", uuid::Uuid::new_v4()), model, role);
         sub_agent.execution_mode = ExecutionMode::Once;
+        // Inherit the parent's provider so the sub-agent routes the same way (e.g.
+        // an OpenRouter parent must not fall back to the default Ollama provider,
+        // which can't serve the parent's model slugs).
+        sub_agent.provider = parent.provider.clone();
 
         let executor = AgentExecutor::new(self.storage.clone(), self.backend.clone());
         match executor.execute_ephemeral(&sub_agent, Some(input)).await {
