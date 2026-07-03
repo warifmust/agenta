@@ -24,6 +24,7 @@
 - 📁 **Built-in file tools** — `read_file`, `write_file`, `list_files` available to every agent, zero setup
 - 💬 **Telegram integration** — multiple bots, one daemon, no webhook or tunnel needed
 - 🧵 **Agent memory** — enabled by default, injects past outputs as context on every run
+- 📚 **RAG / knowledge bases** — attach a knowledge base to an agent; questions auto-retrieve relevant passages (pgvector + local embeddings) and answers are grounded with source + page citations
 - 📦 **Export / import** — backup agents as JSON/YAML, auto-backup on every daemon start
 - 🗄️ **SQLite by default**, Postgres optional
 - 🌐 **REST API + Swagger UI** — built-in, no extra setup
@@ -259,6 +260,7 @@ agenta export          # Export agents to JSON/YAML
 agenta import          # Import agents from file
 agenta view            # View runtime data (executions, etc.)
 agenta pull tool       # Pull and install a tool from the registry
+agenta knowledge       # Manage RAG knowledge bases (create/add/list/remove)
 agenta tool            # Manage tools (create/get/list/update/delete/run/logs)
 agenta script          # Manage scripts (create/get/list/update/delete/run/logs)
 agenta daemon          # start / stop / status / restart daemon
@@ -523,6 +525,59 @@ agenta update CORAL --spawn-message ""
 Default: `⚙️ Spawning sub-agent: <task>`
 
 ---
+
+## 📚 Knowledge Bases (RAG)
+
+Give an agent its own knowledge base and it will retrieve relevant passages for each
+question and answer **grounded in your documents**, with source + page citations.
+
+> **Requires Postgres** (with the `pgvector` extension) as the `database_url`. Uses local
+> embeddings via Ollama by default — no cloud dependency.
+
+### 1. Pull an embedding model
+
+```bash
+ollama pull bge-m3        # multilingual, 1024-dim (default)
+```
+
+### 2. Create a knowledge base and ingest files
+
+```bash
+agenta knowledge create my-docs
+agenta knowledge add my-docs ./handbook.pdf     # also .md / .txt
+agenta knowledge list
+```
+
+Ingestion extracts text per page, shows you a **preview to confirm** before embedding,
+chunks it, and embeds in batches with a live progress bar. It's **resumable** — re-running
+`add` on the same file skips what's already stored, so a large book that fails midway just
+picks up where it left off.
+
+### 3. Attach it to an agent
+
+```bash
+agenta update CORAL --add-kb my-docs
+agenta update CORAL --remove-kb my-docs   # detach
+```
+
+### 4. Ask
+
+The agent now auto-retrieves from its knowledge base on every run and cites what it used:
+
+```
+> What does the handbook say about refunds?
+
+Refunds are processed within 14 days of the request… (handbook.pdf, p.12)
+```
+
+**Grounded by default:** retrieved agents are instructed to answer *only* from the retrieved
+passages and to say when the answer isn't in the knowledge base — rather than filling gaps
+from the model's own training. For strict use (e.g. reference texts), give the agent a firm
+system prompt reinforcing this.
+
+**Notes & limits (v1):** English/Latin-script PDFs with a real text layer work best. PDFs whose
+text is stored as *images* (some Arabic/scanned books) won't extract via text — that needs OCR
+(planned). Chunking is fixed-size per page; structure-aware chunking and reranking are planned.
 
 ## 💬 Telegram Integration
 

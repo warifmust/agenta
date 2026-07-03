@@ -161,6 +161,35 @@ impl OllamaClient {
         Ok(result)
     }
 
+    /// Embed one or more texts. Returns one vector per input, in order.
+    pub async fn embed(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let url = format!("{}/api/embed", self.base_url);
+        let body = serde_json::json!({ "model": model, "input": texts });
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AgentaError::Ollama(format!("Embed request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(AgentaError::Ollama(format!("Embed HTTP {}: {}", status, text)));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct EmbedResponse {
+            #[serde(default)]
+            embeddings: Vec<Vec<f32>>,
+        }
+        let result: EmbedResponse = response.json().await.map_err(|e| {
+            AgentaError::Ollama(format!("Failed to parse embed response: {}", e))
+        })?;
+        Ok(result.embeddings)
+    }
+
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
         let url = format!("{}/api/tags", self.base_url);
         let response = self

@@ -205,11 +205,14 @@ impl DeepAgentExecutor {
                 });
 
             } else {
-                // Model is reasoning — nudge it to take the next action
-                messages.push(ChatMessage {
-                    role:    "user".to_string(),
-                    content: "Continue. Call a tool or write TASK_COMPLETE: <answer> when done.".to_string(),
-                });
+                // No TOOL_CALL and no TASK_COMPLETE marker: the model produced a plain
+                // prose response, which is its final answer. Return it directly instead
+                // of nudging "Continue…" — that nudge makes the model emit a useless
+                // "already answered" meta-comment on the next turn and discards the real
+                // answer. Agents that use tools/TASK_COMPLETE are handled above; only
+                // bare-prose answers (simple chat / RAG Q&A agents) reach here.
+                info!("Agent {} answered in prose at iteration {}", agent.name, iteration + 1);
+                return Ok(content.trim().to_string());
             }
         }
 

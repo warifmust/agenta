@@ -237,15 +237,42 @@ impl DaemonState {
         }
     }
 
+    /// RAG auto-inject: if the agent has knowledge bases, retrieve passages relevant
+    /// to `input` and append them (with citations) to a working copy of the system
+    /// prompt. Retrieval failures are logged, never fatal to the run.
+    async fn inject_knowledge(&self, agent: &mut Agent, input: &str) {
+        if agent.config.knowledge_bases.is_empty() || input.trim().is_empty() {
+            return;
+        }
+        match agenta::knowledge::retrieve_context(
+            &self.config,
+            &agent.config.knowledge_bases,
+            input,
+            5,
+        )
+        .await
+        {
+            Ok(Some(block)) => {
+                agent.system_prompt = format!("{}\n\n{}", agent.system_prompt, block);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Knowledge retrieval failed for agent {}: {}", agent.name, e),
+        }
+    }
+
     pub async fn run_agent(
         &self,
         id: &str,
         input: Option<String>,
     ) -> anyhow::Result<String> {
-        let agent = self
+        let mut agent = self
             .get_agent(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+
+        if let Some(inp) = input.as_deref() {
+            self.inject_knowledge(&mut agent, inp).await;
+        }
 
         let _storage = self.storage.clone();
         let executor = self.executor_for_agent(&agent);
@@ -290,10 +317,12 @@ impl DaemonState {
         id: &str,
         input: String,
     ) -> anyhow::Result<ExecutionResult> {
-        let agent = self
+        let mut agent = self
             .get_agent(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+
+        self.inject_knowledge(&mut agent, &input).await;
 
         let execution_id = uuid::Uuid::new_v4().to_string();
         self
@@ -311,10 +340,12 @@ impl DaemonState {
         input: String,
         progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> anyhow::Result<ExecutionResult> {
-        let agent = self
+        let mut agent = self
             .get_agent(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+
+        self.inject_knowledge(&mut agent, &input).await;
 
         let execution_id = uuid::Uuid::new_v4().to_string();
         self.executor_for_agent(&agent)

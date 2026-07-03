@@ -267,6 +267,10 @@ pub struct AgentConfig {
     pub context_window: u32,
     pub stop_sequences: Vec<String>,
     pub seed: Option<u64>,
+    /// Knowledge bases (by name) this agent retrieves from (RAG auto-inject).
+    /// Persisted inside the agent's config JSON, so no schema change is needed.
+    #[serde(default)]
+    pub knowledge_bases: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -279,6 +283,7 @@ impl Default for AgentConfig {
             context_window: 4096,
             stop_sequences: vec![],
             seed: None,
+            knowledge_bases: vec![],
         }
     }
 }

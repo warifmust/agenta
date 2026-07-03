@@ -20,3 +20,4 @@ prompts/
 # Env/config
 .env
 .env.*
+will_draft.md

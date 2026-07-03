@@ -4,6 +4,7 @@
 
 mod cli;
 mod core;
+mod knowledge;
 mod ollama;
 mod providers;
 mod scheduler;
@@ -19,8 +20,10 @@ async fn main() {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
+            // Quiet sqlx's "relation already exists" NOTICE spam on CLI commands
+            // (knowledge ops re-run schema init each time). Overridable via RUST_LOG.
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "info".to_string()),
+                .unwrap_or_else(|_| "info,sqlx=warn".to_string()),
         )
         .init();
 

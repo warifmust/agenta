@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod core;
+pub mod knowledge;
 pub mod ollama;
 pub mod providers;
 pub mod scheduler;

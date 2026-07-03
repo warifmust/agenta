@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod knowledge;
 pub mod shell;
 pub mod tui;
 
@@ -172,6 +173,14 @@ pub enum Commands {
         #[arg(long, value_name = "TOOL_NAME")]
         remove_tool: Option<String>,
 
+        /// Attach a knowledge base for RAG, e.g. --add-kb islamic-texts
+        #[arg(long, value_name = "KB_NAME")]
+        add_kb: Option<String>,
+
+        /// Detach a knowledge base by name, e.g. --remove-kb islamic-texts
+        #[arg(long, value_name = "KB_NAME")]
+        remove_kb: Option<String>,
+
         /// Custom sub-agent spawn notification message (deep agents only).
         /// Use {task} as a placeholder for the task description.
         /// Example: "🪸 Deploying REEF sub-agent: {task}"
@@ -314,6 +323,41 @@ pub enum Commands {
     Pull {
         #[command(subcommand)]
         target: PullCommands,
+    },
+
+    /// Manage knowledge bases for RAG (Postgres/pgvector)
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KnowledgeCommands {
+    /// Create a knowledge base
+    Create {
+        /// Knowledge base name
+        name: String,
+        /// Embedder spec (provider:model)
+        #[arg(long, default_value = "ollama:bge-m3")]
+        embedder: String,
+    },
+    /// Ingest a file (.pdf/.md/.txt) into a knowledge base
+    Add {
+        /// Knowledge base name
+        name: String,
+        /// Path to the file
+        file: String,
+        /// Skip the extraction preview confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// List knowledge bases
+    List,
+    /// Delete a knowledge base and all its chunks
+    Remove {
+        /// Knowledge base name
+        name: String,
     },
 }
 

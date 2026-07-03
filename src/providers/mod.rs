@@ -1,5 +1,8 @@
+pub mod embedder;
 pub mod ollama;
 pub mod openai_compat;
+
+pub use embedder::{build_embedder, Embedder};
 
 use async_trait::async_trait;
 

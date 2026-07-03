@@ -163,6 +163,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             tools: new_tools,
             add_tool: new_add_tool,
             remove_tool: new_remove_tool,
+            add_kb: new_add_kb,
+            remove_kb: new_remove_kb,
             spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -232,6 +234,18 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 }
                 if let Some(cfg) = agent.deep_agent_config.as_mut() {
                     cfg.available_tools = agent.tools.iter().map(|t| t.name.clone()).collect();
+                }
+            }
+            if let Some(kb) = new_add_kb {
+                if !agent.config.knowledge_bases.contains(&kb) {
+                    agent.config.knowledge_bases.push(kb);
+                }
+            }
+            if let Some(kb) = new_remove_kb {
+                let before = agent.config.knowledge_bases.len();
+                agent.config.knowledge_bases.retain(|k| k != &kb);
+                if agent.config.knowledge_bases.len() == before {
+                    println!("{} Knowledge base '{}' was not attached to this agent.", "!".yellow(), kb);
                 }
             }
             if let Some(msg) = new_spawn_message {
@@ -367,6 +381,10 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 pull_tool(&config, &name, &version, attach.as_deref()).await
             }
         },
+
+        Commands::Knowledge { command } => {
+            super::knowledge::handle_knowledge_command(command, &config).await
+        }
 
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
 
