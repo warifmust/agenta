@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::core::{AgentaError, Result};
@@ -19,7 +20,7 @@ pub mod ingest;
 /// column is `vector(1024)`; KBs of other dimensions are rejected for now.
 pub const V1_DIMENSION: i32 = 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KnowledgeBase {
     pub id: String,
     pub name: String,

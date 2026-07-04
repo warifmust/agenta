@@ -144,10 +144,15 @@ pub struct AppConfig {
     /// GitHub repo of the agenta-tools registry (default: agenta-tools)
     #[serde(default = "default_registry_repo")]
     pub registry_repo: String,
+    /// Number of knowledge passages to retrieve and inject per RAG query (top-k).
+    /// Higher = more recall/context (and tokens); lower = tighter/cheaper.
+    #[serde(default = "default_rag_top_k")]
+    pub rag_top_k: usize,
 }
 
 fn default_registry_owner() -> String { "agenta-tools".to_string() }
 fn default_registry_repo() -> String { "agenta-tools".to_string() }
+fn default_rag_top_k() -> usize { 8 }
 
 fn default_provider() -> Option<String> {
     Some("ollama".to_string())
@@ -185,6 +190,7 @@ impl Default for AppConfig {
             timezone: None,
             registry_owner: default_registry_owner(),
             registry_repo: default_registry_repo(),
+            rag_top_k: default_rag_top_k(),
         }
     }
 }

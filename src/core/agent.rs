@@ -271,6 +271,10 @@ pub struct AgentConfig {
     /// Persisted inside the agent's config JSON, so no schema change is needed.
     #[serde(default)]
     pub knowledge_bases: Vec<String>,
+    /// Per-agent RAG retrieval top-k (how many passages to inject). Distinct from
+    /// the LLM sampling `top_k` above. `None` → fall back to the global `rag_top_k`.
+    #[serde(default)]
+    pub rag_top_k: Option<usize>,
 }
 
 impl Default for AgentConfig {
@@ -284,6 +288,7 @@ impl Default for AgentConfig {
             stop_sequences: vec![],
             seed: None,
             knowledge_bases: vec![],
+            rag_top_k: None,
         }
     }
 }

@@ -88,6 +88,37 @@ ensure_install_dir() {
   esac
 }
 
+# Copy both binaries from $1 into the resolved install dir AND over whatever
+# `agenta` currently resolves to on PATH (if different) — so an older copy earlier
+# in PATH can't silently shadow an upgrade. This is the #1 cause of "cargo installed
+# but `agenta --version` didn't change": cargo installs to ~/.cargo/bin while the
+# on-PATH binary lives elsewhere.
+place_binaries() {
+  local src="$1"
+  local -a dirs=("$INSTALL_DIR")
+  local cur curdir
+  cur="$(command -v agenta 2>/dev/null || true)"
+  if [ -n "$cur" ]; then
+    curdir="$(cd "$(dirname "$cur")" 2>/dev/null && pwd || true)"
+    if [ -n "$curdir" ] && [ "$curdir" != "$INSTALL_DIR" ]; then
+      dirs+=("$curdir")
+    fi
+  fi
+
+  local d wrote=0
+  for d in "${dirs[@]}"; do
+    if install -m 0755 "${src}/agenta" "${d}/agenta" 2>/dev/null \
+       && install -m 0755 "${src}/agenta-daemon" "${d}/agenta-daemon" 2>/dev/null; then
+      echo "Installed: ${d}/agenta, ${d}/agenta-daemon"
+      wrote=1
+    else
+      echo "Warning: could not write to ${d} (permissions?)." >&2
+      echo "         Retry with: sudo install -m0755 ${src}/agenta ${d}/agenta" >&2
+    fi
+  done
+  [ "$wrote" -eq 1 ]
+}
+
 install_from_release() {
   local target version asset url tmp
   target="$(detect_target)"
@@ -110,13 +141,8 @@ install_from_release() {
     || { rm -rf "$tmp"; return 1; }
 
   ensure_install_dir
-  install -m 0755 "${tmp}/agenta" "${INSTALL_DIR}/agenta"
-  install -m 0755 "${tmp}/agenta-daemon" "${INSTALL_DIR}/agenta-daemon"
+  place_binaries "$tmp" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
-
-  echo "Installed:"
-  echo "  - ${INSTALL_DIR}/agenta"
-  echo "  - ${INSTALL_DIR}/agenta-daemon"
 }
 
 ensure_cargo() {
@@ -136,13 +162,23 @@ ensure_cargo() {
 
 install_from_cargo() {
   ensure_cargo
+  ensure_install_dir
   local git_ref=""
   if [ "$VERSION" != "latest" ]; then
     git_ref="--tag ${VERSION}"
   fi
   echo "Falling back to cargo install from https://github.com/${REPO}.git"
+
+  # Build into an isolated root (not ~/.cargo/bin) so the fresh binaries can be
+  # placed into the SAME location the on-PATH `agenta` uses — otherwise cargo's
+  # ~/.cargo/bin copy gets shadowed and the upgrade appears to do nothing.
+  local tmp
+  tmp="$(mktemp -d)"
   # shellcheck disable=SC2086
-  cargo install --git "https://github.com/${REPO}.git" ${git_ref} --locked --force
+  cargo install --git "https://github.com/${REPO}.git" ${git_ref} --locked --force --root "$tmp" \
+    || { rm -rf "$tmp"; return 1; }
+  place_binaries "${tmp}/bin" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
 }
 
 bootstrap() {
@@ -160,13 +196,29 @@ bootstrap() {
   "$bin" setup
 }
 
+# Show what `agenta` actually resolves to now + its version, and warn if a copy
+# outside the install dir still shadows PATH — so a botched upgrade is obvious.
+report_installed() {
+  local resolved
+  resolved="$(command -v agenta 2>/dev/null || true)"
+  if [ -z "$resolved" ]; then
+    echo "Note: 'agenta' is not on your PATH yet. Add ${INSTALL_DIR} to PATH." >&2
+    return
+  fi
+  echo ""
+  echo "agenta resolves to: ${resolved}"
+  "$resolved" --version 2>/dev/null || true
+}
+
 main() {
   if install_from_release; then
+    report_installed
     bootstrap
     return 0
   fi
   echo "Info: release binary not available, using cargo install fallback."
   install_from_cargo
+  report_installed
   bootstrap
 }
 

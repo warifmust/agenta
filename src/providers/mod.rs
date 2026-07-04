@@ -1,8 +1,10 @@
 pub mod embedder;
+pub mod ocr;
 pub mod ollama;
 pub mod openai_compat;
 
-pub use embedder::{build_embedder, Embedder};
+pub use embedder::{build_embedder, ensure_embedder_available, Embedder};
+pub use ocr::{build_ocr, Ocr};
 
 use async_trait::async_trait;
 

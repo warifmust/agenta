@@ -227,10 +227,11 @@ async fn handle_connection(
     state: Arc<DaemonState>,
     shutdown_tx: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    // Read request
-    let mut buffer = vec![0u8; 8192];
-    let n = stream.read(&mut buffer).await?;
-    buffer.truncate(n);
+    // Read the full request. The client writes the request then shuts down its
+    // write half, so read_to_end returns the complete message regardless of size
+    // (a single fixed-size read truncated large requests, e.g. big agent updates).
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await?;
 
     // Parse request
     let request: DaemonRequest = match serde_json::from_slice(&buffer) {

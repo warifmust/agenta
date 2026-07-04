@@ -244,11 +244,16 @@ impl DaemonState {
         if agent.config.knowledge_bases.is_empty() || input.trim().is_empty() {
             return;
         }
+        // top-k passages to inject: per-agent override (`--top-k`) if set, else the
+        // global `rag_top_k` (default 8). Kept generous so a short query like "dua
+        // during sujud" still pulls the content page even when several nearby
+        // sections rank alongside it.
+        let top_k = agent.config.rag_top_k.unwrap_or(self.config.rag_top_k);
         match agenta::knowledge::retrieve_context(
             &self.config,
             &agent.config.knowledge_bases,
             input,
-            5,
+            top_k,
         )
         .await
         {
@@ -508,6 +513,58 @@ impl DaemonState {
 
     pub async fn list_tools(&self) -> anyhow::Result<Vec<ToolResource>> {
         self.storage.list_tools().await.map_err(anyhow::Error::from)
+    }
+
+    // ── Knowledge bases (RAG) ─────────────────────────────────────────────────
+    // KBs live in Postgres/pgvector, not the agent store — queried directly, same
+    // as the `agenta knowledge` CLI. Ingestion is intentionally NOT here (it needs
+    // an async upload+OCR job); this is lifecycle only.
+    async fn kb_store(&self) -> anyhow::Result<agenta::knowledge::PgVectorStore> {
+        let url = match &self.config.database_url {
+            Some(u) if u.starts_with("postgres") => u.clone(),
+            _ => anyhow::bail!("RAG requires Postgres. Set database_url in config.toml."),
+        };
+        Ok(agenta::knowledge::PgVectorStore::new(&url).await?)
+    }
+
+    pub async fn list_kbs(&self) -> anyhow::Result<Vec<agenta::knowledge::KnowledgeBase>> {
+        use agenta::knowledge::VectorStore;
+        Ok(self.kb_store().await?.list_kbs().await?)
+    }
+
+    pub async fn get_kb(&self, name: &str) -> anyhow::Result<Option<agenta::knowledge::KnowledgeBase>> {
+        use agenta::knowledge::VectorStore;
+        Ok(self.kb_store().await?.get_kb(name).await?)
+    }
+
+    pub async fn create_kb(
+        &self,
+        name: &str,
+        embedder: &str,
+    ) -> anyhow::Result<agenta::knowledge::KnowledgeBase> {
+        use agenta::knowledge::VectorStore;
+        let store = self.kb_store().await?;
+        if store.get_kb(name).await?.is_some() {
+            anyhow::bail!("Knowledge base '{}' already exists", name);
+        }
+        // Validate the embedder is usable and produces the pinned dimension.
+        agenta::providers::ensure_embedder_available(&self.config, embedder).await?;
+        let emb = agenta::providers::build_embedder(&self.config, embedder).await?;
+        let dim = emb.dimension() as i32;
+        if dim != agenta::knowledge::V1_DIMENSION {
+            anyhow::bail!(
+                "v1 supports {}-dim embedders only; '{}' is {}-dim",
+                agenta::knowledge::V1_DIMENSION,
+                embedder,
+                dim
+            );
+        }
+        Ok(store.create_kb(name, &emb.id(), dim).await?)
+    }
+
+    pub async fn delete_kb(&self, name: &str) -> anyhow::Result<bool> {
+        use agenta::knowledge::VectorStore;
+        Ok(self.kb_store().await?.delete_kb(name).await?)
     }
 
     pub async fn update_tool(&self, id_or_name: &str, mut tool: ToolResource) -> anyhow::Result<()> {

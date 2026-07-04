@@ -14,8 +14,9 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use agenta::core::{
     Agent, AgentConfig, AgentEnv, AgentStatus, AppConfig, DeepAgentConfig, ExecutionMode,
-    ExecutionResult, ExecutionStatus, ToolCall, ToolDefinition, TriggerType,
+    ExecutionResult, ExecutionStatus, ToolCall, ToolDefinition, ToolResource, TriggerType,
 };
+use agenta::knowledge::KnowledgeBase;
 use super::state::DaemonState;
 
 #[derive(Clone)]
@@ -49,6 +50,23 @@ struct RunBody {
 }
 
 #[derive(Deserialize, ToSchema)]
+struct CreateToolBody {
+    tool: ToolResource,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct UpdateToolBody {
+    tool: ToolResource,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CreateKbBody {
+    name: String,
+    /// Embedder spec, e.g. "ollama:bge-m3". Defaults to "ollama:bge-m3".
+    embedder: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
 struct ListExecutionsQuery {
     limit: Option<i64>,
 }
@@ -71,7 +89,16 @@ struct LogsQuery {
         run_agent,
         get_execution,
         list_executions,
-        get_logs
+        get_logs,
+        list_tools,
+        get_tool,
+        create_tool,
+        update_tool,
+        delete_tool,
+        list_kbs,
+        get_kb,
+        create_kb,
+        delete_kb
     ),
     components(
         schemas(
@@ -90,12 +117,20 @@ struct LogsQuery {
             CreateAgentBody,
             UpdateAgentBody,
             RunBody,
+            CreateToolBody,
+            UpdateToolBody,
+            ToolResource,
+            CreateKbBody,
+            KnowledgeBase,
             ListExecutionsQuery,
             LogsQuery
         )
     ),
     tags(
-        (name = "agenta", description = "Agenta REST API")
+        (name = "Agents", description = "Create, run, and inspect agents"),
+        (name = "Tools", description = "Manage first-class tools"),
+        (name = "Knowledge Bases", description = "Manage RAG knowledge bases (ingestion via CLI)"),
+        (name = "System", description = "Health and diagnostics")
     )
 )]
 struct ApiDoc;
@@ -117,10 +152,19 @@ pub async fn start_rest_api(daemon: Arc<DaemonState>, config: &AppConfig) -> any
         .route("/agents/:id/executions", get(list_executions))
         .route("/agents/:id/logs", get(get_logs))
         .route("/executions/:id", get(get_execution))
+        .route("/tools", get(list_tools).post(create_tool))
+        .route(
+            "/tools/:id",
+            get(get_tool).put(update_tool).delete(delete_tool),
+        )
+        .route("/knowledge-bases", get(list_kbs).post(create_kb))
+        .route("/knowledge-bases/:name", get(get_kb).delete(delete_kb))
         .with_state(api_state.clone())
         .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
 
     let app = Router::new()
+        // Landing on the base URL sends you to the docs instead of a bare 404.
+        .route("/", get(|| async { axum::response::Redirect::temporary("/swagger-ui/") }))
         .nest("/api", protected_api)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-doc/openapi.json", ApiDoc::openapi()));
 
@@ -166,14 +210,14 @@ async fn auth_middleware(
     }
 }
 
-#[utoipa::path(get, path = "/api/health", responses((status = 200, body = MessageResponse)))]
+#[utoipa::path(get, path = "/api/health", tag = "System", responses((status = 200, body = MessageResponse)))]
 async fn health() -> Json<MessageResponse> {
     Json(MessageResponse {
         message: "ok".to_string(),
     })
 }
 
-#[utoipa::path(get, path = "/api/agents", responses((status = 200, body = [Agent])))]
+#[utoipa::path(get, path = "/api/agents", tag = "Agents", responses((status = 200, body = [Agent])))]
 async fn list_agents(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<Agent>>, (StatusCode, String)> {
@@ -185,7 +229,7 @@ async fn list_agents(
         .map_err(internal_error)
 }
 
-#[utoipa::path(get, path = "/api/agents/{id}", responses((status = 200, body = Agent), (status = 404, body = MessageResponse)))]
+#[utoipa::path(get, path = "/api/agents/{id}", tag = "Agents", responses((status = 200, body = Agent), (status = 404, body = MessageResponse)))]
 async fn get_agent(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -196,7 +240,7 @@ async fn get_agent(
     }
 }
 
-#[utoipa::path(post, path = "/api/agents", request_body = CreateAgentBody, responses((status = 200, body = MessageResponse)))]
+#[utoipa::path(post, path = "/api/agents", tag = "Agents", request_body = CreateAgentBody, responses((status = 200, body = MessageResponse)))]
 async fn create_agent(
     State(state): State<ApiState>,
     Json(body): Json<CreateAgentBody>,
@@ -211,7 +255,7 @@ async fn create_agent(
     }))
 }
 
-#[utoipa::path(put, path = "/api/agents/{id}", request_body = UpdateAgentBody, responses((status = 200, body = MessageResponse)))]
+#[utoipa::path(put, path = "/api/agents/{id}", tag = "Agents", request_body = UpdateAgentBody, responses((status = 200, body = MessageResponse)))]
 async fn update_agent(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -227,7 +271,7 @@ async fn update_agent(
     }))
 }
 
-#[utoipa::path(delete, path = "/api/agents/{id}", responses((status = 200, body = MessageResponse), (status = 404, body = MessageResponse)))]
+#[utoipa::path(delete, path = "/api/agents/{id}", tag = "Agents", responses((status = 200, body = MessageResponse), (status = 404, body = MessageResponse)))]
 async fn delete_agent(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -240,7 +284,7 @@ async fn delete_agent(
     }
 }
 
-#[utoipa::path(post, path = "/api/agents/{id}/run", request_body = RunBody, responses((status = 200, body = MessageResponse)))]
+#[utoipa::path(post, path = "/api/agents/{id}/run", tag = "Agents", request_body = RunBody, responses((status = 200, body = MessageResponse)))]
 async fn run_agent(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -256,7 +300,7 @@ async fn run_agent(
     }))
 }
 
-#[utoipa::path(get, path = "/api/executions/{id}", responses((status = 200, body = ExecutionResult), (status = 404, body = MessageResponse)))]
+#[utoipa::path(get, path = "/api/executions/{id}", tag = "Agents", responses((status = 200, body = ExecutionResult), (status = 404, body = MessageResponse)))]
 async fn get_execution(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -267,7 +311,7 @@ async fn get_execution(
     }
 }
 
-#[utoipa::path(get, path = "/api/agents/{id}/executions", responses((status = 200, body = [ExecutionResult])))]
+#[utoipa::path(get, path = "/api/agents/{id}/executions", tag = "Agents", responses((status = 200, body = [ExecutionResult])))]
 async fn list_executions(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -282,7 +326,7 @@ async fn list_executions(
     Ok(Json(executions))
 }
 
-#[utoipa::path(get, path = "/api/agents/{id}/logs", responses((status = 200, body = [String])))]
+#[utoipa::path(get, path = "/api/agents/{id}/logs", tag = "Agents", responses((status = 200, body = [String])))]
 async fn get_logs(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -295,6 +339,132 @@ async fn get_logs(
         .await
         .map(Json)
         .map_err(internal_error)
+}
+
+// ── Tools ───────────────────────────────────────────────────────────────────
+
+#[utoipa::path(get, path = "/api/tools", tag = "Tools", responses((status = 200, body = [ToolResource])))]
+async fn list_tools(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<ToolResource>>, (StatusCode, String)> {
+    state
+        .daemon
+        .list_tools()
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+#[utoipa::path(get, path = "/api/tools/{id}", tag = "Tools", responses((status = 200, body = ToolResource), (status = 404, body = MessageResponse)))]
+async fn get_tool(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ToolResource>, (StatusCode, String)> {
+    match state.daemon.get_tool(&id).await.map_err(internal_error)? {
+        Some(tool) => Ok(Json(tool)),
+        None => Err((StatusCode::NOT_FOUND, "Tool not found".to_string())),
+    }
+}
+
+#[utoipa::path(post, path = "/api/tools", tag = "Tools", request_body = CreateToolBody, responses((status = 200, body = MessageResponse)))]
+async fn create_tool(
+    State(state): State<ApiState>,
+    Json(body): Json<CreateToolBody>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let id = state
+        .daemon
+        .create_tool(body.tool)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(MessageResponse {
+        message: format!("Tool created: {}", id),
+    }))
+}
+
+#[utoipa::path(put, path = "/api/tools/{id}", tag = "Tools", request_body = UpdateToolBody, responses((status = 200, body = MessageResponse), (status = 404, body = MessageResponse)))]
+async fn update_tool(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateToolBody>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    state
+        .daemon
+        .update_tool(&id, body.tool)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(MessageResponse {
+        message: "Tool updated".to_string(),
+    }))
+}
+
+#[utoipa::path(delete, path = "/api/tools/{id}", tag = "Tools", responses((status = 200, body = MessageResponse), (status = 404, body = MessageResponse)))]
+async fn delete_tool(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    match state.daemon.delete_tool(&id).await.map_err(internal_error)? {
+        true => Ok(Json(MessageResponse {
+            message: "Tool deleted".to_string(),
+        })),
+        false => Err((StatusCode::NOT_FOUND, "Tool not found".to_string())),
+    }
+}
+
+// ── Knowledge Bases ─────────────────────────────────────────────────────────
+
+#[utoipa::path(get, path = "/api/knowledge-bases", tag = "Knowledge Bases", responses((status = 200, body = [KnowledgeBase])))]
+async fn list_kbs(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<KnowledgeBase>>, (StatusCode, String)> {
+    state
+        .daemon
+        .list_kbs()
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+#[utoipa::path(get, path = "/api/knowledge-bases/{name}", tag = "Knowledge Bases", responses((status = 200, body = KnowledgeBase), (status = 404, body = MessageResponse)))]
+async fn get_kb(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<KnowledgeBase>, (StatusCode, String)> {
+    match state.daemon.get_kb(&name).await.map_err(internal_error)? {
+        Some(kb) => Ok(Json(kb)),
+        None => Err((StatusCode::NOT_FOUND, "Knowledge base not found".to_string())),
+    }
+}
+
+#[utoipa::path(post, path = "/api/knowledge-bases", tag = "Knowledge Bases", request_body = CreateKbBody, responses((status = 200, body = MessageResponse)))]
+async fn create_kb(
+    State(state): State<ApiState>,
+    Json(body): Json<CreateKbBody>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    let embedder = body.embedder.unwrap_or_else(|| "ollama:bge-m3".to_string());
+    let kb = state
+        .daemon
+        .create_kb(&body.name, &embedder)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(MessageResponse {
+        message: format!(
+            "Knowledge base created: {} ({}, {}-dim)",
+            kb.name, kb.embedder, kb.dimension
+        ),
+    }))
+}
+
+#[utoipa::path(delete, path = "/api/knowledge-bases/{name}", tag = "Knowledge Bases", responses((status = 200, body = MessageResponse), (status = 404, body = MessageResponse)))]
+async fn delete_kb(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<MessageResponse>, (StatusCode, String)> {
+    match state.daemon.delete_kb(&name).await.map_err(internal_error)? {
+        true => Ok(Json(MessageResponse {
+            message: "Knowledge base deleted".to_string(),
+        })),
+        false => Err((StatusCode::NOT_FOUND, "Knowledge base not found".to_string())),
+    }
 }
 
 fn internal_error(err: anyhow::Error) -> (StatusCode, String) {

@@ -29,6 +29,9 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Load ~/.agenta/.env so $VAR provider keys (e.g. OpenRouter for OCR) resolve.
+    core::load_agenta_env();
+
     // Load configuration
     let config = match AppConfig::load() {
         Ok(c) => c,

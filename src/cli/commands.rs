@@ -165,6 +165,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             remove_tool: new_remove_tool,
             add_kb: new_add_kb,
             remove_kb: new_remove_kb,
+            top_k: new_top_k,
             spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -247,6 +248,9 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 if agent.config.knowledge_bases.len() == before {
                     println!("{} Knowledge base '{}' was not attached to this agent.", "!".yellow(), kb);
                 }
+            }
+            if let Some(k) = new_top_k {
+                agent.config.rag_top_k = Some(k);
             }
             if let Some(msg) = new_spawn_message {
                 if let Some(config) = agent.deep_agent_config.as_mut() {
@@ -541,7 +545,128 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 Err(anyhow!("Upgrade failed with exit code: {}", status))
             }
         },
+
+        Commands::Uninstall { purge, yes } => handle_uninstall(&config, purge, yes),
     }
+}
+
+/// Remove agenta's binaries from every standard location (so a stale copy earlier
+/// in PATH can't linger), and — with `--purge` — its config + local data too. Never
+/// touches an external Postgres database.
+fn handle_uninstall(config: &AppConfig, purge: bool, yes: bool) -> Result<()> {
+    // 1. Enumerate binary locations: where we're running from + the standard dirs.
+    let mut bin_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            bin_dirs.push(d.to_path_buf());
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        bin_dirs.push(home.join(".local/bin"));
+        bin_dirs.push(home.join(".cargo/bin"));
+    }
+    bin_dirs.push(std::path::PathBuf::from("/usr/local/bin"));
+    bin_dirs.sort();
+    bin_dirs.dedup();
+
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    for d in &bin_dirs {
+        for b in ["agenta", "agenta-daemon"] {
+            let p = d.join(b);
+            if p.exists() {
+                targets.push(p);
+            }
+        }
+    }
+
+    let config_dir = dirs::home_dir().map(|h| h.join(".agenta"));
+    let data_dir = std::path::Path::new(&config.database_path)
+        .parent()
+        .map(|p| p.to_path_buf());
+
+    // 2. Show the plan.
+    println!("{}", "This will remove:".bold());
+    if targets.is_empty() {
+        println!("  (no agenta binaries found in standard locations)");
+    } else {
+        for t in &targets {
+            println!("  {}", t.display());
+        }
+    }
+    if purge {
+        if let Some(c) = &config_dir {
+            println!("  {}  {}", c.display(), "(config, .env with API keys, tools)".dimmed());
+        }
+        if let Some(dd) = &data_dir {
+            println!("  {}  {}", dd.display(), "(local database, socket)".dimmed());
+        }
+        if config.database_url.as_deref().map(|u| u.starts_with("postgres")).unwrap_or(false) {
+            println!("{}", "Your external Postgres database is NOT touched.".yellow());
+        }
+    } else {
+        println!("{}", "Config and data are kept. Re-run with --purge to remove them too.".dimmed());
+    }
+
+    // 3. Confirm.
+    if !yes {
+        let prompt = if purge {
+            "Remove binaries AND all config/data? This deletes your agents and API keys. [y/N] "
+        } else {
+            "Remove agenta binaries? [y/N] "
+        };
+        print!("{}", prompt);
+        std::io::stdout().flush().ok();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+        if !ans.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // 4. Stop the daemon so we don't leave an orphan behind.
+    println!("Stopping daemon...");
+    kill_all_daemons();
+    cleanup_daemon_files(config);
+
+    // 5. Remove binaries (safe to unlink our own running binary on Unix).
+    let mut failed: Vec<(std::path::PathBuf, std::io::Error)> = Vec::new();
+    for t in &targets {
+        match std::fs::remove_file(t) {
+            Ok(_) => println!("  removed {}", t.display()),
+            Err(e) => failed.push((t.clone(), e)),
+        }
+    }
+
+    // 6. Purge config + local data if asked.
+    if purge {
+        for dir in [config_dir, data_dir].into_iter().flatten() {
+            if dir.exists() {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(_) => println!("  removed {}", dir.display()),
+                    Err(e) => failed.push((dir, e)),
+                }
+            }
+        }
+    }
+
+    // 7. Summary.
+    println!();
+    if failed.is_empty() {
+        println!("{}", "✓ agenta uninstalled.".green());
+    } else {
+        println!("{}", "Uninstalled, but some items could not be removed:".yellow());
+        for (p, e) in &failed {
+            println!("  {} — {}", p.display(), e);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                println!("    try: sudo rm -rf {}", p.display());
+            }
+        }
+    }
+    if !purge {
+        println!("{}", "Your agents and config remain in ~/.agenta.".dimmed());
+    }
+    Ok(())
 }
 
 async fn run_doctor(config: &AppConfig) -> Result<()> {
@@ -1329,6 +1454,18 @@ fn print_agent_details(agent: &Agent) {
     }
     table.add_row(vec!["Memory", if agent.memory_enabled { "Enabled" } else { "Disabled" }]);
 
+    // RAG rows only appear when knowledge bases are attached — their presence is
+    // what marks this as a RAG agent (no separate/duplicative flag needed).
+    if !agent.config.knowledge_bases.is_empty() {
+        let kbs = agent.config.knowledge_bases.join(", ");
+        table.add_row(vec!["Knowledge Bases", &kbs]);
+        let top_k = match agent.config.rag_top_k {
+            Some(k) => format!("{} (override)", k),
+            None => "8 (default)".to_string(),
+        };
+        table.add_row(vec!["RAG Top-K", &top_k]);
+    }
+
     println!("{}", table);
 
     println!("\n{}", "System Prompt:".bold());
@@ -1349,7 +1486,7 @@ fn print_agents_table(agents: &[Agent], filter_status: Option<&str>) {
     }
 
     let mut table = Table::new();
-    table.set_header(vec!["Name", "Model", "Mode", "Status", "Runs", "Last Run"]);
+    table.set_header(vec!["Name", "Model", "Mode", "Status", "Runs", "RAG", "Last Run"]);
 
     for agent in agents {
         if let Some(status) = filter_status {
@@ -1366,6 +1503,8 @@ fn print_agents_table(agents: &[Agent], filter_status: Option<&str>) {
         // Keep plain text in table cells to avoid ANSI escape sequences
         // affecting visual column sizing in some terminals.
         let status_str = format!("{:?}", agent.status);
+        // "KB" marks agents with knowledge bases attached (RAG agents).
+        let rag = if agent.config.knowledge_bases.is_empty() { "" } else { "KB" };
 
         table.add_row(vec![
             Cell::new(agent.name.clone()),
@@ -1373,6 +1512,7 @@ fn print_agents_table(agents: &[Agent], filter_status: Option<&str>) {
             Cell::new(format!("{:?}", agent.execution_mode)),
             Cell::new(status_str),
             Cell::new(format!("{:02}", agent.run_count)).set_alignment(CellAlignment::Right),
+            Cell::new(rag).set_alignment(CellAlignment::Center),
             Cell::new(last_run),
         ]);
     }

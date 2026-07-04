@@ -181,6 +181,11 @@ pub enum Commands {
         #[arg(long, value_name = "KB_NAME")]
         remove_kb: Option<String>,
 
+        /// RAG retrieval top-k for this agent — how many knowledge passages to
+        /// inject per query. Overrides the global `rag_top_k` (default 8).
+        #[arg(long, value_name = "N")]
+        top_k: Option<usize>,
+
         /// Custom sub-agent spawn notification message (deep agents only).
         /// Use {task} as a placeholder for the task description.
         /// Example: "🪸 Deploying REEF sub-agent: {task}"
@@ -310,6 +315,17 @@ pub enum Commands {
         version: String,
     },
 
+    /// Uninstall agenta: stop the daemon and remove its binaries
+    Uninstall {
+        /// Also delete config + data: ~/.agenta (config, .env, tools) and the
+        /// local database/socket dir. Does NOT touch an external Postgres database.
+        #[arg(long)]
+        purge: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Run diagnostics and check system health
     Doctor,
 
@@ -351,6 +367,16 @@ pub enum KnowledgeCommands {
         /// Skip the extraction preview confirmation
         #[arg(short, long)]
         yes: bool,
+        /// OCR the PDF with a vision model instead of text extraction (for
+        /// image-based text, e.g. Arabic/scanned). Spec: provider:model, e.g.
+        /// --ocr openrouter:qwen/qwen3-vl-32b-instruct
+        #[arg(long, value_name = "PROVIDER:MODEL")]
+        ocr: Option<String>,
+        /// Chunking strategy: "words" (fixed windows, default) or "entries"
+        /// (one chunk per numbered supplication/hadith with its section header
+        /// attached — best for structured reference texts like Hisnul Muslim).
+        #[arg(long, default_value = "words")]
+        chunk_strategy: String,
     },
     /// List knowledge bases
     List,

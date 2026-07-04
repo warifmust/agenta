@@ -84,8 +84,15 @@ impl AgentExecutor {
         execution.status = ExecutionStatus::Running;
         self.storage.create_execution(&execution).await?;
 
-        // Update agent status
+        // Update agent status + run metadata. Restore the stored system_prompt/config
+        // first: the passed agent may carry per-run injected context (e.g. RAG passages
+        // appended to the prompt), which must NEVER be persisted — otherwise it leaks
+        // into storage and compounds on every run.
         let mut updated_agent = agent.clone();
+        if let Ok(Some(stored)) = self.storage.get_agent(&agent.id).await {
+            updated_agent.system_prompt = stored.system_prompt;
+            updated_agent.config = stored.config;
+        }
         updated_agent.status = AgentStatus::Running;
         updated_agent.last_run = Some(Utc::now());
         updated_agent.run_count += 1;

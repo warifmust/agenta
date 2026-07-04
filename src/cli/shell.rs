@@ -22,6 +22,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/update-tool",  "Update an existing tool"),
     ("/list",         "List all agents"),
     ("/list-tools",   "List all tools"),
+    ("/list-kb",      "List knowledge bases (RAG)"),
+    ("/attach-kb",    "Attach a knowledge base to an agent"),
+    ("/detach-kb",    "Detach a knowledge base from an agent"),
     ("/get",          "Show agent details"),
     ("/run",          "Run an agent"),
     ("/stop",         "Stop a running agent"),
@@ -319,6 +322,9 @@ async fn dispatch(input: &str, config: &AppConfig) -> Result<bool> {
         "/help" | "/h"           => print_help(),
         "/list"                  => cmd_list(config).await?,
         "/list-tools"            => cmd_list_tools(config).await?,
+        "/list-kb"               => cmd_list_kb(config).await?,
+        "/attach-kb"             => picker_attach_kb(config).await?,
+        "/detach-kb"             => picker_detach_kb(config).await?,
         "/list-scripts"          => println!("{}", "Scripts coming soon.".dimmed()),
         "/status"                => cmd_status(config).await?,
         "/create-agent"          => wizard_create_agent(config).await?,
@@ -416,6 +422,123 @@ async fn fetch_tools(config: &AppConfig) -> Result<Vec<serde_json::Value>> {
         DaemonResponse::Error { message } => Err(anyhow::anyhow!("{}", message)),
         _ => Ok(vec![]),
     }
+}
+
+/// Knowledge bases live in Postgres/pgvector, queried directly (not via the daemon),
+/// same as the `agenta knowledge` CLI. Returns a friendly error if RAG isn't configured.
+async fn fetch_kbs(config: &AppConfig) -> Result<Vec<crate::knowledge::KnowledgeBase>> {
+    use crate::knowledge::VectorStore;
+    let url = match &config.database_url {
+        Some(u) if u.starts_with("postgres") => u.clone(),
+        _ => return Err(anyhow::anyhow!(
+            "RAG needs Postgres — set database_url in config.toml (with pgvector)."
+        )),
+    };
+    let store = crate::knowledge::PgVectorStore::new(&url).await?;
+    Ok(store.list_kbs().await?)
+}
+
+/// Fetch one agent's full JSON (so we can mutate its config and send it back whole,
+/// mirroring how `agenta update` applies KB changes).
+async fn fetch_agent(config: &AppConfig, id: &str) -> Result<serde_json::Value> {
+    match daemon_request(config, DaemonRequest::GetAgent { id: id.to_string() }).await? {
+        DaemonResponse::AgentDetails { agent } => Ok(agent),
+        DaemonResponse::Error { message } => Err(anyhow::anyhow!("{}", message)),
+        _ => Err(anyhow::anyhow!("Unexpected response")),
+    }
+}
+
+async fn cmd_list_kb(config: &AppConfig) -> Result<()> {
+    let kbs = match fetch_kbs(config).await {
+        Ok(k) => k,
+        Err(e) => { println!("{}", e.to_string().yellow()); return Ok(()); }
+    };
+    if kbs.is_empty() {
+        println!("{}", "No knowledge bases. Create one: agenta knowledge create <name>".dimmed());
+        return Ok(());
+    }
+    use comfy_table::Table;
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_header(vec!["NAME", "EMBEDDER", "DIM"]);
+    for kb in &kbs {
+        table.add_row(vec![kb.name.as_str(), kb.embedder.as_str(), &kb.dimension.to_string()]);
+    }
+    println!("{table}");
+    println!("{}", "  Ingest files with: agenta knowledge add <kb> <file>".dimmed());
+    Ok(())
+}
+
+async fn picker_attach_kb(config: &AppConfig) -> Result<()> {
+    use inquire::Select;
+
+    let agents = fetch_agents(config).await?;
+    if agents.is_empty() { println!("{}", "No agents found.".dimmed()); return Ok(()); }
+    let kbs = match fetch_kbs(config).await {
+        Ok(k) => k,
+        Err(e) => { println!("{}", e.to_string().yellow()); return Ok(()); }
+    };
+    if kbs.is_empty() {
+        println!("{}", "No knowledge bases yet. Create one: agenta knowledge create <name>".dimmed());
+        return Ok(());
+    }
+
+    let names = agent_names(&agents);
+    let agent_name = Select::new("Attach to agent:", names.iter().map(|s| s.as_str()).collect()).prompt()?;
+    let kb = Select::new("Knowledge base:", kbs.iter().map(|k| k.name.as_str()).collect()).prompt()?;
+
+    let mut agent = fetch_agent(config, agent_name).await?;
+    let mut list = agent["config"]["knowledge_bases"].as_array().cloned().unwrap_or_default();
+    if list.iter().any(|v| v.as_str() == Some(kb)) {
+        println!("{}", format!("'{}' is already attached to {}.", kb, agent_name).yellow());
+        return Ok(());
+    }
+    list.push(serde_json::Value::String(kb.to_string()));
+    agent["config"]["knowledge_bases"] = serde_json::Value::Array(list);
+
+    let id = agent["id"].as_str().unwrap_or("").to_string();
+    match daemon_request(config, DaemonRequest::UpdateAgent { id, agent }).await? {
+        DaemonResponse::AgentDetails { .. } =>
+            println!("{} Attached '{}' to {}", "✓".green(), kb.bold(), agent_name.bold()),
+        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn picker_detach_kb(config: &AppConfig) -> Result<()> {
+    use inquire::Select;
+
+    let agents = fetch_agents(config).await?;
+    if agents.is_empty() { println!("{}", "No agents found.".dimmed()); return Ok(()); }
+    let names = agent_names(&agents);
+    let agent_name = Select::new("Detach from agent:", names.iter().map(|s| s.as_str()).collect()).prompt()?;
+
+    let mut agent = fetch_agent(config, agent_name).await?;
+    let attached: Vec<String> = agent["config"]["knowledge_bases"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if attached.is_empty() {
+        println!("{}", format!("{} has no knowledge bases attached.", agent_name).dimmed());
+        return Ok(());
+    }
+    let kb = Select::new("Detach which KB:", attached.iter().map(|s| s.as_str()).collect()).prompt()?;
+    let new_list: Vec<serde_json::Value> = attached
+        .iter()
+        .filter(|k| k.as_str() != kb)
+        .map(|k| serde_json::Value::String(k.clone()))
+        .collect();
+    agent["config"]["knowledge_bases"] = serde_json::Value::Array(new_list);
+
+    let id = agent["id"].as_str().unwrap_or("").to_string();
+    match daemon_request(config, DaemonRequest::UpdateAgent { id, agent }).await? {
+        DaemonResponse::AgentDetails { .. } =>
+            println!("{} Detached '{}' from {}", "✓".green(), kb.bold(), agent_name.bold()),
+        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn agent_names(agents: &[serde_json::Value]) -> Vec<String> {
