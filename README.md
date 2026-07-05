@@ -30,7 +30,7 @@
 ## 🚀 Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | bash
+curl -fsSL agenta.arifmustaffa.com/install | bash
 ```
 
 Installs the binary and launches the setup wizard. Then open the dashboard with `agenta`.
