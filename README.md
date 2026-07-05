@@ -19,9 +19,9 @@
 </table>
 
 <p align="center">
-  <a href="https://agenta.run"><strong>Docs</strong></a> ·
-  <a href="https://agenta.run/docs/quickstart">Quickstart</a> ·
-  <a href="https://agenta.run/docs/roadmap">Roadmap</a> ·
+  <a href="https://agenta.arifmustaffa.com"><strong>Docs</strong></a> ·
+  <a href="https://agenta.arifmustaffa.com/docs/quickstart">Quickstart</a> ·
+  <a href="https://agenta.arifmustaffa.com/docs/roadmap">Roadmap</a> ·
   <a href="#-install">Install</a>
 </p>
 
@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/warifmust/agenta/main/install.sh | 
 
 Installs the binary and launches the setup wizard. Then open the dashboard with `agenta`.
 
-Full walkthrough → **[Quickstart](https://agenta.run/docs/quickstart)**.
+Full walkthrough → **[Quickstart](https://agenta.arifmustaffa.com/docs/quickstart)**.
 
 ---
 
@@ -69,15 +69,15 @@ Full walkthrough → **[Quickstart](https://agenta.run/docs/quickstart)**.
 
 ## 📖 Documentation
 
-Everything — setup, configuration, commands, and guides — lives at **[agenta.run](https://agenta.run)**.
+Everything — setup, configuration, commands, and guides — lives at **[agenta.arifmustaffa.com](https://agenta.arifmustaffa.com)**.
 
 | | |
 |---|---|
-| **[Getting Started](https://agenta.run/docs/intro)** | Install, first-time setup, first agent |
-| **[Core Concepts](https://agenta.run/docs/concepts/agent-lifecycle)** | How agents, execution, tools, and memory work |
-| **[Guides](https://agenta.run/docs/guides/create-an-agent)** | Create agents, add tools, schedule, multi-agent, self-host |
-| **[CLI Reference](https://agenta.run/docs/reference/cli/overview)** | Every command and flag |
-| **[Roadmap](https://agenta.run/docs/roadmap)** | Where Agenta is headed |
+| **[Getting Started](https://agenta.arifmustaffa.com/docs/intro)** | Install, first-time setup, first agent |
+| **[Core Concepts](https://agenta.arifmustaffa.com/docs/concepts/agent-lifecycle)** | How agents, execution, tools, and memory work |
+| **[Guides](https://agenta.arifmustaffa.com/docs/guides/agents/create-an-agent)** | Create agents, add tools, schedule, multi-agent, self-host |
+| **[CLI Reference](https://agenta.arifmustaffa.com/docs/reference/cli)** | Every command and flag |
+| **[Roadmap](https://agenta.arifmustaffa.com/docs/roadmap)** | Where Agenta is headed |
 
 ---
 
