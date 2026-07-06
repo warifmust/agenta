@@ -13,7 +13,8 @@ fn expand_home(path: &str) -> String {
 }
 
 use crate::core::{
-    Agent, DeepAgentConfig, ExecutionMode, ExecutionResult, Storage, ToolCall,
+    Agent, AgentStatus, DeepAgentConfig, ExecutionMode, ExecutionResult, Proposal, ProposalAction,
+    SideEffect, Storage, ToolCall, ToolResource,
 };
 use crate::ollama::client::{ChatMessage, ChatRequest};
 use crate::ollama::models::ModelParameters;
@@ -125,8 +126,10 @@ impl DeepAgentExecutor {
 
         let system_content = format!(
             "{system}\n\n{memory}You have access to these tools:\n{tools}\n\nINSTRUCTIONS:\n\
-- To call a tool, respond with exactly: TOOL_CALL: {{\"tool\": \"tool_name\", \"parameters\": {{...}}}}\n\
-- After receiving a TOOL_RESULT, decide: call another tool or write TASK_COMPLETE: <final answer>\n\
+- To call a tool, respond with EXACTLY one line and nothing else: TOOL_CALL: {{\"tool\": \"tool_name\", \"parameters\": {{...}}}}\n\
+- The SYSTEM runs the tool automatically and sends you a TOOL_RESULT on your next turn. NEVER ask the user to run a tool or to provide/paste results — they are delivered to you automatically.\n\
+- Emit only ONE TOOL_CALL per turn, and put no other text in that turn. Then stop and wait for the TOOL_RESULT before doing anything else.\n\
+- After you have the TOOL_RESULT(s) you need, write TASK_COMPLETE: <final answer> using them.\n\
 - Only write TASK_COMPLETE when all required steps are done.\n\
 - You may iterate up to {max} times.",
             system  = agent.system_prompt,
@@ -161,10 +164,50 @@ impl DeepAgentExecutor {
                 content: content.clone(),
             });
 
+            // ── Tool call FIRST ───────────────────────────────────────────────
+            // Execute any TOOL_CALL before checking completion/stop. Models often
+            // emit a TOOL_CALL *and* a TASK_COMPLETE (or other stop-word) in the
+            // same message; if we checked completion first, the tool would never
+            // run. Run it, feed the result back, and let the model finish next turn.
+            if content.contains("TOOL_CALL:") {
+                let calls = self.handle_tool_call(agent, &content).await;
+
+                // Record each call with its real tool name (so callers/UIs can
+                // show "called get_agents" traces), and build the fed-back result.
+                let tool_result = if calls.is_empty() {
+                    "Tool not found or failed.".to_string()
+                } else {
+                    for (name, result) in &calls {
+                        execution.tool_calls.push(ToolCall {
+                            tool_name:  name.clone(),
+                            parameters: serde_json::json!({}),
+                            result:     result.chars().take(4_000).collect::<String>(),
+                            timestamp:  Utc::now(),
+                        });
+                    }
+                    let joined = calls
+                        .iter()
+                        .map(|(n, r)| format!("{}: {}", n, r))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    const MAX_TOOL_OUTPUT: usize = 8_000;
+                    if joined.len() > MAX_TOOL_OUTPUT {
+                        format!("{}… [truncated, {} chars total]", &joined[..MAX_TOOL_OUTPUT], joined.len())
+                    } else {
+                        joined
+                    }
+                };
+
+                // Feed result back as the next user turn, then continue the loop.
+                messages.push(ChatMessage {
+                    role:    "user".to_string(),
+                    content: format!("TOOL_RESULT: {}", tool_result),
+                });
+                continue;
+            }
+
             // ── Task complete ─────────────────────────────────────────────────
-            // TASK_COMPLETE: is a "done" signal, not a position marker. Models vary
-            // on whether they write the answer before or after it (e.g. gemma puts it
-            // after; DeepSeek puts the full answer before and only a closer after).
+            // TASK_COMPLETE: is a "done" signal (no tool call in this message).
             // Strip the marker and keep the whole message so we never drop the body.
             if content.contains("TASK_COMPLETE:") {
                 info!("Agent {} completed at iteration {}", agent.name, iteration + 1);
@@ -177,43 +220,10 @@ impl DeepAgentExecutor {
                 return Ok(content);
             }
 
-            // ── Tool call ─────────────────────────────────────────────────────
-            if content.contains("TOOL_CALL:") {
-                let tool_result = match self.handle_tool_call(agent, &content).await {
-                    Some(raw) => {
-                        const MAX_TOOL_OUTPUT: usize = 8_000;
-                        if raw.len() > MAX_TOOL_OUTPUT {
-                            format!("{}… [truncated, {} chars total]", &raw[..MAX_TOOL_OUTPUT], raw.len())
-                        } else {
-                            raw
-                        }
-                    }
-                    None => "Tool not found or failed.".to_string(),
-                };
-
-                execution.tool_calls.push(ToolCall {
-                    tool_name:  "tool".to_string(),
-                    parameters: serde_json::json!({"raw": content}),
-                    result:     tool_result.clone(),
-                    timestamp:  Utc::now(),
-                });
-
-                // Feed result back as the next user turn
-                messages.push(ChatMessage {
-                    role:    "user".to_string(),
-                    content: format!("TOOL_RESULT: {}", tool_result),
-                });
-
-            } else {
-                // No TOOL_CALL and no TASK_COMPLETE marker: the model produced a plain
-                // prose response, which is its final answer. Return it directly instead
-                // of nudging "Continue…" — that nudge makes the model emit a useless
-                // "already answered" meta-comment on the next turn and discards the real
-                // answer. Agents that use tools/TASK_COMPLETE are handled above; only
-                // bare-prose answers (simple chat / RAG Q&A agents) reach here.
-                info!("Agent {} answered in prose at iteration {}", agent.name, iteration + 1);
-                return Ok(content.trim().to_string());
-            }
+            // No TOOL_CALL and no completion marker: the model produced a plain
+            // prose response, which is its final answer.
+            info!("Agent {} answered in prose at iteration {}", agent.name, iteration + 1);
+            return Ok(content.trim().to_string());
         }
 
         // Max iterations hit — return the last assistant response
@@ -230,12 +240,23 @@ impl DeepAgentExecutor {
         ))
     }
 
-    async fn handle_tool_call(&self, agent: &Agent, content: &str) -> Option<String> {
-        if let Some(start) = content.find("TOOL_CALL:") {
-            let json_start = content[start..].find('{')? + start;
+    /// Execute EVERY `TOOL_CALL:` in the message, not just the first — models
+    /// (e.g. gpt-5.4) often batch several calls in one turn. Returns
+    /// `(tool_name, result)` pairs in call order so the loop can record and feed
+    /// each back.
+    async fn handle_tool_call(&self, agent: &Agent, content: &str) -> Vec<(String, String)> {
+        let mut results: Vec<(String, String)> = Vec::new();
+        let mut cursor = 0usize;
+
+        while let Some(rel) = content[cursor..].find("TOOL_CALL:") {
+            let marker = cursor + rel;
+            // Find the JSON object after this marker (brace-matched).
+            let json_start = match content[marker..].find('{') {
+                Some(p) => marker + p,
+                None => break,
+            };
             let mut depth = 0;
             let mut json_end = json_start;
-
             for (i, c) in content[json_start..].char_indices() {
                 match c {
                     '{' => depth += 1,
@@ -249,23 +270,37 @@ impl DeepAgentExecutor {
                     _ => {}
                 }
             }
+            // Advance past this call regardless of parse outcome.
+            cursor = json_end.max(marker + "TOOL_CALL:".len());
 
             let json_str = &content[json_start..json_end];
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let tool_name  = parsed.get("tool")?.as_str()?.to_string();
-                let parameters = parsed.get("parameters")?.clone();
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                continue;
+            };
+            let Some(tool_name) = parsed.get("tool").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // Parameters default to an empty object (many read tools take none).
+            let parameters = parsed
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
 
-                if is_builtin_tool(&tool_name) {
-                    return self.run_builtin_tool(agent, &tool_name, &parameters).await;
+            let output = if is_builtin_tool(tool_name) {
+                self.run_builtin_tool(agent, tool_name, &parameters)
+                    .await
+                    .unwrap_or_else(|| "Tool produced no output.".to_string())
+            } else {
+                match run_tool(agent, tool_name, parameters).await {
+                    Ok(out) => out,
+                    Err(err) => format!("Tool error: {}", err),
                 }
+            };
 
-                return match run_tool(agent, &tool_name, parameters).await {
-                    Ok(output) => Some(output),
-                    Err(err)   => Some(format!("Tool error: {}", err)),
-                };
-            }
+            results.push((tool_name.to_string(), output));
         }
-        None
+
+        results
     }
 
     async fn run_builtin_tool(
@@ -279,6 +314,12 @@ impl DeepAgentExecutor {
             "write_file"  => self.builtin_write_file(parameters).await,
             "list_files"  => self.builtin_list_files(parameters).await,
             "spawn_agent" => self.spawn_subagent(parent, parameters).await,
+            "list_tools"  => self.builtin_list_tools().await,
+            "list_agents" => self.builtin_list_agents().await,
+            "get_tool"    => self.builtin_get_tool(parameters).await,
+            "get_agent"   => self.builtin_get_agent(parameters).await,
+            "propose_create_tool" => self.builtin_propose_create_tool(parent, parameters).await,
+            "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
             _             => Some(format!("Unknown built-in tool: {}", tool_name)),
         }
     }
@@ -289,6 +330,236 @@ impl DeepAgentExecutor {
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => Some(content),
             Err(e)      => Some(format!("Error reading {}: {}", path, e)),
+        }
+    }
+
+    // ── Read tier: observe the ecosystem (no side effects, no approval) ─────
+
+    async fn builtin_list_tools(&self) -> Option<String> {
+        match self.storage.list_tools().await {
+            Ok(tools) if !tools.is_empty() => {
+                let mut out = format!("{} tool(s):\n", tools.len());
+                for t in &tools {
+                    let kind = if t.http.is_some() { "http" } else { "script" };
+                    let desc: String = t.description.chars().take(80).collect();
+                    out.push_str(&format!(
+                        "- {} [{}, {:?}]: {}\n",
+                        t.name, kind, t.side_effect, desc
+                    ));
+                }
+                Some(out)
+            }
+            Ok(_) => Some("No tools exist yet.".to_string()),
+            Err(e) => Some(format!("Error listing tools: {}", e)),
+        }
+    }
+
+    async fn builtin_list_agents(&self) -> Option<String> {
+        match self.storage.list_agents().await {
+            Ok(agents) if !agents.is_empty() => {
+                let mut out = format!("{} agent(s):\n", agents.len());
+                for a in &agents {
+                    let kb = if a.config.knowledge_bases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", KB: {}", a.config.knowledge_bases.join("+"))
+                    };
+                    out.push_str(&format!(
+                        "- {} [{}, {:?}]{}\n",
+                        a.name, a.model, a.status, kb
+                    ));
+                }
+                Some(out)
+            }
+            Ok(_) => Some("No agents exist yet.".to_string()),
+            Err(e) => Some(format!("Error listing agents: {}", e)),
+        }
+    }
+
+    async fn builtin_get_tool(&self, params: &serde_json::Value) -> Option<String> {
+        let name = params.get("name").and_then(|v| v.as_str())?;
+        match self.storage.get_tool_by_name(name).await {
+            Ok(Some(t)) => {
+                let kind = if t.http.is_some() { "http" } else { "script" };
+                Some(format!(
+                    "Tool {}\n  description: {}\n  type: {}\n  side_effect: {:?}\n  secrets: {:?}\n  handler: {}\n  parameters: {}",
+                    t.name,
+                    t.description,
+                    kind,
+                    t.side_effect,
+                    t.secrets,
+                    t.handler.as_deref().unwrap_or("N/A"),
+                    t.parameters
+                ))
+            }
+            Ok(None) => Some(format!("No tool named '{}'.", name)),
+            Err(e) => Some(format!("Error getting tool: {}", e)),
+        }
+    }
+
+    async fn builtin_get_agent(&self, params: &serde_json::Value) -> Option<String> {
+        let name = params.get("name").and_then(|v| v.as_str())?;
+        match self.storage.get_agent_by_name(name).await {
+            Ok(Some(a)) => Some(format!(
+                "Agent {}\n  model: {} ({})\n  status: {:?}\n  mode: {:?}\n  knowledge_bases: {:?}\n  tools: {:?}\n  system_prompt: {}",
+                a.name,
+                a.model,
+                a.provider.as_deref().unwrap_or("ollama"),
+                a.status,
+                a.execution_mode,
+                a.config.knowledge_bases,
+                a.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                a.system_prompt.chars().take(200).collect::<String>()
+            )),
+            Ok(None) => Some(format!("No agent named '{}'.", name)),
+            Err(e) => Some(format!("Error getting agent: {}", e)),
+        }
+    }
+
+    /// MIND's write-tier builtin: does NOT create the tool. It drafts a Proposal
+    /// the user must approve. Returns a result that tells MIND to report and wait.
+    async fn builtin_propose_create_tool(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+    ) -> Option<String> {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => return Some("Error: propose_create_tool requires a non-empty 'name'.".to_string()),
+        };
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let parameters = params
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+        let handler = params.get("handler").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let mut tool = ToolResource::new(name, description, parameters, handler);
+        if let Some(secrets) = params.get("secrets").and_then(|v| v.as_array()) {
+            tool.secrets = secrets.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+        }
+        if let Some(se) = params.get("side_effect").and_then(|v| v.as_str()) {
+            tool.side_effect = match se.to_lowercase().replace('-', "_").as_str() {
+                "write" => SideEffect::Write,
+                "destructive" => SideEffect::Destructive,
+                _ => SideEffect::ReadOnly,
+            };
+        }
+        if let Some(http) = params.get("http").filter(|h| !h.is_null()) {
+            tool.http = serde_json::from_value(http.clone()).ok();
+        }
+
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let proposal = Proposal::new(ProposalAction::CreateTool(tool), rationale, parent.name.clone());
+        let short: String = proposal.id.chars().take(8).collect();
+        match self.storage.create_proposal(&proposal).await {
+            Ok(_) => Some(format!(
+                "Proposal {} created: {} (risk: {:?}). IMPORTANT: this is NOT applied — the user must approve it. \
+                 Do not claim the tool exists. Tell the user what you proposed and that it awaits their approval \
+                 (they can run `agenta approve {}` or review with `agenta proposals`).",
+                short,
+                proposal.summary(),
+                proposal.risk,
+                short,
+            )),
+            Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
+    /// MIND's write-tier builtin: proposes creating a new agent (never applies).
+    async fn builtin_propose_create_agent(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+    ) -> Option<String> {
+        let name = match params.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => return Some("Error: propose_create_agent requires a non-empty 'name'.".to_string()),
+        };
+        // Default model/provider to MIND's own (known-configured) when unspecified.
+        let model = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| parent.model.clone());
+        let system_prompt = params
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("You are a helpful agenta agent.")
+            .to_string();
+
+        let mut agent = Agent::new(name, model, system_prompt);
+        agent.status = AgentStatus::Active;
+        agent.provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| parent.provider.clone());
+        if let Some(desc) = params.get("description").and_then(|v| v.as_str()) {
+            agent.description = Some(desc.to_string());
+        }
+
+        // Attach requested tools by name, resolved from the DB registry.
+        let mut missing: Vec<String> = Vec::new();
+        if let Some(tools) = params.get("tools").and_then(|v| v.as_array()) {
+            for t in tools {
+                if let Some(tn) = t.as_str() {
+                    match self.storage.get_tool_by_name(tn).await {
+                        Ok(Some(tool)) => agent.tools.push(tool.as_definition()),
+                        _ => missing.push(tn.to_string()),
+                    }
+                }
+            }
+        }
+
+        // Make it a deep agent by default when it has tools (so it can call them).
+        let deep = params
+            .get("deep")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(!agent.tools.is_empty());
+        if deep {
+            agent.deep_agent_config = Some(DeepAgentConfig {
+                max_iterations: 10,
+                enable_reflection: true,
+                available_tools: agent.tools.iter().map(|t| t.name.clone()).collect(),
+                stop_conditions: vec!["task_complete".to_string()],
+                allow_sub_agents: false,
+                subagent_spawn_message: None,
+            });
+        }
+
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let proposal = Proposal::new(ProposalAction::CreateAgent(agent), rationale, parent.name.clone());
+        let short: String = proposal.id.chars().take(8).collect();
+        let miss = if missing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " NOTE: these requested tools don't exist yet and were skipped: {} — propose/approve them first.",
+                missing.join(", ")
+            )
+        };
+        match self.storage.create_proposal(&proposal).await {
+            Ok(_) => Some(format!(
+                "Proposal {} created: {} (risk: {:?}).{} IMPORTANT: this is NOT applied — the user must approve it. \
+                 Do not claim the agent exists. Tell the user what you proposed and that it awaits approval (`agenta approve {}`).",
+                short, proposal.summary(), proposal.risk, miss, short,
+            )),
+            Err(e) => Some(format!("Error creating proposal: {}", e)),
         }
     }
 

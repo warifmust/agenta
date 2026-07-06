@@ -1,6 +1,6 @@
 [package]
 name = "agenta"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 description = "AI Agent Management CLI and Daemon"
 authors = ["Arif Mustaffa <wmaz93@gmail.com>"]
@@ -85,6 +85,9 @@ comfy-table = "7.1"
 
 # Interactive prompts
 inquire = "0.7"
+
+# Shell-quoting-aware parsing of tool handler command strings
+shlex = "1"
 
 # Terminal UI
 ratatui = "0.29"

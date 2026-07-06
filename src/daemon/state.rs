@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -10,6 +9,7 @@ use agenta::core::{
     Agent, AgentStatus, ExecutionMode, ExecutionResult, Storage, ToolExecution,
     ToolExecutionStatus, ToolResource, TriggerEvent, TriggerType,
     ScriptDefinition, ScriptExecution, ScriptExecutionStatus,
+    Proposal, ProposalAction, ProposalStatus,
 };
 use agenta::core::AppConfig;
 use agenta::providers::build_backend;
@@ -100,9 +100,13 @@ impl DaemonState {
             }
         }
 
-        // Handle trigger events
+        // Handle trigger events. Each run builds an executor from the agent's own
+        // provider (via build_executor_for_agent) rather than the shared default —
+        // otherwise every scheduled/triggered run would hit the default backend
+        // (Ollama) and a deepseek/openai agent would 404 on its own cron.
         let storage = self.storage.clone();
         let executor = self.executor.clone();
+        let config = self.config.clone();
 
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
@@ -110,7 +114,8 @@ impl DaemonState {
                     TriggerEvent::Scheduled { agent_id, cron } => {
                         info!("Scheduled trigger for {}: {}", agent_id, cron);
                         if let Ok(Some(agent)) = storage.get_agent(&agent_id).await {
-                            let _ = executor.execute(&agent, None).await;
+                            let ex = build_executor_for_agent(&config, &storage, &executor, &agent);
+                            let _ = ex.execute(&agent, None).await;
                         }
                     }
                     TriggerEvent::FileCreated { path } => {
@@ -122,7 +127,8 @@ impl DaemonState {
                                     &agent.trigger
                                 {
                                     if path.contains(watch_path) {
-                                        let _ = executor.execute(&agent, Some(path.clone())).await;
+                                        let ex = build_executor_for_agent(&config, &storage, &executor, &agent);
+                                        let _ = ex.execute(&agent, Some(path.clone())).await;
                                     }
                                 }
                             }
@@ -132,13 +138,15 @@ impl DaemonState {
                         info!("HTTP trigger: {} {} -> {}", method, path, agent_id);
                         if let Ok(Some(agent)) = storage.get_agent(&agent_id).await {
                             let input = body.unwrap_or_default();
-                            let _ = executor.execute(&agent, Some(input)).await;
+                            let ex = build_executor_for_agent(&config, &storage, &executor, &agent);
+                            let _ = ex.execute(&agent, Some(input)).await;
                         }
                     }
                     TriggerEvent::CommandOutput { agent_id, command, output, matched: _ } => {
                         info!("Command trigger: {} -> {}", command, agent_id);
                         if let Ok(Some(agent)) = storage.get_agent(&agent_id).await {
-                            let _ = executor.execute(&agent, Some(output)).await;
+                            let ex = build_executor_for_agent(&config, &storage, &executor, &agent);
+                            let _ = ex.execute(&agent, Some(output)).await;
                         }
                     }
                     _ => {}
@@ -229,12 +237,7 @@ impl DaemonState {
 
     /// Build an executor using the agent's provider override (if any), falling back to default.
     fn executor_for_agent(&self, agent: &Agent) -> AgentExecutor {
-        if agent.provider.is_some() {
-            let backend = build_backend(&self.config, agent.provider.as_deref());
-            AgentExecutor::new(self.storage.clone(), backend)
-        } else {
-            self.executor.clone()
-        }
+        build_executor_for_agent(&self.config, &self.storage, &self.executor, agent)
     }
 
     /// RAG auto-inject: if the agent has knowledge bases, retrieve passages relevant
@@ -675,48 +678,130 @@ impl DaemonState {
             })
             .collect())
     }
+
+    // ── Proposals (human-gated mutations from agents like MIND) ──────────────
+
+    pub async fn create_proposal(&self, proposal: &Proposal) -> anyhow::Result<()> {
+        self.storage.create_proposal(proposal).await.map_err(anyhow::Error::from)
+    }
+
+    pub async fn list_proposals(
+        &self,
+        status: Option<ProposalStatus>,
+    ) -> anyhow::Result<Vec<Proposal>> {
+        self.storage.list_proposals(status).await.map_err(anyhow::Error::from)
+    }
+
+    pub async fn get_proposal(&self, id: &str) -> anyhow::Result<Option<Proposal>> {
+        self.storage.get_proposal(id).await.map_err(anyhow::Error::from)
+    }
+
+    /// Approve and apply a pending proposal. Runs the underlying CRUD, then
+    /// records the outcome. Returns the (updated) proposal.
+    pub async fn approve_proposal(&self, id: &str) -> anyhow::Result<Proposal> {
+        let mut proposal = self
+            .get_proposal(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Proposal not found: {}", id))?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(anyhow::anyhow!(
+                "Proposal {} is already {:?}",
+                &proposal.id[..8],
+                proposal.status
+            ));
+        }
+
+        let outcome = self.apply_proposal_action(&proposal.action).await;
+        proposal.resolved_at = Some(chrono::Utc::now());
+        match outcome {
+            Ok(msg) => {
+                proposal.status = ProposalStatus::Applied;
+                proposal.result = Some(msg);
+            }
+            Err(err) => {
+                proposal.status = ProposalStatus::Failed;
+                proposal.result = Some(err.to_string());
+            }
+        }
+        self.storage.update_proposal(&proposal).await?;
+        Ok(proposal)
+    }
+
+    /// Reject a pending proposal without applying it.
+    pub async fn reject_proposal(&self, id: &str, reason: Option<String>) -> anyhow::Result<Proposal> {
+        let mut proposal = self
+            .get_proposal(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Proposal not found: {}", id))?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(anyhow::anyhow!(
+                "Proposal {} is already {:?}",
+                &proposal.id[..8],
+                proposal.status
+            ));
+        }
+
+        proposal.status = ProposalStatus::Rejected;
+        proposal.resolved_at = Some(chrono::Utc::now());
+        proposal.result = reason.or(Some("rejected by user".to_string()));
+        self.storage.update_proposal(&proposal).await?;
+        Ok(proposal)
+    }
+
+    /// Execute the mutation a proposal describes, reusing the existing CRUD.
+    async fn apply_proposal_action(&self, action: &ProposalAction) -> anyhow::Result<String> {
+        match action {
+            ProposalAction::CreateTool(tool) => {
+                if self.storage.get_tool_by_name(&tool.name).await?.is_some() {
+                    return Err(anyhow::anyhow!("A tool named '{}' already exists", tool.name));
+                }
+                self.storage.create_tool(tool).await?;
+                Ok(format!("Created tool '{}'", tool.name))
+            }
+            ProposalAction::CreateAgent(agent) => {
+                if self.storage.get_agent_by_name(&agent.name).await?.is_some() {
+                    return Err(anyhow::anyhow!("An agent named '{}' already exists", agent.name));
+                }
+                self.storage.create_agent(agent).await?;
+                Ok(format!("Created agent '{}'", agent.name))
+            }
+        }
+    }
+}
+
+/// Build an executor honoring the agent's provider override, falling back to the
+/// shared default executor when the agent has no (non-empty) provider set. Used
+/// by both the request path (`run_agent`) and the trigger loop, so scheduled/
+/// file/http/command runs route to the same backend a manual run would — e.g. a
+/// `deepseek` agent must not silently fall through to Ollama on its cron.
+fn build_executor_for_agent(
+    config: &AppConfig,
+    storage: &Arc<dyn Storage>,
+    fallback: &AgentExecutor,
+    agent: &Agent,
+) -> AgentExecutor {
+    let has_provider = agent
+        .provider
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    if has_provider {
+        let backend = build_backend(config, agent.provider.as_deref());
+        AgentExecutor::new(storage.clone(), backend)
+    } else {
+        fallback.clone()
+    }
 }
 
 async fn run_tool_handler(
     tool: &ToolResource,
     parameters: serde_json::Value,
 ) -> anyhow::Result<String> {
-    let handler = tool
-        .handler
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Tool has no handler"))?;
-
-    let expanded = expand_tilde(handler);
-    let mut parts = expanded.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid tool handler: {}", handler))?;
-    let args: Vec<String> = parts.map(|a| expand_tilde(a)).collect();
-
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("AGENTA_TOOL_NAME", &tool.name)
-        .env("AGENTA_TOOL_PARAMS", parameters.to_string())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(parameters.to_string().as_bytes()).await?;
-    }
-
-    let output = child.wait_with_output().await?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(anyhow::anyhow!(
-            "Tool {} failed ({}): {}",
-            tool.name,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    // Delegate to the single shared executor so the manual `tool run` path gets
+    // the same validation, secret allowlist, env sealing, and timeout as agent runs.
+    agenta::tools::execute_tool(&tool.as_definition(), parameters).await
 }
 
 impl DaemonState {

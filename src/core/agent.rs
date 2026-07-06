@@ -1,7 +1,41 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+fn default_http_method() -> String {
+    "POST".to_string()
+}
+
+/// Configuration for an HTTP-backed tool. When present on a tool, the executor
+/// makes this request instead of spawning a process: the tool's `handler` field
+/// is the URL, the call parameters become the JSON body (for non-GET methods),
+/// and `${VAR}` placeholders in the URL and header values are substituted from
+/// the tool's allowlisted `secrets`. Kills the curl-in-bash boilerplate for
+/// API/webhook tools while keeping the endpoint declared (not model-supplied).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HttpHandler {
+    #[serde(default = "default_http_method")]
+    pub method: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+/// Classifies a tool's effect on the world. Drives permission/approval guards:
+/// read-only tools run freely; write/destructive tools are candidates for a
+/// confirmation prompt before execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffect {
+    /// No state change — pure compute or read/fetch (calculator, search, read file).
+    #[default]
+    ReadOnly,
+    /// Mutates state or reaches an external system (write file, send message, POST).
+    Write,
+    /// Irreversible or high-blast-radius (delete, deploy, transfer).
+    Destructive,
+}
 
 /// Represents a tool that an agent can use
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -9,7 +43,25 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    pub handler: Option<String>, // Path to script or built-in command
+    pub handler: Option<String>, // Script command, or the URL when `http` is set
+    /// Environment variables (by name) the handler is allowed to receive. The
+    /// executor clears the environment and injects only these from agenta's own
+    /// env, so a tool can't read secrets it wasn't granted.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// Effect classification used for permission/approval guards.
+    #[serde(default)]
+    pub side_effect: SideEffect,
+    /// When set, this is an HTTP tool: the executor calls the endpoint (see
+    /// `HttpHandler`) instead of spawning a process. `None` = script handler.
+    #[serde(default)]
+    pub http: Option<HttpHandler>,
+    /// Per-tool execution timeout in seconds. `None` uses the global default
+    /// (AGENTA_TOOL_TIMEOUT_SECS or 120s). Long-running orchestrator tools that
+    /// drive other agents (e.g. a newsletter pipeline) set this higher so they
+    /// aren't killed mid-run.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// First-class tool resource managed by CLI/daemon
@@ -21,6 +73,15 @@ pub struct ToolResource {
     pub parameters: serde_json::Value,
     pub handler: Option<String>,
     pub enabled: bool,
+    /// Env var names this tool is granted (allowlist). See `ToolDefinition::secrets`.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// Effect classification. See `SideEffect`.
+    #[serde(default)]
+    pub side_effect: SideEffect,
+    /// HTTP handler config. See `ToolDefinition::http`.
+    #[serde(default)]
+    pub http: Option<HttpHandler>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -40,6 +101,9 @@ impl ToolResource {
             parameters,
             handler,
             enabled: true,
+            secrets: Vec::new(),
+            side_effect: SideEffect::default(),
+            http: None,
             created_at: now,
             updated_at: now,
         }
@@ -51,6 +115,10 @@ impl ToolResource {
             description: self.description.clone(),
             parameters: self.parameters.clone(),
             handler: self.handler.clone(),
+            secrets: self.secrets.clone(),
+            side_effect: self.side_effect,
+            http: self.http.clone(),
+            timeout_secs: None,
         }
     }
 }
@@ -275,6 +343,11 @@ pub struct AgentConfig {
     /// the LLM sampling `top_k` above. `None` → fall back to the global `rag_top_k`.
     #[serde(default)]
     pub rag_top_k: Option<usize>,
+    /// Whether this agent may run `Destructive` tools autonomously. Off by default:
+    /// an irreversible tool won't fire during an unattended run unless explicitly
+    /// opted in. (`Write` tools are never gated; only `Destructive`.)
+    #[serde(default)]
+    pub allow_destructive_tools: bool,
 }
 
 impl Default for AgentConfig {
@@ -289,6 +362,7 @@ impl Default for AgentConfig {
             seed: None,
             knowledge_bases: vec![],
             rag_top_k: None,
+            allow_destructive_tools: false,
         }
     }
 }
