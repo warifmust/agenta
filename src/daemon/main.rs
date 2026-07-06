@@ -585,6 +585,47 @@ async fn process_request(
             }
         }
 
+        DaemonRequest::ListProposals { status } => {
+            let filter = status.as_deref().and_then(|s| {
+                serde_json::from_value(serde_json::json!(s)).ok()
+            });
+            match state.list_proposals(filter).await {
+                Ok(proposals) => {
+                    let values: Vec<serde_json::Value> = proposals
+                        .into_iter()
+                        .filter_map(|p| serde_json::to_value(p).ok())
+                        .collect();
+                    DaemonResponse::ProposalList { proposals: values }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::GetProposal { id } => match state.get_proposal(&id).await {
+            Ok(Some(p)) => match serde_json::to_value(p) {
+                Ok(value) => DaemonResponse::ProposalDetails { proposal: value },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            },
+            Ok(None) => DaemonResponse::Error { message: format!("Proposal not found: {}", id) },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::ApproveProposal { id } => match state.approve_proposal(&id).await {
+            Ok(p) => match serde_json::to_value(p) {
+                Ok(value) => DaemonResponse::ProposalDetails { proposal: value },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
+        DaemonRequest::RejectProposal { id, reason } => match state.reject_proposal(&id, reason).await {
+            Ok(p) => match serde_json::to_value(p) {
+                Ok(value) => DaemonResponse::ProposalDetails { proposal: value },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
         DaemonRequest::Ping => {
             DaemonResponse::Status {
                 running: true,

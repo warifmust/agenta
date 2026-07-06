@@ -1,12 +1,13 @@
-use super::{Commands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
+use super::{Commands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
-    ExecutionResult, ScriptDefinition, ToolDefinition, ToolResource,
+    ExecutionResult, HttpHandler, Proposal, ProposalStatus, ScriptDefinition, SideEffect,
+    ToolDefinition, ToolResource,
 };
 use anyhow::{anyhow, Context, Result};
 use comfy_table::{Cell, CellAlignment, Table};
 use owo_colors::OwoColorize;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +68,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             memory,
             provider,
             tools,
+            allow_destructive_tools,
             interactive,
         } => {
             if interactive {
@@ -88,6 +90,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             agent.schedule = schedule;
             agent.memory_enabled = memory;
             agent.provider = provider;
+            agent.config.allow_destructive_tools = allow_destructive_tools;
             if let Some(tools_arg) = tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
             }
@@ -153,6 +156,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             name: new_name,
             model: new_model,
             prompt: new_prompt,
+            prompt_file: new_prompt_file,
             description: new_description,
             temperature: new_temp,
             max_tokens: new_max_tokens,
@@ -161,11 +165,14 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             memory: new_memory,
             provider: new_provider,
             tools: new_tools,
+            deep: new_deep,
+            deep_iterations: new_deep_iterations,
             add_tool: new_add_tool,
             remove_tool: new_remove_tool,
             add_kb: new_add_kb,
             remove_kb: new_remove_kb,
             top_k: new_top_k,
+            allow_destructive_tools: new_allow_destructive,
             spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -184,6 +191,10 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(model) = new_model {
                 agent.model = model;
+            }
+            if let Some(file) = new_prompt_file {
+                agent.system_prompt = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading --prompt-file {}", file))?;
             }
             if let Some(prompt) = new_prompt {
                 agent.system_prompt = prompt;
@@ -216,7 +227,20 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 }
             }
             if let Some(tool_name) = new_add_tool {
-                let tool = read_installed_tool(&tool_name)?;
+                // Resolve the tool: prefer the DB registry (where `agenta tool
+                // create` and MIND's approved proposals live), and fall back to a
+                // filesystem manifest for legacy `agenta pull` tools.
+                let tool: ToolDefinition = match daemon_request(
+                    &config,
+                    DaemonRequest::GetTool { id: tool_name.clone() },
+                )
+                .await
+                {
+                    Ok(DaemonResponse::ToolDetails { tool }) => {
+                        serde_json::from_value::<ToolResource>(tool)?.as_definition()
+                    }
+                    _ => read_installed_tool(&tool_name)?,
+                };
                 // Replace if already present, otherwise append
                 if let Some(pos) = agent.tools.iter().position(|t| t.name == tool.name) {
                     agent.tools[pos] = tool;
@@ -251,6 +275,32 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(k) = new_top_k {
                 agent.config.rag_top_k = Some(k);
+            }
+            if let Some(v) = new_allow_destructive {
+                agent.config.allow_destructive_tools = v;
+            }
+            match new_deep {
+                Some(true) => {
+                    // Enable deep mode, preserving an existing config's fields where possible.
+                    let tool_names: Vec<String> = agent.tools.iter().map(|t| t.name.clone()).collect();
+                    agent.deep_agent_config = Some(match agent.deep_agent_config.take() {
+                        Some(mut cfg) => {
+                            cfg.max_iterations = new_deep_iterations;
+                            cfg.available_tools = tool_names;
+                            cfg
+                        }
+                        None => DeepAgentConfig {
+                            max_iterations: new_deep_iterations,
+                            enable_reflection: true,
+                            available_tools: tool_names,
+                            stop_conditions: vec!["task_complete".to_string()],
+                            allow_sub_agents: false,
+                            subagent_spawn_message: None,
+                        },
+                    });
+                }
+                Some(false) => agent.deep_agent_config = None,
+                None => {}
             }
             if let Some(msg) = new_spawn_message {
                 if let Some(config) = agent.deep_agent_config.as_mut() {
@@ -502,6 +552,14 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         Commands::Tool { command } => handle_tool_command(command, &config).await,
 
         Commands::Script { command } => handle_script_command(command, &config).await,
+
+        Commands::Dashboard => crate::cli::tui::run_tui(config).await,
+
+        Commands::Proposals { all, command } => handle_proposals_command(all, command, &config).await,
+
+        Commands::Approve { id } => resolve_proposal(&config, &id, true, None).await,
+
+        Commands::Reject { id, reason } => resolve_proposal(&config, &id, false, reason).await,
 
         Commands::View { command } => match command {
             ViewCommands::Executions { limit } => {
@@ -801,7 +859,7 @@ async fn handle_daemon_command(
 
             match daemon_request(&config, request).await {
                 Ok(DaemonResponse::Status { running, pid, version }) => {
-                    let mut table = Table::new();
+                    let mut table = styled_table();
                     table.set_header(vec!["Property", "Value"]);
                     table.add_row(vec!["Status", if running { "Running" } else { "Stopped" }]);
                     if let Some(pid) = pid {
@@ -1084,16 +1142,21 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     let mut mind = Agent::new(
         "MIND".to_string(),
         model.clone(),
-        "You are MIND — Maintenance, Inference, and Development agent. \
-Your primary role is to generate shell scripts and tools for the agenta ecosystem. \
-When asked to create a tool, output a well-structured bash script that accomplishes the task. \
-Support multiple languages (Python, Node.js, etc.) when the task warrants it. \
-Always validate inputs and handle errors gracefully. \
-Suggest test commands for any tool you create.".to_string(),
+        include_str!("mind_prompt.txt").to_string(),
     );
     mind.is_system = true;
     mind.provider = Some(provider.to_string());
     mind.status = AgentStatus::Active;
+    // MIND is a deep agent — the builder builtins (propose_create_tool) and its
+    // multi-step reasoning only run in the deep-agent loop.
+    mind.deep_agent_config = Some(DeepAgentConfig {
+        max_iterations: 10,
+        enable_reflection: true,
+        available_tools: vec![],
+        stop_conditions: vec!["task_complete".to_string()],
+        allow_sub_agents: false,
+        subagent_spawn_message: None,
+    });
 
     let agent_value = serde_json::to_value(&mind)?;
     match daemon_request(&fresh_config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
@@ -1260,6 +1323,172 @@ async fn daemon_stop(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+async fn handle_proposals_command(
+    all: bool,
+    command: Option<ProposalCommands>,
+    config: &AppConfig,
+) -> Result<()> {
+    match command {
+        None => list_proposals(config, all).await,
+        Some(ProposalCommands::Show { id }) => show_proposal(config, &id).await,
+    }
+}
+
+pub(crate) async fn list_proposals(config: &AppConfig, all: bool) -> Result<()> {
+    // Default view is the pending queue — what needs a decision now.
+    let status = if all { None } else { Some("pending".to_string()) };
+    match daemon_request(config, DaemonRequest::ListProposals { status }).await? {
+        DaemonResponse::ProposalList { proposals } => {
+            let proposals: Vec<Proposal> = proposals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
+            print_proposals_table(&proposals, all);
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        _ => Err(anyhow!("Unexpected response")),
+    }
+}
+
+async fn show_proposal(config: &AppConfig, id: &str) -> Result<()> {
+    match daemon_request(config, DaemonRequest::GetProposal { id: id.to_string() }).await? {
+        DaemonResponse::ProposalDetails { proposal } => {
+            let proposal: Proposal = serde_json::from_value(proposal)?;
+            print_proposal_detail(&proposal);
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        _ => Err(anyhow!("Unexpected response")),
+    }
+}
+
+async fn resolve_proposal(
+    config: &AppConfig,
+    id: &str,
+    approve: bool,
+    reason: Option<String>,
+) -> Result<()> {
+    let request = if approve {
+        DaemonRequest::ApproveProposal { id: id.to_string() }
+    } else {
+        DaemonRequest::RejectProposal { id: id.to_string(), reason }
+    };
+    match daemon_request(config, request).await? {
+        DaemonResponse::ProposalDetails { proposal } => {
+            let proposal: Proposal = serde_json::from_value(proposal)?;
+            match proposal.status {
+                ProposalStatus::Applied => println!(
+                    "{} {}",
+                    "✓ Applied:".green(),
+                    proposal.result.as_deref().unwrap_or(&proposal.summary())
+                ),
+                ProposalStatus::Failed => println!(
+                    "{} {}",
+                    "✗ Apply failed:".red(),
+                    proposal.result.as_deref().unwrap_or("unknown error")
+                ),
+                ProposalStatus::Rejected => println!("{} {}", "Rejected:".yellow(), proposal.summary()),
+                ProposalStatus::Pending => println!("Proposal still pending."),
+            }
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        _ => Err(anyhow!("Unexpected response")),
+    }
+}
+
+/// Colored risk badge for list/detail views.
+fn risk_badge(risk: crate::core::Risk) -> String {
+    use crate::core::Risk;
+    match risk {
+        Risk::Low => "low".green().to_string(),
+        Risk::Elevated => "elevated".yellow().to_string(),
+        Risk::Destructive => "DESTRUCTIVE".red().bold().to_string(),
+    }
+}
+
+fn print_proposals_table(proposals: &[Proposal], all: bool) {
+    if proposals.is_empty() {
+        let scope = if all { "proposals" } else { "pending proposals" };
+        println!("No {}.", scope);
+        return;
+    }
+    let mut table = styled_table();
+    table.set_header(vec!["ID", "Risk", "Action", "By", "Status", "When"]);
+    for p in proposals {
+        table.add_row(vec![
+            p.id.chars().take(8).collect::<String>(),
+            risk_badge(p.risk),
+            p.summary(),
+            p.proposed_by.clone(),
+            format!("{:?}", p.status),
+            p.created_at.format("%Y-%m-%d %H:%M").to_string(),
+        ]);
+    }
+    println!("{table}");
+    if !all {
+        println!(
+            "{}",
+            "Review with: agenta proposals show <id> · approve <id> · reject <id>".dimmed()
+        );
+    }
+}
+
+fn print_proposal_detail(p: &Proposal) {
+    let mut table = styled_table();
+    table.set_header(vec!["Property", "Value"]);
+    table.add_row(vec!["ID".to_string(), p.id.clone()]);
+    table.add_row(vec!["Action".to_string(), p.summary()]);
+    table.add_row(vec!["Risk".to_string(), risk_badge(p.risk)]);
+    table.add_row(vec!["Status".to_string(), format!("{:?}", p.status)]);
+    table.add_row(vec!["Proposed by".to_string(), p.proposed_by.clone()]);
+    table.add_row(vec!["Rationale".to_string(), p.rationale.clone()]);
+    if let Some(result) = &p.result {
+        table.add_row(vec!["Result".to_string(), result.clone()]);
+    }
+    println!("{table}");
+
+    // The full payload — what will actually be created/changed on approval.
+    println!("\n{}", "Payload (applied on approval):".bold());
+    if let Ok(rendered) = serde_json::to_string_pretty(&p.action) {
+        println!("{}", rendered);
+    }
+    if p.status == ProposalStatus::Pending {
+        println!(
+            "\n{}",
+            format!("Approve: agenta approve {}   ·   Reject: agenta reject {}",
+                &p.id[..8.min(p.id.len())], &p.id[..8.min(p.id.len())]).dimmed()
+        );
+    }
+}
+
+/// Parse the CLI `--side-effect` value into the enum. Accepts hyphen or
+/// underscore spelling (read-only / read_only / readonly).
+fn parse_side_effect(s: &str) -> Result<SideEffect> {
+    match s.trim().to_lowercase().replace('-', "_").as_str() {
+        "read_only" | "readonly" | "read" => Ok(SideEffect::ReadOnly),
+        "write" => Ok(SideEffect::Write),
+        "destructive" => Ok(SideEffect::Destructive),
+        other => Err(anyhow!(
+            "Invalid --side-effect '{}': expected read-only | write | destructive",
+            other
+        )),
+    }
+}
+
+/// Parse `--http-header "Key: Value"` args into a header map.
+fn parse_http_headers(raw: &[String]) -> Result<std::collections::HashMap<String, String>> {
+    let mut headers = std::collections::HashMap::new();
+    for h in raw {
+        let (k, v) = h
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Invalid --http-header '{}': expected 'Key: Value'", h))?;
+        headers.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    Ok(headers)
+}
+
 async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Result<()> {
     match command {
         ToolCommands::Create {
@@ -1268,17 +1497,40 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
             parameters,
             handler,
             scaffold,
+            secrets,
+            side_effect,
+            http,
+            http_method,
+            http_headers,
         } => {
             let parameters: serde_json::Value = serde_json::from_str(&parameters)
                 .map_err(|e| anyhow!("Invalid --parameters JSON: {}", e))?;
-            let should_scaffold = scaffold || handler.is_none();
-            let resolved_handler = if should_scaffold {
-                Some(scaffold_tool_handler(&name, handler.as_deref())?)
+            let side_effect = parse_side_effect(&side_effect)?;
+
+            // HTTP tool: --handler is the URL, no script is scaffolded.
+            let (resolved_handler, http_config) = if http {
+                let url = handler.ok_or_else(|| {
+                    anyhow!("--http requires --handler <URL> (the request endpoint)")
+                })?;
+                let cfg = HttpHandler {
+                    method: http_method,
+                    headers: parse_http_headers(&http_headers)?,
+                };
+                (Some(url), Some(cfg))
             } else {
-                handler
+                let should_scaffold = scaffold || handler.is_none();
+                let h = if should_scaffold {
+                    Some(scaffold_tool_handler(&name, handler.as_deref())?)
+                } else {
+                    handler
+                };
+                (h, None)
             };
 
-            let tool = ToolResource::new(name, description, parameters, resolved_handler);
+            let mut tool = ToolResource::new(name, description, parameters, resolved_handler);
+            tool.secrets = secrets;
+            tool.side_effect = side_effect;
+            tool.http = http_config;
             let request = DaemonRequest::CreateTool {
                 tool: serde_json::to_value(tool)?,
             };
@@ -1325,6 +1577,10 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
             parameters,
             handler,
             enabled,
+            secrets,
+            side_effect,
+            http_method,
+            http_headers,
         } => {
             let current = match daemon_request(config, DaemonRequest::GetTool { id: id.clone() }).await? {
                 DaemonResponse::ToolDetails { tool } => serde_json::from_value::<ToolResource>(tool)?,
@@ -1342,6 +1598,19 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
                 tool.handler = handler;
             }
             if let Some(v) = enabled { tool.enabled = v; }
+            // Empty `secrets` means "not provided" — leave the allowlist untouched.
+            if !secrets.is_empty() { tool.secrets = secrets; }
+            if let Some(v) = side_effect { tool.side_effect = parse_side_effect(&v)?; }
+            // Setting method or headers makes (or updates) this an HTTP tool.
+            if http_method.is_some() || !http_headers.is_empty() {
+                let mut cfg = tool.http.take().unwrap_or_else(|| HttpHandler {
+                    method: "POST".to_string(),
+                    headers: std::collections::HashMap::new(),
+                });
+                if let Some(m) = http_method { cfg.method = m; }
+                if !http_headers.is_empty() { cfg.headers = parse_http_headers(&http_headers)?; }
+                tool.http = Some(cfg);
+            }
 
             let request = DaemonRequest::UpdateTool {
                 id,
@@ -1367,9 +1636,34 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
                 _ => Err(anyhow!("Unexpected response")),
             }
         }
-        ToolCommands::Run { id, input, wait } => {
+        ToolCommands::Run { id, input, wait, yes } => {
             let input: serde_json::Value = serde_json::from_str(&input)
                 .map_err(|e| anyhow!("Invalid --input JSON: {}", e))?;
+
+            // Guard: confirm before manually running a state-changing tool. Only
+            // prompts on an interactive terminal; `--yes` or a non-TTY skips it.
+            if !yes && std::io::stdin().is_terminal() {
+                if let DaemonResponse::ToolDetails { tool } =
+                    daemon_request(config, DaemonRequest::GetTool { id: id.clone() }).await?
+                {
+                    if let Ok(tool) = serde_json::from_value::<ToolResource>(tool) {
+                        if tool.side_effect != SideEffect::ReadOnly {
+                            print!(
+                                "⚠ '{}' is a {:?} tool. Run it? [y/N] ",
+                                tool.name, tool.side_effect
+                            );
+                            std::io::stdout().flush().ok();
+                            let mut line = String::new();
+                            std::io::stdin().read_line(&mut line)?;
+                            if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                                println!("Aborted.");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
             let request = DaemonRequest::RunTool { id, input };
             match daemon_request(config, request).await? {
                 DaemonResponse::ToolExecutionStarted { execution_id } => {
@@ -1423,8 +1717,17 @@ fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from("agenta-daemon"))
 }
 
-fn print_agent_details(agent: &Agent) {
+/// Shared table style used across every CLI table (list + detail views), so the
+/// UI stays consistent: condensed UTF-8 borders + dynamic wrapping to terminal width.
+fn styled_table() -> Table {
     let mut table = Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    table
+}
+
+fn print_agent_details(agent: &Agent) {
+    let mut table = styled_table();
     table.set_header(vec!["Property", "Value"]);
 
     table.add_row(vec!["ID", &agent.id]);
@@ -1453,6 +1756,11 @@ fn print_agent_details(agent: &Agent) {
         table.add_row(vec!["Deep Agent", "Yes"]);
     }
     table.add_row(vec!["Memory", if agent.memory_enabled { "Enabled" } else { "Disabled" }]);
+
+    // Only surfaced when enabled — an opt-in safety flag, off for virtually all agents.
+    if agent.config.allow_destructive_tools {
+        table.add_row(vec!["Destructive Tools", "Allowed (autonomous)"]);
+    }
 
     // RAG rows only appear when knowledge bases are attached — their presence is
     // what marks this as a RAG agent (no separate/duplicative flag needed).
@@ -1485,7 +1793,7 @@ fn print_agents_table(agents: &[Agent], filter_status: Option<&str>) {
         return;
     }
 
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Name", "Model", "Mode", "Status", "Runs", "RAG", "Last Run"]);
 
     for agent in agents {
@@ -1681,13 +1989,35 @@ async fn follow_logs(config: &AppConfig, request: DaemonRequest) -> Result<()> {
 }
 
 fn print_tool_details(tool: &ToolResource) {
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Property", "Value"]);
     table.add_row(vec!["ID", &tool.id]);
     table.add_row(vec!["Name", &tool.name]);
     table.add_row(vec!["Description", &tool.description]);
     table.add_row(vec!["Enabled", if tool.enabled { "true" } else { "false" }]);
-    table.add_row(vec!["Handler", tool.handler.as_deref().unwrap_or("N/A")]);
+    table.add_row(vec!["Side Effect", &format!("{:?}", tool.side_effect)]);
+    let secrets = if tool.secrets.is_empty() {
+        "none".to_string()
+    } else {
+        tool.secrets.join(", ")
+    };
+    table.add_row(vec!["Secrets", &secrets]);
+    if let Some(http) = &tool.http {
+        table.add_row(vec!["Type", &format!("HTTP ({})", http.method)]);
+        table.add_row(vec!["URL", tool.handler.as_deref().unwrap_or("N/A")]);
+        if !http.headers.is_empty() {
+            let hdrs = http
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            table.add_row(vec!["Headers", &hdrs]);
+        }
+    } else {
+        table.add_row(vec!["Type", "script"]);
+        table.add_row(vec!["Handler", tool.handler.as_deref().unwrap_or("N/A")]);
+    }
     table.add_row(vec!["Created", &tool.created_at.to_rfc3339()]);
     table.add_row(vec!["Updated", &tool.updated_at.to_rfc3339()]);
     println!("{}", table);
@@ -1702,7 +2032,7 @@ fn print_tools_table(tools: &[ToolResource]) {
         println!("No tools found");
         return;
     }
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Name", "Enabled", "Handler", "Updated"]);
     for tool in tools {
         table.add_row(vec![
@@ -1721,7 +2051,7 @@ fn print_executions_table(executions: &[ExecutionResult]) {
         return;
     }
 
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Execution ID", "Agent ID", "Status", "Started", "Completed", "Error"]);
 
     for execution in executions {
@@ -1948,7 +2278,7 @@ async fn handle_script_command(command: ScriptCommands, config: &AppConfig) -> R
 }
 
 fn print_script_details(script: &ScriptDefinition) {
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Property", "Value"]);
     table.add_row(vec!["ID", &script.id]);
     table.add_row(vec!["Name", &script.name]);
@@ -1980,7 +2310,7 @@ fn print_scripts_table(scripts: &[ScriptDefinition]) {
         println!("No scripts found");
         return;
     }
-    let mut table = Table::new();
+    let mut table = styled_table();
     table.set_header(vec!["Name", "Schedule", "Enabled", "Runs", "Last Run", "Handler"]);
     for script in scripts {
         table.add_row(vec![
@@ -2043,7 +2373,7 @@ async fn wait_for_script_execution(
     Ok(())
 }
 
-fn scaffold_tool_handler(name: &str, handler_arg: Option<&str>) -> Result<String> {
+pub(crate) fn scaffold_tool_handler(name: &str, handler_arg: Option<&str>) -> Result<String> {
     let path = if let Some(handler) = handler_arg {
         let script_path = handler
             .strip_prefix("/usr/bin/env bash ")
@@ -2123,7 +2453,16 @@ pub(crate) fn read_installed_tool(name: &str) -> Result<ToolDefinition> {
     let handler_path = install_dir.join(handler_file);
     let handler = format!("/usr/bin/env bash {}", handler_path.display());
 
-    Ok(ToolDefinition { name: tool_name, description, parameters, handler: Some(handler) })
+    Ok(ToolDefinition {
+        name: tool_name,
+        description,
+        parameters,
+        handler: Some(handler),
+        secrets: Vec::new(),
+        side_effect: Default::default(),
+        http: None,
+        timeout_secs: None,
+    })
 }
 
 async fn pull_tool(config: &AppConfig, name: &str, version: &str, attach: Option<&str>) -> Result<()> {

@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod commands;
 pub mod knowledge;
 pub mod shell;
@@ -90,6 +91,10 @@ pub enum Commands {
         #[arg(long)]
         tools: Option<String>,
 
+        /// Permit this agent to run destructive tools autonomously (default: off)
+        #[arg(long)]
+        allow_destructive_tools: bool,
+
         /// Interactive mode
         #[arg(short, long)]
         interactive: bool,
@@ -133,6 +138,10 @@ pub enum Commands {
         #[arg(short, long)]
         prompt: Option<String>,
 
+        /// Load the new system prompt from a file (avoids shell-quoting a long prompt)
+        #[arg(long, value_name = "FILE")]
+        prompt_file: Option<String>,
+
         /// New description
         #[arg(short, long)]
         description: Option<String>,
@@ -165,6 +174,14 @@ pub enum Commands {
         #[arg(long)]
         tools: Option<String>,
 
+        /// Enable or disable deep-agent mode (multi-step reasoning + builder builtins)
+        #[arg(long)]
+        deep: Option<bool>,
+
+        /// Deep agent max iterations (only when enabling deep mode)
+        #[arg(long, default_value = "10")]
+        deep_iterations: u32,
+
         /// Add (or update) a single installed tool by name, e.g. --add-tool tavily_search
         #[arg(long, value_name = "TOOL_NAME")]
         add_tool: Option<String>,
@@ -185,6 +202,10 @@ pub enum Commands {
         /// inject per query. Overrides the global `rag_top_k` (default 8).
         #[arg(long, value_name = "N")]
         top_k: Option<usize>,
+
+        /// Permit (or forbid) this agent to run destructive tools autonomously.
+        #[arg(long)]
+        allow_destructive_tools: Option<bool>,
 
         /// Custom sub-agent spawn notification message (deep agents only).
         /// Use {task} as a placeholder for the task description.
@@ -300,6 +321,33 @@ pub enum Commands {
     Script {
         #[command(subcommand)]
         command: ScriptCommands,
+    },
+
+    /// Open the TUI dashboard (bare `agenta` opens the MIND chat instead)
+    Dashboard,
+
+    /// Review pending proposals from agents (e.g. MIND). Bare = list pending.
+    Proposals {
+        /// Show proposals of every status, not just pending
+        #[arg(short, long)]
+        all: bool,
+        #[command(subcommand)]
+        command: Option<ProposalCommands>,
+    },
+
+    /// Approve and apply a pending proposal
+    Approve {
+        /// Proposal id (or a unique prefix)
+        id: String,
+    },
+
+    /// Reject a pending proposal without applying it
+    Reject {
+        /// Proposal id (or a unique prefix)
+        id: String,
+        /// Optional reason, recorded on the proposal
+        #[arg(short, long)]
+        reason: Option<String>,
     },
 
     /// View runtime data
@@ -438,6 +486,15 @@ pub enum DaemonCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ProposalCommands {
+    /// Show a proposal's full preview + rationale
+    Show {
+        /// Proposal id (or a unique prefix)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ToolCommands {
     /// Create a new tool
     Create {
@@ -455,6 +512,23 @@ pub enum ToolCommands {
         /// Auto-generate a starter handler script (bash)
         #[arg(long)]
         scaffold: bool,
+        /// Environment variable this tool is allowed to read (repeatable).
+        /// Everything not listed is withheld from the handler.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// Effect classification: read-only | write | destructive (default read-only)
+        #[arg(long, default_value = "read-only")]
+        side_effect: String,
+        /// Make this an HTTP tool: --handler is the request URL (no script is spawned).
+        #[arg(long)]
+        http: bool,
+        /// HTTP method for --http tools (default POST).
+        #[arg(long, default_value = "POST")]
+        http_method: String,
+        /// HTTP header for --http tools, "Key: Value" (repeatable). Values may
+        /// reference an allowlisted secret as ${NAME}, e.g. "Authorization: Bearer ${TAVILY_API_KEY}".
+        #[arg(long = "http-header")]
+        http_headers: Vec<String>,
     },
     /// Get tool details by ID or name
     Get { id: String },
@@ -473,6 +547,18 @@ pub enum ToolCommands {
         handler: Option<String>,
         #[arg(long)]
         enabled: Option<bool>,
+        /// Replace the secret allowlist (repeatable). Omit to leave unchanged.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// Effect classification: read-only | write | destructive. Omit to leave unchanged.
+        #[arg(long)]
+        side_effect: Option<String>,
+        /// Set the HTTP method (implies HTTP tool). Omit to leave unchanged.
+        #[arg(long)]
+        http_method: Option<String>,
+        /// Replace HTTP headers, "Key: Value" (repeatable, implies HTTP tool).
+        #[arg(long = "http-header")]
+        http_headers: Vec<String>,
     },
     /// Delete tool
     Delete { id: String },
@@ -485,6 +571,9 @@ pub enum ToolCommands {
         /// Wait for completion
         #[arg(short, long)]
         wait: bool,
+        /// Skip the confirmation prompt for write/destructive tools
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// View tool execution logs
     Logs {

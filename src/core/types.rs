@@ -21,6 +21,8 @@ pub enum DaemonResponse {
     ScriptDetails { script: serde_json::Value },
     ScriptExecutionStarted { execution_id: String },
     ScriptExecutionLog { lines: Vec<String> },
+    ProposalList { proposals: Vec<serde_json::Value> },
+    ProposalDetails { proposal: serde_json::Value },
     Status { running: bool, pid: Option<u32>, version: String },
 }
 
@@ -53,6 +55,10 @@ pub enum DaemonRequest {
     ListScripts,
     RunScript { id: String },
     GetScriptLogs { script_id: String, execution_id: Option<String>, lines: usize },
+    ListProposals { status: Option<String> },
+    GetProposal { id: String },
+    ApproveProposal { id: String },
+    RejectProposal { id: String, reason: Option<String> },
     Ping,
     Shutdown,
 }

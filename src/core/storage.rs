@@ -8,6 +8,7 @@ use sqlx::{
 use std::path::Path;
 
 use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource, ScriptDefinition, ScriptExecution, ScriptExecutionStatus};
+use super::proposal::{Proposal, ProposalStatus};
 use super::error::{AgentaError, Result};
 
 /// Storage trait - can be implemented for different backends
@@ -84,6 +85,18 @@ pub trait Storage: Send + Sync {
 
     /// List executions for a tool
     async fn list_tool_executions(&self, tool_id: &str, limit: i64) -> Result<Vec<ToolExecution>>;
+
+    /// Create a proposal (a human-gated mutation drafted by an agent)
+    async fn create_proposal(&self, proposal: &Proposal) -> Result<()>;
+
+    /// Get a proposal by id (accepts a unique id prefix)
+    async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>>;
+
+    /// Update a proposal (status/result after a decision)
+    async fn update_proposal(&self, proposal: &Proposal) -> Result<()>;
+
+    /// List proposals, optionally filtered to a single status, newest first
+    async fn list_proposals(&self, status: Option<ProposalStatus>) -> Result<Vec<Proposal>>;
 
     /// Create a script
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()>;
@@ -243,6 +256,17 @@ impl SqliteStorage {
         .execute(&self.pool)
         .await?;
 
+        // Migration: secrets allowlist + side-effect classification + http handler (SQLite).
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN secrets TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN side_effect TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN http_config TEXT")
+            .execute(&self.pool)
+            .await;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS tool_executions (
@@ -265,6 +289,28 @@ impl SqliteStorage {
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_exec_tool_id ON tool_executions(tool_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // Proposals: human-gated mutations drafted by agents (MIND). SQLite.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS proposals (
+                id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                risk TEXT NOT NULL,
+                status TEXT NOT NULL,
+                proposed_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                result TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
             .execute(&self.pool)
             .await?;
 
@@ -437,6 +483,17 @@ impl PostgresStorage {
         .execute(&self.pool)
         .await?;
 
+        // Migration: secrets allowlist + side-effect classification + http handler (Postgres).
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS secrets TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS side_effect TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS http_config TEXT")
+            .execute(&self.pool)
+            .await;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS tool_executions (
@@ -459,6 +516,28 @@ impl PostgresStorage {
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tool_exec_tool_id ON tool_executions(tool_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // Proposals: human-gated mutations drafted by agents (MIND). Postgres.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS proposals (
+                id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                risk TEXT NOT NULL,
+                status TEXT NOT NULL,
+                proposed_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                result TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
             .execute(&self.pool)
             .await?;
 
@@ -809,8 +888,8 @@ impl Storage for SqliteStorage {
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tools (id, name, description, parameters, handler, enabled, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
         )
         .bind(&tool.id)
@@ -819,6 +898,9 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&tool.parameters)?)
         .bind(&tool.handler)
         .bind(if tool.enabled { 1i64 } else { 0i64 })
+        .bind(serde_json::to_string(&tool.secrets)?)
+        .bind(serde_json::to_string(&tool.side_effect)?)
+        .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
         .bind(tool.created_at.to_rfc3339())
         .bind(tool.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -829,7 +911,7 @@ impl Storage for SqliteStorage {
     async fn get_tool(&self, id: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools WHERE id = ?1
             "#,
         )
@@ -842,7 +924,7 @@ impl Storage for SqliteStorage {
     async fn get_tool_by_name(&self, name: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools WHERE name = ?1
             "#,
         )
@@ -861,8 +943,11 @@ impl Storage for SqliteStorage {
                 parameters = ?3,
                 handler = ?4,
                 enabled = ?5,
-                updated_at = ?6
-            WHERE id = ?7
+                secrets = ?6,
+                side_effect = ?7,
+                http_config = ?8,
+                updated_at = ?9
+            WHERE id = ?10
             "#,
         )
         .bind(&tool.name)
@@ -870,6 +955,9 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&tool.parameters)?)
         .bind(&tool.handler)
         .bind(if tool.enabled { 1i64 } else { 0i64 })
+        .bind(serde_json::to_string(&tool.secrets)?)
+        .bind(serde_json::to_string(&tool.side_effect)?)
+        .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
         .bind(tool.updated_at.to_rfc3339())
         .bind(&tool.id)
         .execute(&self.pool)
@@ -888,7 +976,7 @@ impl Storage for SqliteStorage {
     async fn list_tools(&self) -> Result<Vec<ToolResource>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools
             ORDER BY created_at DESC
             "#,
@@ -971,6 +1059,84 @@ impl Storage for SqliteStorage {
             .into_iter()
             .filter_map(|r| row_to_tool_execution_sqlite(&r))
             .collect())
+    }
+
+    async fn create_proposal(&self, proposal: &Proposal) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO proposals (id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(&proposal.id)
+        .bind(serde_json::to_string(&proposal.action)?)
+        .bind(&proposal.rationale)
+        .bind(serde_json::to_string(&proposal.risk)?)
+        .bind(serde_json::to_string(&proposal.status)?)
+        .bind(&proposal.proposed_by)
+        .bind(proposal.created_at.to_rfc3339())
+        .bind(proposal.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(&proposal.result)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+            FROM proposals WHERE id = ?1 OR id LIKE ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(id)
+        .bind(format!("{}%", id))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_proposal_sqlite(&r)))
+    }
+
+    async fn update_proposal(&self, proposal: &Proposal) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proposals SET status = ?1, resolved_at = ?2, result = ?3 WHERE id = ?4
+            "#,
+        )
+        .bind(serde_json::to_string(&proposal.status)?)
+        .bind(proposal.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(&proposal.result)
+        .bind(&proposal.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_proposals(&self, status: Option<ProposalStatus>) -> Result<Vec<Proposal>> {
+        let rows = match status {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+                    FROM proposals WHERE status = ?1 ORDER BY created_at DESC
+                    "#,
+                )
+                .bind(serde_json::to_string(&s)?)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+                    FROM proposals ORDER BY created_at DESC
+                    "#,
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().filter_map(|r| row_to_proposal_sqlite(&r)).collect())
     }
 
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
@@ -1443,8 +1609,8 @@ impl Storage for PostgresStorage {
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tools (id, name, description, parameters, handler, enabled, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(&tool.id)
@@ -1453,6 +1619,9 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&tool.parameters)?)
         .bind(&tool.handler)
         .bind(tool.enabled)
+        .bind(serde_json::to_string(&tool.secrets)?)
+        .bind(serde_json::to_string(&tool.side_effect)?)
+        .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
         .bind(tool.created_at.to_rfc3339())
         .bind(tool.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -1463,7 +1632,7 @@ impl Storage for PostgresStorage {
     async fn get_tool(&self, id: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools WHERE id = $1
             "#,
         )
@@ -1476,7 +1645,7 @@ impl Storage for PostgresStorage {
     async fn get_tool_by_name(&self, name: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools WHERE name = $1
             "#,
         )
@@ -1495,8 +1664,11 @@ impl Storage for PostgresStorage {
                 parameters = $3,
                 handler = $4,
                 enabled = $5,
-                updated_at = $6
-            WHERE id = $7
+                secrets = $6,
+                side_effect = $7,
+                http_config = $8,
+                updated_at = $9
+            WHERE id = $10
             "#,
         )
         .bind(&tool.name)
@@ -1504,6 +1676,9 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&tool.parameters)?)
         .bind(&tool.handler)
         .bind(tool.enabled)
+        .bind(serde_json::to_string(&tool.secrets)?)
+        .bind(serde_json::to_string(&tool.side_effect)?)
+        .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
         .bind(tool.updated_at.to_rfc3339())
         .bind(&tool.id)
         .execute(&self.pool)
@@ -1522,7 +1697,7 @@ impl Storage for PostgresStorage {
     async fn list_tools(&self) -> Result<Vec<ToolResource>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
             FROM tools
             ORDER BY created_at DESC
             "#,
@@ -1605,6 +1780,84 @@ impl Storage for PostgresStorage {
             .into_iter()
             .filter_map(|r| row_to_tool_execution_pg(&r))
             .collect())
+    }
+
+    async fn create_proposal(&self, proposal: &Proposal) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO proposals (id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+        )
+        .bind(&proposal.id)
+        .bind(serde_json::to_string(&proposal.action)?)
+        .bind(&proposal.rationale)
+        .bind(serde_json::to_string(&proposal.risk)?)
+        .bind(serde_json::to_string(&proposal.status)?)
+        .bind(&proposal.proposed_by)
+        .bind(proposal.created_at.to_rfc3339())
+        .bind(proposal.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(&proposal.result)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_proposal(&self, id: &str) -> Result<Option<Proposal>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+            FROM proposals WHERE id = $1 OR id LIKE $2
+            LIMIT 1
+            "#,
+        )
+        .bind(id)
+        .bind(format!("{}%", id))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| row_to_proposal_pg(&r)))
+    }
+
+    async fn update_proposal(&self, proposal: &Proposal) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proposals SET status = $1, resolved_at = $2, result = $3 WHERE id = $4
+            "#,
+        )
+        .bind(serde_json::to_string(&proposal.status)?)
+        .bind(proposal.resolved_at.map(|d| d.to_rfc3339()))
+        .bind(&proposal.result)
+        .bind(&proposal.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_proposals(&self, status: Option<ProposalStatus>) -> Result<Vec<Proposal>> {
+        let rows = match status {
+            Some(s) => {
+                sqlx::query(
+                    r#"
+                    SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+                    FROM proposals WHERE status = $1 ORDER BY created_at DESC
+                    "#,
+                )
+                .bind(serde_json::to_string(&s)?)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    SELECT id, action, rationale, risk, status, proposed_by, created_at, resolved_at, result
+                    FROM proposals ORDER BY created_at DESC
+                    "#,
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().filter_map(|r| row_to_proposal_pg(&r)).collect())
     }
 
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
@@ -1916,6 +2169,14 @@ fn row_to_tool_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<ToolResource> {
         parameters: serde_json::from_str(get_str("parameters")?).ok()?,
         handler: get_optional_str("handler").map(|s| s.to_string()),
         enabled: get_i64("enabled").unwrap_or(1) != 0,
+        secrets: get_optional_str("secrets")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+        side_effect: get_optional_str("side_effect")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+        http: get_optional_str("http_config")
+            .and_then(|s| serde_json::from_str(s).ok()),
         created_at: get_str("created_at")?.parse().ok()?,
         updated_at: get_str("updated_at")?.parse().ok()?,
     })
@@ -1937,6 +2198,14 @@ fn row_to_tool_pg(row: &sqlx::postgres::PgRow) -> Option<ToolResource> {
         parameters: serde_json::from_str(&get_string("parameters")?).ok()?,
         handler: get_optional_string("handler"),
         enabled,
+        secrets: get_optional_string("secrets")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        side_effect: get_optional_string("side_effect")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        http: get_optional_string("http_config")
+            .and_then(|s| serde_json::from_str(&s).ok()),
         created_at: get_string("created_at")?.parse().ok()?,
         updated_at: get_string("updated_at")?.parse().ok()?,
     })
@@ -1977,6 +2246,40 @@ fn row_to_tool_execution_pg(row: &sqlx::postgres::PgRow) -> Option<ToolExecution
         output: get_optional_string("output"),
         status: serde_json::from_str(&status).ok()?,
         error: get_optional_string("error"),
+    })
+}
+
+fn row_to_proposal_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Proposal> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+
+    Some(Proposal {
+        id: get_string("id")?,
+        action: serde_json::from_str(&get_string("action")?).ok()?,
+        rationale: get_string("rationale")?,
+        risk: serde_json::from_str(&get_string("risk")?).ok()?,
+        status: serde_json::from_str(&get_string("status")?).ok()?,
+        proposed_by: get_string("proposed_by")?,
+        created_at: get_string("created_at")?.parse().ok()?,
+        resolved_at: get_optional_string("resolved_at").and_then(|s| s.parse().ok()),
+        result: get_optional_string("result"),
+    })
+}
+
+fn row_to_proposal_pg(row: &sqlx::postgres::PgRow) -> Option<Proposal> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    let get_optional_string = |col: &str| row.try_get::<Option<String>, _>(col).ok().flatten();
+
+    Some(Proposal {
+        id: get_string("id")?,
+        action: serde_json::from_str(&get_string("action")?).ok()?,
+        rationale: get_string("rationale")?,
+        risk: serde_json::from_str(&get_string("risk")?).ok()?,
+        status: serde_json::from_str(&get_string("status")?).ok()?,
+        proposed_by: get_string("proposed_by")?,
+        created_at: get_string("created_at")?.parse().ok()?,
+        resolved_at: get_optional_string("resolved_at").and_then(|s| s.parse().ok()),
+        result: get_optional_string("result"),
     })
 }
 
