@@ -49,14 +49,16 @@ async fn main() {
             }
         }
         None => {
-            // First-run guard: if MIND doesn't exist, prompt setup before opening TUI
+            // Bare `agenta` opens the MIND chat. First-run guard: if MIND doesn't
+            // exist yet, point the user at setup. (The TUI dashboard is now
+            // `agenta dashboard`.)
             if !cli::commands::mind_exists(&config).await {
                 eprintln!("Looks like this is your first time here.");
                 eprintln!("Run {} to get started.", "agenta setup");
                 std::process::exit(0);
             }
-            if let Err(e) = cli::tui::run_tui(config).await {
-                eprintln!("TUI error: {}", e);
+            if let Err(e) = cli::chat::run_chat(&config).await {
+                eprintln!("Chat error: {}", e);
                 std::process::exit(1);
             }
         }

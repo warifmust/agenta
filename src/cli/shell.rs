@@ -22,10 +22,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/update-tool",  "Update an existing tool"),
     ("/list",         "List all agents"),
     ("/list-tools",   "List all tools"),
+    ("/list-proposals", "List pending proposals"),
     ("/list-kb",      "List knowledge bases (RAG)"),
     ("/attach-kb",    "Attach a knowledge base to an agent"),
     ("/detach-kb",    "Detach a knowledge base from an agent"),
     ("/get",          "Show agent details"),
+    ("/get-tool",     "Show tool details"),
     ("/run",          "Run an agent"),
     ("/stop",         "Stop a running agent"),
     ("/logs",         "View agent logs"),
@@ -38,17 +40,20 @@ const COMMANDS: &[(&str, &str)] = &[
 const PROMPT: &str = "agenta> ";
 
 /// Outcome of reading one line from the palette reader.
-enum LineResult {
+pub(crate) enum LineResult {
     Line(String),
-    Eof, // Ctrl-C / Ctrl-D → exit shell
+    Eof, // Ctrl-C / Ctrl-D → exit
 }
 
-/// Commands whose name starts with `prefix` (used to populate the dropdown).
-fn matches(prefix: &str) -> Vec<&'static (&'static str, &'static str)> {
+/// Commands from `commands` whose name starts with `prefix` (populates the dropdown).
+fn matches_in<'a>(
+    commands: &'a [(&'a str, &'a str)],
+    prefix: &str,
+) -> Vec<&'a (&'a str, &'a str)> {
     if prefix.contains(' ') {
         return vec![];
     }
-    COMMANDS.iter().filter(|(cmd, _)| cmd.starts_with(prefix)).collect()
+    commands.iter().filter(|(cmd, _)| cmd.starts_with(prefix)).collect()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -57,7 +62,7 @@ pub async fn run_shell(config: AppConfig) -> Result<()> {
     print_banner();
 
     let mut history: Vec<String> = load_history();
-    let mut reader = PaletteReader::new();
+    let mut reader = PaletteReader::new(PROMPT, COMMANDS, (0x7C, 0xE3, 0x8B));
 
     loop {
         match reader.read_line(&history)? {
@@ -85,8 +90,19 @@ pub async fn run_shell(config: AppConfig) -> Result<()> {
         }
     }
 
+    // Last meaningful command (skip the quit command that triggered the exit).
+    let last_cmd = history
+        .iter()
+        .rev()
+        .find(|c| !matches!(c.as_str(), "/quit" | "/exit" | "/q"))
+        .cloned();
     save_history(&history);
-    println!("Goodbye.");
+    println!();
+    println!("{}", "  👋  Until next time — your agents keep running in the background.".dimmed());
+    if let Some(cmd) = last_cmd {
+        println!();
+        println!("  {} {}", "Last shell execution:".dimmed(), cmd);
+    }
     Ok(())
 }
 
@@ -97,24 +113,42 @@ pub async fn run_shell(config: AppConfig) -> Result<()> {
 // ↑/↓ move the highlight, Enter/Tab runs the highlighted command. When the buffer
 // isn't a slash-command, it behaves like an ordinary prompt (↑/↓ = history).
 
-struct PaletteReader {
+pub(crate) struct PaletteReader {
+    prompt: &'static str,
+    commands: &'static [(&'static str, &'static str)],
+    prompt_rgb: (u8, u8, u8),
     buf: String,
-    cursor: usize,   // char index into buf
-    selected: usize, // index into the current matches
-    menu_rows: u16,  // rows the dropdown drew last render (for cleanup)
+    cursor: usize,    // char index into buf
+    selected: usize,  // index into the current matches
+    cursor_row: u16,  // row offset of the cursor below the prompt's first row (last render)
     hist_idx: Option<usize>,
 }
 
 impl PaletteReader {
-    fn new() -> Self {
-        Self { buf: String::new(), cursor: 0, selected: 0, menu_rows: 0, hist_idx: None }
+    /// `prompt` is the plain prompt text (rendered in `prompt_rgb`); `commands`
+    /// populates the `/` dropdown.
+    pub(crate) fn new(
+        prompt: &'static str,
+        commands: &'static [(&'static str, &'static str)],
+        prompt_rgb: (u8, u8, u8),
+    ) -> Self {
+        Self {
+            prompt,
+            commands,
+            prompt_rgb,
+            buf: String::new(),
+            cursor: 0,
+            selected: 0,
+            cursor_row: 0,
+            hist_idx: None,
+        }
     }
 
-    fn read_line(&mut self, history: &[String]) -> Result<LineResult> {
+    pub(crate) fn read_line(&mut self, history: &[String]) -> Result<LineResult> {
         self.buf.clear();
         self.cursor = 0;
         self.selected = 0;
-        self.menu_rows = 0;
+        self.cursor_row = 0;
         self.hist_idx = None;
 
         enable_raw_mode()?;
@@ -135,7 +169,7 @@ impl PaletteReader {
                 _ => continue,
             };
 
-            let menu = matches(&self.buf);
+            let menu = matches_in(self.commands, &self.buf);
             let menu_open = self.buf.starts_with('/') && !menu.is_empty();
 
             match ev.code {
@@ -258,37 +292,45 @@ impl PaletteReader {
     /// Clear the dropdown, commit the prompt line into scrollback, return the line.
     fn finish_line(&mut self, line: String) -> Result<LineResult> {
         let mut out = stdout();
-        self.clear_menu(&mut out)?;
-        queue!(out, cursor::MoveToColumn(0))?;
-        write!(out, "{}{}\r\n", PROMPT, self.buf)?;
+        self.clear_all(&mut out)?;
+        let (r, g, b) = self.prompt_rgb;
+        write!(out, "{}{}\r\n", self.prompt.truecolor(r, g, b), self.buf)?;
         out.flush()?;
         Ok(LineResult::Line(line))
     }
 
     fn finish_eof(&mut self) -> Result<LineResult> {
         let mut out = stdout();
-        self.clear_menu(&mut out)?;
+        self.clear_all(&mut out)?;
         write!(out, "\r\n")?;
         out.flush()?;
         Ok(LineResult::Eof)
     }
 
-    fn clear_menu(&mut self, out: &mut impl Write) -> Result<()> {
+    /// Return to the prompt's first row (the cursor may be several rows down when
+    /// the input wrapped or the dropdown is open) and wipe everything below it.
+    fn clear_all(&mut self, out: &mut impl Write) -> Result<()> {
+        if self.cursor_row > 0 {
+            queue!(out, cursor::MoveUp(self.cursor_row))?;
+        }
         queue!(out, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-        self.menu_rows = 0;
+        self.cursor_row = 0;
         Ok(())
     }
 
     fn render(&mut self) -> Result<()> {
         let mut out = stdout();
-        let menu = matches(&self.buf);
+        let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).max(1);
+        let (r, g, b) = self.prompt_rgb;
+
+        // Go back to the prompt's first row and clear the whole region we drew.
+        self.clear_all(&mut out)?;
+
+        // Prompt + buffer (the terminal wraps long input automatically).
+        write!(out, "{}{}", self.prompt.truecolor(r, g, b), self.buf)?;
+
+        let menu = matches_in(self.commands, &self.buf);
         let menu_open = self.buf.starts_with('/') && !menu.is_empty();
-
-        // Repaint from the prompt line down.
-        queue!(out, cursor::MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-        write!(out, "{}{}", PROMPT.green(), self.buf)?;
-
-        let rows = if menu_open { menu.len() as u16 } else { 0 };
         if menu_open {
             for (i, (cmd, desc)) in menu.iter().enumerate() {
                 write!(out, "\r\n")?;
@@ -301,14 +343,26 @@ impl PaletteReader {
                     write!(out, "{}", label.dimmed())?;
                 }
             }
-            // Move back up to the prompt line.
-            queue!(out, cursor::MoveUp(rows))?;
         }
-        self.menu_rows = rows;
 
-        // Place the cursor at its column on the prompt line.
-        let col = (PROMPT.chars().count() + self.cursor) as u16;
-        queue!(out, cursor::MoveToColumn(col))?;
+        // Row bookkeeping (rows are offsets below the prompt's first row).
+        let prompt_len = self.prompt.chars().count();
+        let input_rows = ((prompt_len + self.buf.chars().count()) / width) as u16;
+        let menu_rows = if menu_open { menu.len() as u16 } else { 0 };
+        // The cursor is currently at the end of everything we wrote.
+        let end_row = if menu_open { input_rows + menu_rows } else { input_rows };
+
+        // Move it to the text cursor's position (accounting for wrap).
+        let cursor_total = prompt_len + self.cursor;
+        let cur_row = (cursor_total / width) as u16;
+        let cur_col = (cursor_total % width) as u16;
+        let up = end_row.saturating_sub(cur_row);
+        if up > 0 {
+            queue!(out, cursor::MoveUp(up))?;
+        }
+        queue!(out, cursor::MoveToColumn(cur_col))?;
+        self.cursor_row = cur_row;
+
         out.flush()?;
         Ok(())
     }
@@ -316,12 +370,13 @@ impl PaletteReader {
 
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
-async fn dispatch(input: &str, config: &AppConfig) -> Result<bool> {
+pub(crate) async fn dispatch(input: &str, config: &AppConfig) -> Result<bool> {
     match input {
         "/quit" | "/exit" | "/q" => return Ok(true),
         "/help" | "/h"           => print_help(),
         "/list"                  => cmd_list(config).await?,
         "/list-tools"            => cmd_list_tools(config).await?,
+        "/list-proposals"        => super::commands::list_proposals(config, false).await?,
         "/list-kb"               => cmd_list_kb(config).await?,
         "/attach-kb"             => picker_attach_kb(config).await?,
         "/detach-kb"             => picker_detach_kb(config).await?,
@@ -333,6 +388,7 @@ async fn dispatch(input: &str, config: &AppConfig) -> Result<bool> {
         "/update-tool"           => println!("{}", "Coming soon.".dimmed()),
         "/create-script"         => println!("{}", "Scripts coming soon.".dimmed()),
         "/get"                   => picker_get(config).await?,
+        "/get-tool"              => picker_get_tool(config).await?,
         "/delete"                => picker_delete(config).await?,
         "/run"                   => picker_run(config).await?,
         "/stop"                  => picker_stop(config).await?,
@@ -460,6 +516,7 @@ async fn cmd_list_kb(config: &AppConfig) -> Result<()> {
     use comfy_table::Table;
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     table.set_header(vec!["NAME", "EMBEDDER", "DIM"]);
     for kb in &kbs {
         table.add_row(vec![kb.name.as_str(), kb.embedder.as_str(), &kb.dimension.to_string()]);
@@ -563,6 +620,7 @@ async fn cmd_list(config: &AppConfig) -> Result<()> {
     }
     use comfy_table::{Table, Cell, CellAlignment};
     let mut table = Table::new();
+    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
     table.set_header(vec!["NAME", "MODEL", "STATUS", "PROVIDER", "MODE"]);
     for agent in &agents {
@@ -585,14 +643,24 @@ async fn cmd_list_tools(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
     use comfy_table::Table;
+    // Keep the DESCRIPTION column compact — truncate long descriptions with an ellipsis
+    // so a single verbose tool doesn't blow out the whole table width.
+    const DESC_MAX: usize = 50;
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
     table.set_header(vec!["NAME", "DESCRIPTION", "ENABLED"]);
     for tool in &tools {
+        let desc = tool["description"].as_str().unwrap_or("-");
+        let desc = if desc.chars().count() > DESC_MAX {
+            format!("{}…", desc.chars().take(DESC_MAX - 1).collect::<String>().trim_end())
+        } else {
+            desc.to_string()
+        };
         table.add_row(vec![
-            tool["name"].as_str().unwrap_or("-"),
-            tool["description"].as_str().unwrap_or("-"),
-            if tool["enabled"].as_bool().unwrap_or(true) { "yes" } else { "no" },
+            tool["name"].as_str().unwrap_or("-").to_string(),
+            desc,
+            if tool["enabled"].as_bool().unwrap_or(true) { "yes".to_string() } else { "no".to_string() },
         ]);
     }
     println!("{table}");
@@ -743,8 +811,24 @@ async fn wizard_update_agent(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Read a multi-line value like a heredoc: type or paste across as many lines as you
+/// want (blank lines kept, so paragraphs work), then press Ctrl-D on a new line to
+/// finish. Better than a single-line prompt for descriptions written in a terminal.
+fn prompt_multiline(label: &str) -> Result<String> {
+    use std::io::BufRead;
+    println!("{}", label.bold());
+    println!("{}", "  (write across multiple lines; press Ctrl-D when done)".dimmed());
+    let stdin = std::io::stdin();
+    let mut out = String::new();
+    for line in stdin.lock().lines() {
+        out.push_str(&line?);
+        out.push('\n');
+    }
+    Ok(out.trim_end().to_string())
+}
+
 async fn wizard_create_tool(config: &AppConfig) -> Result<()> {
-    use inquire::{Confirm, Text};
+    use inquire::{Confirm, Select, Text};
 
     println!("{}", "  Creating a new tool...".dimmed());
 
@@ -753,25 +837,66 @@ async fn wizard_create_tool(config: &AppConfig) -> Result<()> {
         return Err(anyhow::anyhow!("Name cannot be empty"));
     }
 
-    let description = Text::new("Description:").prompt()?;
+    let description = prompt_multiline("Description:")?;
 
     let handler = Text::new("Handler script path (leave blank to auto-scaffold):").prompt()?;
 
-    let scaffold = if handler.trim().is_empty() {
-        Confirm::new("Auto-generate starter script?").with_default(true).prompt()?
+    // Resolve the handler: an explicit path, an auto-scaffolded starter script, or none.
+    let resolved_handler = if handler.trim().is_empty() {
+        let scaffold = Confirm::new("Auto-generate starter script?")
+            .with_default(true)
+            .prompt()?;
+        if scaffold {
+            Some(super::commands::scaffold_tool_handler(name.trim(), None)?)
+        } else {
+            None
+        }
     } else {
-        false
+        Some(handler.trim().to_string())
     };
 
-    let tool = serde_json::json!({
-        "name": name.trim(),
-        "description": description,
-        "parameters": { "type": "object", "properties": {}, "required": [] },
-        "handler": if handler.trim().is_empty() { serde_json::Value::Null } else { serde_json::Value::String(handler.trim().to_string()) },
-        "scaffold": scaffold,
-    });
+    // Effect classification — drives the confirm-before-run guard for risky tools.
+    let side_effect = match Select::new(
+        "Effect on the world:",
+        vec![
+            "read-only  (no state change — compute, search, read)",
+            "write      (mutates state / sends to an external system)",
+            "destructive(irreversible — delete, deploy, transfer)",
+        ],
+    )
+    .prompt()?
+    {
+        s if s.starts_with("write") => crate::core::SideEffect::Write,
+        s if s.starts_with("destructive") => crate::core::SideEffect::Destructive,
+        _ => crate::core::SideEffect::ReadOnly,
+    };
 
-    match daemon_request(config, DaemonRequest::CreateTool { tool }).await? {
+    // Secret allowlist — the only env vars the handler will receive.
+    let secrets_raw = Text::new("Secrets allowlist (env var names, comma-separated; blank for none):")
+        .prompt()?;
+    let secrets: Vec<String> = secrets_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Build a full ToolResource (this generates the id + timestamps the daemon needs).
+    let mut tool = crate::core::ToolResource::new(
+        name.trim().to_string(),
+        description,
+        serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        resolved_handler,
+    );
+    tool.side_effect = side_effect;
+    tool.secrets = secrets;
+
+    match daemon_request(
+        config,
+        DaemonRequest::CreateTool { tool: serde_json::to_value(&tool)? },
+    )
+    .await?
+    {
+        DaemonResponse::Success { message } => println!("{}", message.green()),
         DaemonResponse::ToolDetails { tool } => {
             println!("{} Tool '{}' created.", "✓".green(), tool["name"].as_str().unwrap_or("").bold());
         }
@@ -1010,36 +1135,104 @@ fn print_execution_detail(e: &serde_json::Value) {
 
 // ── Detail printer ────────────────────────────────────────────────────────────
 
+/// Turn a JSON value into a display string ("-" for null).
+fn detail_cell(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "-".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A Property/Value table that wraps long values to the terminal — matches `agenta
+/// tool get`.
+fn detail_table() -> comfy_table::Table {
+    let mut table = comfy_table::Table::new();
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    table.set_header(vec!["Property", "Value"]);
+    table
+}
+
 fn print_agent_detail(agent: &serde_json::Value) {
-    let fields = [
-        ("ID",       "id"),
-        ("Name",     "name"),
-        ("Model",    "model"),
-        ("Provider", "provider"),
-        ("Status",   "status"),
-        ("Mode",     "execution_mode"),
-        ("Schedule", "schedule"),
-        ("Memory",   "memory_enabled"),
-        ("Deep",     "deep_agent_config"),
-    ];
-
-    println!();
-    for (label, key) in &fields {
-        let val = match &agent[key] {
-            serde_json::Value::Null => "-".to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            // deep_agent_config is an object — show "true" if set, "-" if null
-            serde_json::Value::Object(_) if *key == "deep_agent_config" => "true".to_string(),
-            other => other.to_string(),
-        };
-        println!("  {:12} {}", format!("{label}:").bold(), val);
+    let mut table = detail_table();
+    table.add_row(vec!["ID".to_string(), detail_cell(&agent["id"])]);
+    table.add_row(vec!["Name".to_string(), detail_cell(&agent["name"])]);
+    table.add_row(vec!["Model".to_string(), detail_cell(&agent["model"])]);
+    table.add_row(vec!["Provider".to_string(), detail_cell(&agent["provider"])]);
+    table.add_row(vec!["Status".to_string(), detail_cell(&agent["status"])]);
+    table.add_row(vec!["Mode".to_string(), detail_cell(&agent["execution_mode"])]);
+    table.add_row(vec!["Schedule".to_string(), detail_cell(&agent["schedule"])]);
+    table.add_row(vec!["Memory".to_string(), detail_cell(&agent["memory_enabled"])]);
+    table.add_row(vec![
+        "Deep".to_string(),
+        if agent["deep_agent_config"].is_object() { "true".to_string() } else { "-".to_string() },
+    ]);
+    if let Some(kbs) = agent["config"]["knowledge_bases"].as_array() {
+        if !kbs.is_empty() {
+            let names: Vec<&str> = kbs.iter().filter_map(|v| v.as_str()).collect();
+            table.add_row(vec!["Knowledge Bases".to_string(), names.join(", ")]);
+        }
     }
-
     if let Some(prompt) = agent["system_prompt"].as_str() {
-        let preview: String = prompt.chars().take(120).collect();
-        let ellipsis = if prompt.len() > 120 { "…" } else { "" };
-        println!("  {:12} {}{}", "Prompt:".bold(), preview, ellipsis);
+        table.add_row(vec!["Prompt".to_string(), prompt.to_string()]);
     }
-    println!();
+    println!("{table}");
+}
+
+fn print_tool_detail(tool: &serde_json::Value) {
+    let mut table = detail_table();
+    table.add_row(vec!["ID".to_string(), detail_cell(&tool["id"])]);
+    table.add_row(vec!["Name".to_string(), detail_cell(&tool["name"])]);
+    table.add_row(vec!["Description".to_string(), detail_cell(&tool["description"])]);
+    table.add_row(vec!["Enabled".to_string(), detail_cell(&tool["enabled"])]);
+    let side_effect = tool["side_effect"].as_str().unwrap_or("read_only");
+    table.add_row(vec!["Side Effect".to_string(), side_effect.to_string()]);
+    let secrets = match tool["secrets"].as_array() {
+        Some(arr) if !arr.is_empty() => arr
+            .iter()
+            .filter_map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "none".to_string(),
+    };
+    table.add_row(vec!["Secrets".to_string(), secrets]);
+    if let Some(http) = tool.get("http").filter(|h| !h.is_null()) {
+        let method = http["method"].as_str().unwrap_or("POST");
+        table.add_row(vec!["Type".to_string(), format!("HTTP ({method})")]);
+        table.add_row(vec!["URL".to_string(), detail_cell(&tool["handler"])]);
+        if let Some(headers) = http["headers"].as_object().filter(|h| !h.is_empty()) {
+            let hdrs = headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            table.add_row(vec!["Headers".to_string(), hdrs]);
+        }
+    } else {
+        table.add_row(vec!["Type".to_string(), "script".to_string()]);
+        table.add_row(vec!["Handler".to_string(), detail_cell(&tool["handler"])]);
+    }
+    println!("{table}");
+    if let Some(params) = tool.get("parameters").filter(|p| !p.is_null()) {
+        println!("\n{}", "Parameters schema:".bold());
+        println!("{}", serde_json::to_string_pretty(params).unwrap_or_else(|_| params.to_string()));
+    }
+}
+
+async fn picker_get_tool(config: &AppConfig) -> Result<()> {
+    use inquire::Select;
+    let tools = fetch_tools(config).await?;
+    if tools.is_empty() {
+        println!("{}", "No tools found.".dimmed());
+        return Ok(());
+    }
+    let names = tool_names(&tools);
+    let selected =
+        Select::new("Select tool:", names.iter().map(|s| s.as_str()).collect()).prompt()?;
+    if let Some(tool) = tools.iter().find(|t| t["name"].as_str() == Some(selected)) {
+        print_tool_detail(tool);
+    }
+    Ok(())
 }
