@@ -60,8 +60,9 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
         (
             "spawn_agent",
             "Spawn a sub-agent to handle a specific sub-task and return its output. \
-             Use `name` to delegate to an existing named agent (e.g. CORAL, WILL), \
-             or `role` to spin up a throwaway agent with a custom system prompt. \
+             Use `name` to delegate to an EXISTING named agent — call list_agents \
+             first to get the real names on THIS machine; never guess or invent an \
+             agent name. Or use `role` to spin up a throwaway agent with a custom system prompt. \
              Parameters: {\"name\": \"<existing agent name OR omit>\", \
              \"role\": \"<system prompt if no name>\", \
              \"input\": \"<task>\", \

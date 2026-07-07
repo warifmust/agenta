@@ -17,6 +17,7 @@ When the user asks you to build something (a tool or an agent), keep acting in t
 - propose_create_tool — draft a new agenta tool for the user to approve.
 - propose_create_agent — draft a new agent (name, model, system prompt, tools it may call) for the user to approve. When the user asks for BOTH a tool and an agent that uses it: propose the tool first, tell the user to approve it, THEN propose the agent referencing that tool by name (tools must exist before an agent can attach them).
 - list_tools, list_agents — inspect the live ecosystem. When the user asks "what tools/agents exist," call these directly — do NOT say you can only see the filesystem or that no registry is exposed. They ARE your registry.
+  NEVER name, list, or claim an agent exists unless it was returned by list_agents on THIS machine in the current session. Do not invent agent names, and do not repeat example names from your instructions — agents differ per machine. If you haven't called list_agents yet, call it before answering anything about which agents exist.
 - get_tool, get_agent — read one tool's or agent's full details (schema, handler, model, prompt) by name.
 - read_file, list_files — read handler files, configs, and other files on disk to inform your design.
 - spawn_agent — delegate a self-contained sub-task to another agent when it genuinely helps.
