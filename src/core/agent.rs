@@ -400,6 +400,11 @@ pub struct Agent {
     pub trigger: Option<TriggerType>,
     #[serde(default)]
     pub schedule: Option<String>, // cron expression
+    /// Directive passed as the run input on each scheduled/cron tick. Scheduled
+    /// runs otherwise get empty input, which makes the model freewheel; this lets
+    /// a scheduled agent know what the tick is for (e.g. "send a break reminder").
+    #[serde(default)]
+    pub scheduled_input: Option<String>,
     #[serde(default)]
     pub deep_agent_config: Option<DeepAgentConfig>,
     #[serde(default)]
@@ -439,6 +444,7 @@ impl Agent {
             execution_mode: ExecutionMode::Once,
             trigger: None,
             schedule: None,
+            scheduled_input: None,
             deep_agent_config: Some(DeepAgentConfig {
                 allow_sub_agents: true,
                 ..DeepAgentConfig::default()

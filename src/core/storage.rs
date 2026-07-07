@@ -169,6 +169,7 @@ impl SqliteStorage {
                 execution_mode TEXT NOT NULL,
                 trigger TEXT,
                 schedule TEXT,
+                scheduled_input TEXT,
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled INTEGER NOT NULL DEFAULT 0,
@@ -202,6 +203,13 @@ impl SqliteStorage {
         // Migration: add is_system column if it doesn't exist (SQLite)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add scheduled_input column if it doesn't exist (SQLite)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN scheduled_input TEXT"
         )
         .execute(&self.pool)
         .await;
@@ -396,6 +404,7 @@ impl PostgresStorage {
                 execution_mode TEXT NOT NULL,
                 trigger TEXT,
                 schedule TEXT,
+                scheduled_input TEXT,
                 deep_agent_config TEXT,
                 environment TEXT NOT NULL,
                 memory_enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -429,6 +438,13 @@ impl PostgresStorage {
         // Migration: add is_system column if it doesn't exist (Postgres)
         let _ = sqlx::query(
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        .execute(&self.pool)
+        .await;
+
+        // Migration: add scheduled_input column if it doesn't exist (Postgres)
+        let _ = sqlx::query(
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS scheduled_input TEXT"
         )
         .execute(&self.pool)
         .await;
@@ -600,9 +616,9 @@ impl Storage for SqliteStorage {
             r#"
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
-                execution_mode, trigger, schedule, deep_agent_config, environment,
+                execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                 memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
             "#,
         )
         .bind(&agent.id)
@@ -615,6 +631,7 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&agent.execution_mode)?)
         .bind(serde_json::to_string(&agent.trigger)?)
         .bind(&agent.schedule)
+        .bind(&agent.scheduled_input)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(if agent.memory_enabled { 1i64 } else { 0i64 })
@@ -637,7 +654,7 @@ impl Storage for SqliteStorage {
         let row = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = ?1
             "#,
@@ -655,7 +672,7 @@ impl Storage for SqliteStorage {
         let row = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = ?1
             "#,
@@ -689,8 +706,9 @@ impl Storage for SqliteStorage {
                 status = ?14,
                 updated_at = ?15,
                 last_run = ?16,
-                run_count = ?17
-            WHERE id = ?18
+                run_count = ?17,
+                scheduled_input = ?18
+            WHERE id = ?19
             "#,
         )
         .bind(&agent.name)
@@ -710,6 +728,7 @@ impl Storage for SqliteStorage {
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
         .bind(agent.run_count as i64)
+        .bind(&agent.scheduled_input)
         .bind(&agent.id)
         .execute(&self.pool)
         .await?;
@@ -743,7 +762,7 @@ impl Storage for SqliteStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE is_system = 0 ORDER BY created_at DESC
             "#,
@@ -761,7 +780,7 @@ impl Storage for SqliteStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = ?1 ORDER BY created_at DESC
             "#,
@@ -1298,7 +1317,7 @@ impl Storage for SqliteStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = ?1
@@ -1321,9 +1340,9 @@ impl Storage for PostgresStorage {
             r#"
             INSERT INTO agents (
                 id, name, description, model, system_prompt, config, tools,
-                execution_mode, trigger, schedule, deep_agent_config, environment,
+                execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                 memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             "#,
         )
         .bind(&agent.id)
@@ -1336,6 +1355,7 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&agent.execution_mode)?)
         .bind(serde_json::to_string(&agent.trigger)?)
         .bind(&agent.schedule)
+        .bind(&agent.scheduled_input)
         .bind(serde_json::to_string(&agent.deep_agent_config)?)
         .bind(serde_json::to_string(&agent.environment)?)
         .bind(agent.memory_enabled)
@@ -1358,7 +1378,7 @@ impl Storage for PostgresStorage {
         let row = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE id = $1
             "#,
@@ -1376,7 +1396,7 @@ impl Storage for PostgresStorage {
         let row = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE name = $1
             "#,
@@ -1410,8 +1430,9 @@ impl Storage for PostgresStorage {
                 status = $14,
                 updated_at = $15,
                 last_run = $16,
-                run_count = $17
-            WHERE id = $18
+                run_count = $17,
+                scheduled_input = $18
+            WHERE id = $19
             "#,
         )
         .bind(&agent.name)
@@ -1431,6 +1452,7 @@ impl Storage for PostgresStorage {
         .bind(agent.updated_at.to_rfc3339())
         .bind(agent.last_run.map(|d| d.to_rfc3339()))
         .bind(agent.run_count as i64)
+        .bind(&agent.scheduled_input)
         .bind(&agent.id)
         .execute(&self.pool)
         .await?;
@@ -1464,7 +1486,7 @@ impl Storage for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE is_system = FALSE ORDER BY created_at DESC
             "#,
@@ -1482,7 +1504,7 @@ impl Storage for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents WHERE status = $1 ORDER BY created_at DESC
             "#,
@@ -2019,7 +2041,7 @@ impl Storage for PostgresStorage {
         let rows = sqlx::query(
             r#"
             SELECT id, name, description, model, system_prompt, config, tools,
-                   execution_mode, trigger, schedule, deep_agent_config, environment,
+                   execution_mode, trigger, schedule, scheduled_input, deep_agent_config, environment,
                    memory_enabled, is_system, provider, status, created_at, updated_at, last_run, run_count
             FROM agents
             WHERE trigger IS NOT NULL AND status = $1
@@ -2050,6 +2072,7 @@ fn row_to_agent_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Agent> {
         execution_mode: serde_json::from_str(get_str("execution_mode")?).ok()?,
         trigger: get_optional_str("trigger").and_then(|s| serde_json::from_str(s).ok()),
         schedule: get_optional_str("schedule").map(|s| s.to_string()),
+        scheduled_input: get_optional_str("scheduled_input").map(|s| s.to_string()),
         deep_agent_config: get_optional_str("deep_agent_config").and_then(|s| serde_json::from_str(s).ok()),
         environment: serde_json::from_str(get_str("environment")?).ok()?,
         memory_enabled: get_i64("memory_enabled").unwrap_or(0) != 0,
@@ -2094,6 +2117,7 @@ fn row_to_agent_pg(row: &sqlx::postgres::PgRow) -> Option<Agent> {
     let execution_mode = get_string("execution_mode")?;
     let trigger = get_optional_string("trigger");
     let schedule = get_optional_string("schedule");
+    let scheduled_input = get_optional_string("scheduled_input");
     let deep_agent_config = get_optional_string("deep_agent_config");
     let environment = get_string("environment")?;
     let status = get_string("status")?;
@@ -2112,6 +2136,7 @@ fn row_to_agent_pg(row: &sqlx::postgres::PgRow) -> Option<Agent> {
         execution_mode: serde_json::from_str(&execution_mode).ok()?,
         trigger: trigger.as_deref().and_then(|s| serde_json::from_str(s).ok()),
         schedule,
+        scheduled_input,
         deep_agent_config: deep_agent_config
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),

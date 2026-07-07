@@ -16,6 +16,22 @@ pub use storage::{Storage, SqliteStorage, PostgresStorage};
 pub use error::{AgentaError, Result};
 pub use types::*;
 
+/// The protected system agent everyone talks to.
+pub const MIND_AGENT_NAME: &str = "MIND";
+
+/// MIND's system prompt is compiled into the binary (not read from the per-install
+/// DB row) so it ships and upgrades atomically with agenta — a prompt improvement
+/// reaches every install on `agenta upgrade`, with zero drift. The DB copy for MIND
+/// is vestigial; the runtime executor and the display path both use THIS constant.
+/// Edit `src/core/mind_prompt.txt` + rebuild to change MIND everywhere.
+pub const MIND_SYSTEM_PROMPT: &str = include_str!("mind_prompt.txt");
+
+/// True when `agent` is the protected MIND system agent (whose prompt is
+/// binary-sourced). Used to override its stored prompt at runtime/display.
+pub fn is_mind(agent: &agent::Agent) -> bool {
+    agent.is_system && agent.name == MIND_AGENT_NAME
+}
+
 /// Load `~/.agenta/.env` into the process environment (KEY=VALUE lines; comments
 /// and blanks skipped; existing env vars are not overridden). Both the CLI and the
 /// daemon call this so `$VAR` references in config.toml resolve for provider keys.

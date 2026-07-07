@@ -115,7 +115,9 @@ impl DaemonState {
                         info!("Scheduled trigger for {}: {}", agent_id, cron);
                         if let Ok(Some(agent)) = storage.get_agent(&agent_id).await {
                             let ex = build_executor_for_agent(&config, &storage, &executor, &agent);
-                            let _ = ex.execute(&agent, None).await;
+                            // Pass the agent's scheduled directive as the run input so the
+                            // model knows what this tick is for; empty input makes it freewheel.
+                            let _ = ex.execute(&agent, agent.scheduled_input.clone()).await;
                         }
                     }
                     TriggerEvent::FileCreated { path } => {
@@ -224,10 +226,18 @@ impl DaemonState {
     pub async fn get_agent(&self,
         id: &str,
     ) -> anyhow::Result<Option<Agent>> {
-        if let Some(agent) = self.storage.get_agent(id).await? {
-            return Ok(Some(agent));
+        let mut found = match self.storage.get_agent(id).await? {
+            Some(agent) => Some(agent),
+            None => self.storage.get_agent_by_name(id).await?,
+        };
+        // MIND's prompt is binary-sourced — surface the compiled-in version, not the
+        // vestigial DB copy, so `agenta get MIND` and runs agree and reflect upgrades.
+        if let Some(agent) = found.as_mut() {
+            if agenta::core::is_mind(agent) {
+                agent.system_prompt = agenta::core::MIND_SYSTEM_PROMPT.to_string();
+            }
         }
-        Ok(self.storage.get_agent_by_name(id).await?)
+        Ok(found)
     }
 
     pub async fn list_agents(&self,

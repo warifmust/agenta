@@ -641,7 +641,7 @@ fn render_welcome(w: &Welcome) {
     // Right column: tips + what needs you.
     let mut right: Vec<(String, Sty)> = Vec::new();
     right.push(("Getting started".to_string(), Sty::AccentBold));
-    let tip = "Describe what you want built — MIND drafts a tool proposal you approve; nothing applies until you say so.";
+    let tip = "Build tools & agents, craft prompts, or ask anything. MIND drafts, you approve — nothing changes until you say go.";
     for line in wrap_text(tip, rw).lines() {
         right.push((line.to_string(), Sty::Dim));
     }

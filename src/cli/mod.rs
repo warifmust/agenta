@@ -162,6 +162,10 @@ pub enum Commands {
         #[arg(long)]
         schedule: Option<String>,
 
+        /// Directive passed as input on each scheduled tick (e.g. "send a break reminder")
+        #[arg(long)]
+        scheduled_input: Option<String>,
+
         /// Enable or disable memory
         #[arg(long)]
         memory: Option<bool>,

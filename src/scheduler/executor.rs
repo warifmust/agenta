@@ -98,12 +98,25 @@ impl AgentExecutor {
         updated_agent.run_count += 1;
         self.storage.update_agent(&updated_agent).await?;
 
+        // MIND's system prompt is binary-sourced (ships + upgrades with agenta),
+        // never the per-install DB copy — so a prompt improvement reaches every
+        // install on upgrade. Swap it in just for this run.
+        let mind_override;
+        let run_agent: &Agent = if crate::core::is_mind(agent) {
+            let mut a = agent.clone();
+            a.system_prompt = crate::core::MIND_SYSTEM_PROMPT.to_string();
+            mind_override = a;
+            &mind_override
+        } else {
+            agent
+        };
+
         // Bound execution time so runs do not stay "running" forever.
         // Deep agents with sub-agent spawning need more time — use 600s (10 min).
         let execution_timeout = Duration::from_secs(600);
         let run_result = tokio::time::timeout(
             execution_timeout,
-            self.run_execution(agent, &input_text, execution),
+            self.run_execution(run_agent, &input_text, execution),
         )
         .await;
 

@@ -162,6 +162,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             max_tokens: new_max_tokens,
             mode: new_mode,
             schedule: new_schedule,
+            scheduled_input: new_scheduled_input,
             memory: new_memory,
             provider: new_provider,
             tools: new_tools,
@@ -213,6 +214,10 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if new_schedule.is_some() {
                 agent.schedule = new_schedule;
+            }
+            if new_scheduled_input.is_some() {
+                // Empty string clears the directive (back to no scheduled input).
+                agent.scheduled_input = new_scheduled_input.filter(|s| !s.trim().is_empty());
             }
             if let Some(mem) = new_memory {
                 agent.memory_enabled = mem;
@@ -1140,9 +1145,9 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
 
     // ── Create MIND ───────────────────────────────────────────────────────────
     let mut mind = Agent::new(
-        "MIND".to_string(),
+        crate::core::MIND_AGENT_NAME.to_string(),
         model.clone(),
-        include_str!("mind_prompt.txt").to_string(),
+        crate::core::MIND_SYSTEM_PROMPT.to_string(),
     );
     mind.is_system = true;
     mind.provider = Some(provider.to_string());
