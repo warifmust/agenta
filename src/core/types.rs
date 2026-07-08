@@ -23,6 +23,7 @@ pub enum DaemonResponse {
     ScriptExecutionLog { lines: Vec<String> },
     ProposalList { proposals: Vec<serde_json::Value> },
     ProposalDetails { proposal: serde_json::Value },
+    MemoryList { memories: Vec<serde_json::Value> },
     Status { running: bool, pid: Option<u32>, version: String },
 }
 
@@ -59,6 +60,9 @@ pub enum DaemonRequest {
     GetProposal { id: String },
     ApproveProposal { id: String },
     RejectProposal { id: String, reason: Option<String> },
+    ListMemories { scope: String, active_only: bool },
+    AddMemory { scope: String, kind: String, content: String },
+    DeleteMemory { id: String },
     Ping,
     Shutdown,
 }

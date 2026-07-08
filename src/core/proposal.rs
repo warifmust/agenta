@@ -44,6 +44,10 @@ pub enum ProposalAction {
     CreateTool(ToolResource),
     /// Create an agent. Payload is the agent to create.
     CreateAgent(Agent),
+    /// Attach a knowledge base to an existing agent (by names).
+    AttachKb { agent: String, kb: String },
+    /// Detach a knowledge base from an existing agent (by names).
+    DetachKb { agent: String, kb: String },
 }
 
 impl ProposalAction {
@@ -52,6 +56,8 @@ impl ProposalAction {
         match self {
             ProposalAction::CreateTool(t) => format!("create tool '{}'", t.name),
             ProposalAction::CreateAgent(a) => format!("create agent '{}'", a.name),
+            ProposalAction::AttachKb { agent, kb } => format!("attach kb '{}' to '{}'", kb, agent),
+            ProposalAction::DetachKb { agent, kb } => format!("detach kb '{}' from '{}'", kb, agent),
         }
     }
 
@@ -68,6 +74,9 @@ impl ProposalAction {
             // Creating an agent is reversible and inert until run; its tools are
             // themselves gated. Low risk.
             ProposalAction::CreateAgent(_) => Risk::Low,
+            // Attaching/detaching a KB only changes what context an agent retrieves;
+            // fully reversible. Low risk.
+            ProposalAction::AttachKb { .. } | ProposalAction::DetachKb { .. } => Risk::Low,
         }
     }
 }

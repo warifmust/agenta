@@ -339,6 +339,12 @@ pub enum Commands {
         command: Option<ProposalCommands>,
     },
 
+    /// Manage MIND's corrective memory — feedback & preferences it honors on every run
+    Memory {
+        #[command(subcommand)]
+        command: Option<MemoryCommands>,
+    },
+
     /// Approve and apply a pending proposal
     Approve {
         /// Proposal id (or a unique prefix)
@@ -494,6 +500,33 @@ pub enum ProposalCommands {
     /// Show a proposal's full preview + rationale
     Show {
         /// Proposal id (or a unique prefix)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCommands {
+    /// Add a memory (a correction/preference an agent should honor)
+    Add {
+        /// The memory content
+        content: String,
+        /// Which agent it applies to
+        #[arg(long, default_value = "MIND")]
+        scope: String,
+        /// Category: preference | correction | note
+        #[arg(long, default_value = "note")]
+        kind: String,
+    },
+    /// List memories for an agent (default: MIND)
+    List {
+        #[arg(long, default_value = "MIND")]
+        scope: String,
+        /// Include inactive memories too
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Remove a memory by id (or a unique prefix)
+    Rm {
         id: String,
     },
 }

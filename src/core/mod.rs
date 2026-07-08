@@ -1,9 +1,11 @@
 pub mod agent;
+pub mod memory;
 pub mod proposal;
 pub mod storage;
 pub mod error;
 pub mod types;
 
+pub use memory::Memory;
 pub use proposal::{Proposal, ProposalAction, ProposalStatus, Risk};
 
 pub use agent::{

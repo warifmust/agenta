@@ -1,4 +1,4 @@
-use super::{Commands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
+use super::{Commands, MemoryCommands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
     ExecutionResult, HttpHandler, Proposal, ProposalStatus, ScriptDefinition, SideEffect,
@@ -562,6 +562,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
 
         Commands::Proposals { all, command } => handle_proposals_command(all, command, &config).await,
 
+        Commands::Memory { command } => handle_memory_command(command, &config).await,
+
         Commands::Approve { id } => resolve_proposal(&config, &id, true, None).await,
 
         Commands::Reject { id, reason } => resolve_proposal(&config, &id, false, reason).await,
@@ -912,9 +914,7 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
 
     print!("  Bot token: ");
     std::io::stdout().flush()?;
-    let mut token = String::new();
-    std::io::stdin().read_line(&mut token)?;
-    let token = token.trim().to_string();
+    let token = prompt_line().unwrap_or_default();
 
     if token.is_empty() {
         println!("  {} No token entered — skipping Telegram setup.", "⚠".yellow());
@@ -936,9 +936,7 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
         println!("  No agents found — you can set the agent name manually.");
         print!("  Agent name: ");
         std::io::stdout().flush()?;
-        let mut a = String::new();
-        std::io::stdin().read_line(&mut a)?;
-        a.trim().to_string()
+        prompt_line().unwrap_or_default()
     } else {
         println!("  Which agent should handle messages from this bot?");
         for (i, name) in agents.iter().enumerate() {
@@ -946,9 +944,8 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
         }
         print!("  Choice [1]: ");
         std::io::stdout().flush()?;
-        let mut choice = String::new();
-        std::io::stdin().read_line(&mut choice)?;
-        let idx: usize = choice.trim().parse().unwrap_or(1);
+        let choice = prompt_line().unwrap_or_default();
+        let idx: usize = choice.parse().unwrap_or(1);
         agents.get(idx.saturating_sub(1)).cloned().unwrap_or_else(|| agents[0].clone())
     };
 
@@ -959,9 +956,7 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
 
     print!("  Friendly bot name (optional, press Enter to skip): ");
     std::io::stdout().flush()?;
-    let mut label = String::new();
-    std::io::stdin().read_line(&mut label)?;
-    let label = label.trim().to_string();
+    let label = prompt_line().unwrap_or_default();
     let bot_name = if label.is_empty() { None } else { Some(label) };
 
     // Read existing config.toml, append the new bot, write back
@@ -1008,6 +1003,35 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Read one line of input for the setup wizard from the controlling terminal.
+///
+/// We read `/dev/tty` (the real keyboard), NOT `std::io::stdin()`, because agenta
+/// is installed via `curl … | bash` — which makes the process's stdin the install
+/// *pipe*, not the terminal. A plain stdin read there hits EOF instantly, so every
+/// wizard prompt silently takes its default and "auto-skips". Reading `/dev/tty`
+/// makes the prompts actually work under `curl | bash`.
+///
+/// Returns the trimmed line, or `None` when there's no interactive terminal at all
+/// (headless/CI) — callers then fall back to defaults.
+fn prompt_line() -> Option<String> {
+    use std::io::BufRead;
+    // Prefer the real terminal so piped-stdin installs still prompt the user.
+    if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+        let mut line = String::new();
+        if std::io::BufReader::new(tty).read_line(&mut line).unwrap_or(0) > 0 {
+            return Some(line.trim().to_string());
+        }
+        return None;
+    }
+    // No controlling terminal (headless) — fall back to stdin.
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).unwrap_or(0) > 0 {
+        Some(line.trim().to_string())
+    } else {
+        None
+    }
+}
+
 async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     // ── Step 0: already set up? ───────────────────────────────────────────────
     let already_have_mind = matches!(
@@ -1038,9 +1062,8 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     print!("  Choice [1]: ");
     std::io::stdout().flush()?;
 
-    let mut choice = String::new();
-    std::io::stdin().read_line(&mut choice)?;
-    let provider = match choice.trim() {
+    let choice = prompt_line().unwrap_or_default();
+    let provider = match choice.as_str() {
         "2" => "deepseek",
         "3" => "openrouter",
         "4" => "openai",
@@ -1061,9 +1084,7 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
         print!("  API key: ");
         std::io::stdout().flush()?;
 
-        let mut key = String::new();
-        std::io::stdin().read_line(&mut key)?;
-        let key = key.trim().to_string();
+        let key = prompt_line().unwrap_or_default();
 
         if !key.is_empty() {
             // Append to ~/.agenta/.env
@@ -1103,11 +1124,11 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     print!("  Model: ");
     std::io::stdout().flush()?;
 
-    let mut model_input = String::new();
-    std::io::stdin().read_line(&mut model_input)?;
-    let model = {
-        let m = model_input.trim();
-        if m.is_empty() { default_model.to_string() } else { m.to_string() }
+    let model_input = prompt_line().unwrap_or_default();
+    let model = if model_input.is_empty() {
+        default_model.to_string()
+    } else {
+        model_input
     };
     println!("  {} {}", "✓ Model:".green(), model);
     println!();
@@ -1178,9 +1199,8 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     println!("  Set up Telegram bot? [y/N]: ");
     print!("  ");
     std::io::stdout().flush()?;
-    let mut tg = String::new();
-    std::io::stdin().read_line(&mut tg)?;
-    if tg.trim().eq_ignore_ascii_case("y") {
+    let tg = prompt_line().unwrap_or_default();
+    if tg.eq_ignore_ascii_case("y") {
         setup_telegram(&fresh_config).await?;
     }
 
@@ -1336,6 +1356,67 @@ async fn handle_proposals_command(
     match command {
         None => list_proposals(config, all).await,
         Some(ProposalCommands::Show { id }) => show_proposal(config, &id).await,
+    }
+}
+
+async fn handle_memory_command(
+    command: Option<MemoryCommands>,
+    config: &AppConfig,
+) -> Result<()> {
+    match command {
+        // Bare `agenta memory` → list MIND's active memories.
+        None => list_memories_cmd(config, "MIND", false).await,
+        Some(MemoryCommands::List { scope, all }) => list_memories_cmd(config, &scope, all).await,
+        Some(MemoryCommands::Add { content, scope, kind }) => {
+            match daemon_request(config, DaemonRequest::AddMemory { scope: scope.clone(), kind, content }).await? {
+                DaemonResponse::Success { message } => {
+                    println!("{} {}", "✓".green(), message);
+                    println!("{}", format!("{} will honor it on its next run.", scope).dimmed());
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+        Some(MemoryCommands::Rm { id }) => {
+            match daemon_request(config, DaemonRequest::DeleteMemory { id }).await? {
+                DaemonResponse::Success { message } => { println!("{} {}", "✓".green(), message); Ok(()) }
+                DaemonResponse::Error { message } => Err(anyhow!(message)),
+                _ => Err(anyhow!("Unexpected response")),
+            }
+        }
+    }
+}
+
+async fn list_memories_cmd(config: &AppConfig, scope: &str, all: bool) -> Result<()> {
+    match daemon_request(config, DaemonRequest::ListMemories { scope: scope.to_string(), active_only: !all }).await? {
+        DaemonResponse::MemoryList { memories } => {
+            let memories: Vec<crate::core::Memory> = memories
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
+            if memories.is_empty() {
+                println!("No memories for {}.", scope);
+                println!("{}", format!("Add one: agenta memory add \"<preference>\" --scope {}", scope).dimmed());
+                return Ok(());
+            }
+            let mut table = styled_table();
+            table.set_header(vec!["ID", "Kind", "Memory", "Active", "When"]);
+            for m in &memories {
+                table.add_row(vec![
+                    m.id.chars().take(8).collect::<String>(),
+                    m.kind.clone(),
+                    m.content.clone(),
+                    if m.active { "yes".to_string() } else { "no".to_string() },
+                    m.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                ]);
+            }
+            println!("{table}");
+            println!("{}", "Remove with: agenta memory rm <id>".dimmed());
+            Ok(())
+        }
+        DaemonResponse::Error { message } => Err(anyhow!(message)),
+        _ => Err(anyhow!("Unexpected response")),
     }
 }
 

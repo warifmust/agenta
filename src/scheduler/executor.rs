@@ -100,11 +100,29 @@ impl AgentExecutor {
 
         // MIND's system prompt is binary-sourced (ships + upgrades with agenta),
         // never the per-install DB copy — so a prompt improvement reaches every
-        // install on upgrade. Swap it in just for this run.
+        // install on upgrade. Swap it in just for this run, then append the user's
+        // corrective memories (Tier-1 feedback) so MIND honors them going forward.
         let mind_override;
         let run_agent: &Agent = if crate::core::is_mind(agent) {
             let mut a = agent.clone();
             a.system_prompt = crate::core::MIND_SYSTEM_PROMPT.to_string();
+            if let Ok(mems) = self
+                .storage
+                .list_memories(crate::core::MIND_AGENT_NAME, true)
+                .await
+            {
+                if !mems.is_empty() {
+                    let block: String = mems
+                        .iter()
+                        .map(|m| format!("- {}", m.content.trim()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    a.system_prompt.push_str(&format!(
+                        "\n\n# WHAT THE USER HAS TOLD YOU (corrections & preferences — honor these)\n{}",
+                        block
+                    ));
+                }
+            }
             mind_override = a;
             &mind_override
         } else {

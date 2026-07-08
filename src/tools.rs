@@ -33,6 +33,9 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_agent",
     "propose_create_tool",
     "propose_create_agent",
+    "propose_attach_kb",
+    "propose_detach_kb",
+    "remember_feedback",
 ];
 
 pub fn is_builtin_tool(name: &str) -> bool {
@@ -115,6 +118,29 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
              \"description\": \"<optional>\", \"rationale\": \"<why>\"}. \
              If the user asks for BOTH a tool and an agent that uses it, propose the tool first and have \
              the user approve it, then propose the agent referencing that tool by name.",
+        ),
+        (
+            "propose_attach_kb",
+            "Propose attaching a knowledge base (RAG) to an existing agent, so that agent retrieves from \
+             it. Drafts a proposal the user approves; does NOT attach it directly. \
+             Parameters: {\"agent\": \"<existing agent name>\", \"kb\": \"<knowledge base name>\", \
+             \"rationale\": \"<why>\"}. Use the agent name from list_agents and the KB name the user gave \
+             you (the KB is validated when the proposal is applied).",
+        ),
+        (
+            "propose_detach_kb",
+            "Propose detaching a knowledge base from an existing agent (reverse of propose_attach_kb). \
+             Drafts a proposal the user approves. \
+             Parameters: {\"agent\": \"<existing agent name>\", \"kb\": \"<knowledge base name>\", \"rationale\": \"<why>\"}.",
+        ),
+        (
+            "remember_feedback",
+            "Save a durable piece of feedback, correction, or preference the user has given you, so you \
+             honor it on every future run (it gets injected into your instructions). Call this whenever \
+             the user tells you how they want you to behave going forward — e.g. \"always X\", \"stop \
+             doing Y\", \"from now on Z\", or corrects you in a way that should stick. \
+             Parameters: {\"content\": \"<the rule/preference, phrased so future-you understands it>\", \
+             \"kind\": \"preference|correction|note\" (optional)}. Saves immediately (no approval needed).",
         ),
     ]
 }

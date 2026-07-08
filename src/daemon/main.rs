@@ -626,6 +626,29 @@ async fn process_request(
             Err(e) => DaemonResponse::Error { message: e.to_string() },
         },
 
+        DaemonRequest::ListMemories { scope, active_only } => {
+            match state.list_memories(&scope, active_only).await {
+                Ok(mems) => {
+                    let values = mems.iter().filter_map(|m| serde_json::to_value(m).ok()).collect();
+                    DaemonResponse::MemoryList { memories: values }
+                }
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::AddMemory { scope, kind, content } => {
+            match state.add_memory(&scope, &kind, &content).await {
+                Ok(_) => DaemonResponse::Success { message: "Memory saved.".to_string() },
+                Err(e) => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        DaemonRequest::DeleteMemory { id } => match state.delete_memory(&id).await {
+            Ok(true) => DaemonResponse::Success { message: "Memory deleted.".to_string() },
+            Ok(false) => DaemonResponse::Error { message: format!("No memory matching: {}", id) },
+            Err(e) => DaemonResponse::Error { message: e.to_string() },
+        },
+
         DaemonRequest::Ping => {
             DaemonResponse::Status {
                 running: true,

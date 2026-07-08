@@ -320,6 +320,9 @@ impl DeepAgentExecutor {
             "get_agent"   => self.builtin_get_agent(parameters).await,
             "propose_create_tool" => self.builtin_propose_create_tool(parent, parameters).await,
             "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
+            "propose_attach_kb" => self.builtin_propose_kb(parent, parameters, true).await,
+            "propose_detach_kb" => self.builtin_propose_kb(parent, parameters, false).await,
+            "remember_feedback" => self.builtin_remember_feedback(parent, parameters).await,
             _             => Some(format!("Unknown built-in tool: {}", tool_name)),
         }
     }
@@ -560,6 +563,81 @@ impl DeepAgentExecutor {
                 short, proposal.summary(), proposal.risk, miss, short,
             )),
             Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
+    /// Propose attaching (attach=true) or detaching a knowledge base to/from an
+    /// existing agent. Verifies the agent exists here; the KB's existence is checked
+    /// at apply time. Drafts a proposal — does not mutate.
+    async fn builtin_propose_kb(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+        attach: bool,
+    ) -> Option<String> {
+        let verb = if attach { "attach" } else { "detach" };
+        let agent = match params.get("agent").and_then(|v| v.as_str()) {
+            Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+            _ => return Some(format!("Error: propose_{}_kb requires a non-empty 'agent'.", verb)),
+        };
+        let kb = match params.get("kb").and_then(|v| v.as_str()) {
+            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+            _ => return Some(format!("Error: propose_{}_kb requires a non-empty 'kb'.", verb)),
+        };
+        // Don't let MIND propose against an agent that doesn't exist.
+        match self.storage.get_agent_by_name(&agent).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Some(format!(
+                    "Agent '{}' not found — call list_agents for the real names on this machine.",
+                    agent
+                ))
+            }
+            Err(e) => return Some(format!("Error looking up agent: {}", e)),
+        }
+        let action = if attach {
+            ProposalAction::AttachKb { agent: agent.clone(), kb: kb.clone() }
+        } else {
+            ProposalAction::DetachKb { agent: agent.clone(), kb: kb.clone() }
+        };
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let proposal = Proposal::new(action, rationale, parent.name.clone());
+        let id: String = proposal.id.chars().take(8).collect();
+        match self.storage.create_proposal(&proposal).await {
+            Ok(_) => Some(format!(
+                "Proposal {} created: {} kb '{}' {} agent '{}'. Tell the user to run `agenta approve {}` (or reject {}).",
+                id, verb, kb, if attach { "to" } else { "from" }, agent, id, id
+            )),
+            Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
+    /// Persist a piece of durable user feedback so it shapes this agent's behavior
+    /// on future runs (injected into the prompt at run time). Low-risk → saved
+    /// directly, no proposal gate. Scoped to the running agent (parent.name).
+    async fn builtin_remember_feedback(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+    ) -> Option<String> {
+        let content = match params.get("content").and_then(|v| v.as_str()) {
+            Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+            _ => return Some("Error: remember_feedback requires a non-empty 'content'.".to_string()),
+        };
+        let kind = params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("note")
+            .to_string();
+        let mem = crate::core::Memory::new(parent.name.clone(), kind, content.clone());
+        match self.storage.add_memory(&mem).await {
+            Ok(_)  => Some(format!("Saved to memory — I'll honor this from now on: \"{}\"", content)),
+            Err(e) => Some(format!("Error saving feedback: {}", e)),
         }
     }
 

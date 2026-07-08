@@ -689,6 +689,25 @@ impl DaemonState {
             .collect())
     }
 
+    // ── Agent memories (corrective feedback / preferences) ───────────────────
+
+    pub async fn add_memory(&self, scope: &str, kind: &str, content: &str) -> anyhow::Result<()> {
+        let mem = agenta::core::Memory::new(scope, kind, content);
+        self.storage.add_memory(&mem).await.map_err(anyhow::Error::from)
+    }
+
+    pub async fn list_memories(
+        &self,
+        scope: &str,
+        active_only: bool,
+    ) -> anyhow::Result<Vec<agenta::core::Memory>> {
+        self.storage.list_memories(scope, active_only).await.map_err(anyhow::Error::from)
+    }
+
+    pub async fn delete_memory(&self, id: &str) -> anyhow::Result<bool> {
+        self.storage.delete_memory(id).await.map_err(anyhow::Error::from)
+    }
+
     // ── Proposals (human-gated mutations from agents like MIND) ──────────────
 
     pub async fn create_proposal(&self, proposal: &Proposal) -> anyhow::Result<()> {
@@ -755,8 +774,28 @@ impl DaemonState {
 
         proposal.status = ProposalStatus::Rejected;
         proposal.resolved_at = Some(chrono::Utc::now());
+
+        // Failure memory (AQL §16): a rejection WITH a reason becomes a memory for
+        // the proposer (e.g. MIND), so it won't re-propose the same thing. No reason
+        // = no signal = no memory (avoids noise). Best-effort — never fail the reject.
+        let why = reason
+            .as_ref()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
         proposal.result = reason.or(Some("rejected by user".to_string()));
         self.storage.update_proposal(&proposal).await?;
+
+        if let Some(why) = why {
+            let content = format!(
+                "You previously proposed: {} — the user REJECTED it. Reason: {}. Don't propose this again unless they ask.",
+                proposal.summary(),
+                why
+            );
+            let mem = agenta::core::Memory::new(proposal.proposed_by.clone(), "rejection", content);
+            if let Err(e) = self.storage.add_memory(&mem).await {
+                warn!("Failed to store rejection memory: {}", e);
+            }
+        }
         Ok(proposal)
     }
 
@@ -776,6 +815,36 @@ impl DaemonState {
                 }
                 self.storage.create_agent(agent).await?;
                 Ok(format!("Created agent '{}'", agent.name))
+            }
+            ProposalAction::AttachKb { agent, kb } => {
+                let mut a = self
+                    .storage
+                    .get_agent_by_name(agent)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent))?;
+                if self.get_kb(kb).await?.is_none() {
+                    return Err(anyhow::anyhow!("Knowledge base '{}' not found", kb));
+                }
+                if a.config.knowledge_bases.iter().any(|k| k == kb) {
+                    return Ok(format!("'{}' already has knowledge base '{}'", agent, kb));
+                }
+                a.config.knowledge_bases.push(kb.clone());
+                self.storage.update_agent(&a).await?;
+                Ok(format!("Attached knowledge base '{}' to '{}'", kb, agent))
+            }
+            ProposalAction::DetachKb { agent, kb } => {
+                let mut a = self
+                    .storage
+                    .get_agent_by_name(agent)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent))?;
+                let before = a.config.knowledge_bases.len();
+                a.config.knowledge_bases.retain(|k| k != kb);
+                if a.config.knowledge_bases.len() == before {
+                    return Ok(format!("'{}' did not have knowledge base '{}'", agent, kb));
+                }
+                self.storage.update_agent(&a).await?;
+                Ok(format!("Detached knowledge base '{}' from '{}'", kb, agent))
             }
         }
     }

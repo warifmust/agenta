@@ -9,6 +9,7 @@ use std::path::Path;
 
 use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource, ScriptDefinition, ScriptExecution, ScriptExecutionStatus};
 use super::proposal::{Proposal, ProposalStatus};
+use super::memory::Memory;
 use super::error::{AgentaError, Result};
 
 /// Storage trait - can be implemented for different backends
@@ -97,6 +98,16 @@ pub trait Storage: Send + Sync {
 
     /// List proposals, optionally filtered to a single status, newest first
     async fn list_proposals(&self, status: Option<ProposalStatus>) -> Result<Vec<Proposal>>;
+
+    /// Add a memory (corrective feedback / preference) for an agent.
+    async fn add_memory(&self, memory: &Memory) -> Result<()>;
+
+    /// List an agent's memories (by scope), newest first. `active_only` filters to
+    /// injectable memories.
+    async fn list_memories(&self, scope: &str, active_only: bool) -> Result<Vec<Memory>>;
+
+    /// Delete a memory by id (accepts a unique id prefix). Returns true if removed.
+    async fn delete_memory(&self, id: &str) -> Result<bool>;
 
     /// Create a script
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()>;
@@ -319,6 +330,25 @@ impl SqliteStorage {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
+            .execute(&self.pool)
+            .await?;
+
+        // Agent memories — corrective feedback / preferences injected at run time (SQLite).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_memories (
+                id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_agent_memories_scope ON agent_memories(scope)")
             .execute(&self.pool)
             .await?;
 
@@ -554,6 +584,25 @@ impl PostgresStorage {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
+            .execute(&self.pool)
+            .await?;
+
+        // Agent memories — corrective feedback / preferences injected at run time (Postgres).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_memories (
+                id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_agent_memories_scope ON agent_memories(scope)")
             .execute(&self.pool)
             .await?;
 
@@ -1156,6 +1205,40 @@ impl Storage for SqliteStorage {
             }
         };
         Ok(rows.into_iter().filter_map(|r| row_to_proposal_sqlite(&r)).collect())
+    }
+
+    async fn add_memory(&self, memory: &Memory) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_memories (id, scope, kind, content, active, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&memory.id)
+        .bind(&memory.scope)
+        .bind(&memory.kind)
+        .bind(&memory.content)
+        .bind(if memory.active { 1i64 } else { 0i64 })
+        .bind(memory.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_memories(&self, scope: &str, active_only: bool) -> Result<Vec<Memory>> {
+        let sql = if active_only {
+            "SELECT id, scope, kind, content, active, created_at FROM agent_memories WHERE scope = ?1 AND active = 1 ORDER BY created_at DESC"
+        } else {
+            "SELECT id, scope, kind, content, active, created_at FROM agent_memories WHERE scope = ?1 ORDER BY created_at DESC"
+        };
+        let rows = sqlx::query(sql).bind(scope).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_memory_sqlite(&r)).collect())
+    }
+
+    async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM agent_memories WHERE id = ?1 OR id LIKE ?2")
+            .bind(id)
+            .bind(format!("{}%", id))
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
@@ -1882,6 +1965,40 @@ impl Storage for PostgresStorage {
         Ok(rows.into_iter().filter_map(|r| row_to_proposal_pg(&r)).collect())
     }
 
+    async fn add_memory(&self, memory: &Memory) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_memories (id, scope, kind, content, active, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&memory.id)
+        .bind(&memory.scope)
+        .bind(&memory.kind)
+        .bind(&memory.content)
+        .bind(memory.active)
+        .bind(memory.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_memories(&self, scope: &str, active_only: bool) -> Result<Vec<Memory>> {
+        let sql = if active_only {
+            "SELECT id, scope, kind, content, active, created_at FROM agent_memories WHERE scope = $1 AND active = TRUE ORDER BY created_at DESC"
+        } else {
+            "SELECT id, scope, kind, content, active, created_at FROM agent_memories WHERE scope = $1 ORDER BY created_at DESC"
+        };
+        let rows = sqlx::query(sql).bind(scope).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| row_to_memory_pg(&r)).collect())
+    }
+
+    async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM agent_memories WHERE id = $1 OR id LIKE $2")
+            .bind(id)
+            .bind(format!("{}%", id))
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn create_script(&self, script: &ScriptDefinition) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO scripts (id, name, description, handler, schedule, enabled, created_at, updated_at, last_run, run_count)
@@ -2305,6 +2422,30 @@ fn row_to_proposal_pg(row: &sqlx::postgres::PgRow) -> Option<Proposal> {
         created_at: get_string("created_at")?.parse().ok()?,
         resolved_at: get_optional_string("resolved_at").and_then(|s| s.parse().ok()),
         result: get_optional_string("result"),
+    })
+}
+
+fn row_to_memory_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<Memory> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    Some(Memory {
+        id: get_string("id")?,
+        scope: get_string("scope")?,
+        kind: get_string("kind")?,
+        content: get_string("content")?,
+        active: row.try_get::<i64, _>("active").unwrap_or(1) != 0,
+        created_at: get_string("created_at")?.parse().ok()?,
+    })
+}
+
+fn row_to_memory_pg(row: &sqlx::postgres::PgRow) -> Option<Memory> {
+    let get_string = |col: &str| row.try_get::<String, _>(col).ok();
+    Some(Memory {
+        id: get_string("id")?,
+        scope: get_string("scope")?,
+        kind: get_string("kind")?,
+        content: get_string("content")?,
+        active: row.try_get::<bool, _>("active").unwrap_or(true),
+        created_at: get_string("created_at")?.parse().ok()?,
     })
 }
 
