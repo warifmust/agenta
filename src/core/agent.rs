@@ -62,6 +62,13 @@ pub struct ToolDefinition {
     /// aren't killed mid-run.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// External commands/interpreters this script tool needs on PATH (e.g. ["argo"],
+    /// ["python3"]). The executor verifies these exist before running and fails with
+    /// a clear message if any are missing — so a tool never dies on a cryptic spawn
+    /// error. The executor also auto-detects the handler's own command; `requires` is
+    /// for extra deps it can't infer (e.g. commands invoked inside a `sh -c` script).
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 /// First-class tool resource managed by CLI/daemon
@@ -119,6 +126,7 @@ impl ToolResource {
             side_effect: self.side_effect,
             http: self.http.clone(),
             timeout_secs: None,
+            requires: Vec::new(),
         }
     }
 }

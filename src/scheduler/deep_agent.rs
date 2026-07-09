@@ -114,7 +114,14 @@ impl DeepAgentExecutor {
             .iter()
             .map(|t| format!("- {}: {}", t.name, t.description))
             .collect();
+        let mind = crate::core::is_mind(agent);
         for (name, desc) in builtin_tool_descriptions() {
+            // MIND is read-and-propose only: it must never mutate the filesystem
+            // directly, so it doesn't get write_file. All its changes go through
+            // propose_* (human-approved). Other agents keep write_file.
+            if mind && name == "write_file" {
+                continue;
+            }
             tool_descriptions.push(format!("- {} (built-in): {}", name, desc));
         }
 
@@ -311,6 +318,14 @@ impl DeepAgentExecutor {
     ) -> Option<String> {
         match tool_name {
             "read_file"   => self.builtin_read_file(parameters).await,
+            // MIND never writes files directly — it is read-and-propose only. Refuse
+            // here too (defense in depth beyond hiding it from MIND's tool list).
+            "write_file" if crate::core::is_mind(parent) => Some(
+                "Refused: MIND is read-and-propose only and cannot write files directly. \
+                 To create a tool, script, or file-producing capability, use propose_create_tool \
+                 so the user approves it before anything is written."
+                    .to_string(),
+            ),
             "write_file"  => self.builtin_write_file(parameters).await,
             "list_files"  => self.builtin_list_files(parameters).await,
             "spawn_agent" => self.spawn_subagent(parent, parameters).await,
@@ -322,6 +337,7 @@ impl DeepAgentExecutor {
             "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
             "propose_attach_kb" => self.builtin_propose_kb(parent, parameters, true).await,
             "propose_detach_kb" => self.builtin_propose_kb(parent, parameters, false).await,
+            "check_command" => self.builtin_check_command(parameters).await,
             "remember_feedback" => self.builtin_remember_feedback(parent, parameters).await,
             _             => Some(format!("Unknown built-in tool: {}", tool_name)),
         }
@@ -613,6 +629,37 @@ impl DeepAgentExecutor {
                 id, verb, kb, if attach { "to" } else { "from" }, agent, id, id
             )),
             Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
+    /// Check whether an external command/interpreter is installed & on PATH in the
+    /// environment tools actually run in (the daemon copies its PATH into every
+    /// tool's sealed env, and this builtin runs in the daemon — so the answer here
+    /// predicts whether a script tool that calls the command will work). Lets MIND
+    /// verify a dependency BEFORE building a tool around it.
+    async fn builtin_check_command(&self, params: &serde_json::Value) -> Option<String> {
+        let cmd = match params
+            .get("command")
+            .or_else(|| params.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+            _ => return Some("Error: check_command requires a non-empty 'command'.".to_string()),
+        };
+        // Only a bare command name or path — reject shell metacharacters/args.
+        if cmd.contains(|c: char| c.is_whitespace() || "|&;<>()$`\\\"'*?[]{}".contains(c)) {
+            return Some(format!("Error: '{}' is not a plain command name.", cmd));
+        }
+        match tokio::process::Command::new("which").arg(&cmd).output().await {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                Some(format!("FOUND: '{}' is installed at {} — a tool that calls it will work here.", cmd, path))
+            }
+            Ok(_) => Some(format!(
+                "NOT FOUND: '{}' is not installed / not on PATH in this environment, so a tool that calls it WOULD FAIL. Do not build a tool depending on it — tell the user it isn't available and offer an HTTP alternative, or ask them to install it or give the full path.",
+                cmd
+            )),
+            Err(e) => Some(format!("Could not check '{}' (which unavailable?): {}", cmd, e)),
         }
     }
 

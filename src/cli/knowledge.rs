@@ -33,43 +33,52 @@ async fn ocr_pages(
         ));
     }
 
-    // Render pages to a temp dir.
+    // Total page count up front (pdfinfo ships with poppler alongside pdftoppm).
+    let total = pdf_page_count(path).ok_or_else(|| {
+        anyhow!("Could not read page count — ensure poppler's `pdfinfo` is installed (macOS: brew install poppler).")
+    })?;
+    if total == 0 {
+        return Err(anyhow!("{} has no pages", path.display()));
+    }
+
+    // Work in a temp dir. We render and OCR ONE page at a time, which (a) shows real
+    // progress instead of a silent multi-minute upfront render, (b) doesn't render
+    // 800+ pages before you've even seen the preview, and (c) lets us SKIP a page
+    // that fails OCR instead of throwing away the whole (already paid-for) run.
     let tmp = std::env::temp_dir().join(format!("agenta-ocr-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
-    println!("Rendering PDF pages to images...");
-    let status = std::process::Command::new("pdftoppm")
-        .args(["-png", "-r", "200"])
-        .arg(path)
-        .arg(tmp.join("page"))
-        .status()?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(anyhow!("pdftoppm failed to render {}", path.display()));
-    }
 
-    let mut imgs: Vec<std::path::PathBuf> = std::fs::read_dir(&tmp)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
-        .collect();
-    imgs.sort();
-    if imgs.is_empty() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(anyhow!("No pages rendered from {}", path.display()));
-    }
+    // Render a single 1-based page to PNG bytes (`-singlefile` gives a predictable name).
+    let render_page = |n: usize| -> Result<Vec<u8>> {
+        let prefix = tmp.join("current");
+        let status = std::process::Command::new("pdftoppm")
+            .args(["-f", &n.to_string(), "-l", &n.to_string(), "-singlefile", "-png", "-r", "200"])
+            .arg(path)
+            .arg(&prefix)
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("pdftoppm failed to render page {}", n));
+        }
+        let png = prefix.with_extension("png");
+        let bytes = std::fs::read(&png)?;
+        let _ = std::fs::remove_file(&png);
+        Ok(bytes)
+    };
 
     let ocr = build_ocr(config, spec)?;
-    println!("OCR via {} ({} pages)...", spec.bold(), imgs.len());
 
-    // First page → preview → confirm.
-    let first = ocr
-        .ocr_image(&std::fs::read(&imgs[0])?, None)
-        .await
-        .map_err(|e| anyhow!("OCR failed on page 1: {}", e))?;
+    // ── Page 1 → preview → confirm (only one page rendered so far — fast) ──
+    println!("Rendering page 1 for a preview...");
+    let first_png = render_page(1).inspect_err(|_| { let _ = std::fs::remove_dir_all(&tmp); })?;
+    let first = match ocr.ocr_image(&first_png, None).await {
+        Ok(t) => t,
+        Err(e) => { let _ = std::fs::remove_dir_all(&tmp); return Err(anyhow!("OCR failed on page 1: {}", e)); }
+    };
     println!("\n{}", "── OCR text preview (page 1) ────────────".dimmed());
     println!("{}", first.chars().take(600).collect::<String>());
     println!("{}\n", "─────────────────────────────────────────".dimmed());
     if !yes {
-        print!("OCR looks right? Embed the whole document? [y/N]: ");
+        print!("OCR looks right? Embed all {} pages? [y/N]: ", total);
         std::io::stdout().flush().ok();
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans)?;
@@ -79,31 +88,66 @@ async fn ocr_pages(
         }
     }
 
-    // OCR the rest with progress.
-    let pb = ProgressBar::new(imgs.len() as u64);
+    // ── Render + OCR the rest, one page at a time, with a live progress bar ──
+    println!("OCR via {} ({} pages)...", spec.bold(), total);
+    let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
-            "  OCR [{bar:32}] {pos}/{len} pages ({percent}%)  {per_sec}  ETA {eta}",
+            "  [{bar:32}] {pos}/{len} pages ({percent}%)  {per_sec}  ETA {eta}",
         )
         .unwrap()
         .progress_chars("=>-"),
     );
     let mut pages = vec![ingest::Page { number: 1, text: first }];
     pb.inc(1);
-    for (i, img) in imgs.iter().enumerate().skip(1) {
-        match ocr.ocr_image(&std::fs::read(img)?, None).await {
-            Ok(text) => pages.push(ingest::Page { number: (i + 1) as i32, text }),
-            Err(e) => {
-                pb.abandon();
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(anyhow!("OCR failed on page {}: {}", i + 1, e));
+    let mut failed: Vec<usize> = Vec::new();
+
+    for n in 2..=total {
+        let png = match render_page(n) {
+            Ok(b) => b,
+            Err(e) => { pb.println(format!("  ! page {} render failed: {} — skipped", n, e)); failed.push(n); pb.inc(1); continue; }
+        };
+        // One retry — "OCR response missing content" and rate blips are often transient.
+        let mut text: Option<String> = None;
+        for attempt in 0..2 {
+            match ocr.ocr_image(&png, None).await {
+                Ok(t) => { text = Some(t); break; }
+                Err(_) if attempt == 0 => tokio::time::sleep(std::time::Duration::from_millis(800)).await,
+                Err(e) => pb.println(format!("  ! page {} OCR failed after retry: {} — skipped", n, e)),
             }
+        }
+        match text {
+            Some(t) => pages.push(ingest::Page { number: n as i32, text: t }),
+            None => failed.push(n),
         }
         pb.inc(1);
     }
     pb.finish_and_clear();
     let _ = std::fs::remove_dir_all(&tmp);
+
+    if !failed.is_empty() {
+        println!(
+            "{} {} of {} pages failed OCR and were skipped: {}",
+            "!".yellow(),
+            failed.len(),
+            total,
+            failed.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    println!("{} OCR done — captured {}/{} pages.", "✓".green(), pages.len(), total);
     Ok(Some(pages))
+}
+
+/// Read a PDF's page count via poppler's `pdfinfo`. None if it's unavailable or
+/// the output can't be parsed.
+fn pdf_page_count(path: &Path) -> Option<usize> {
+    let out = std::process::Command::new("pdfinfo").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("Pages:").and_then(|r| r.trim().parse().ok()))
 }
 
 /// RAG requires Postgres/pgvector in v1.

@@ -2548,6 +2548,7 @@ pub(crate) fn read_installed_tool(name: &str) -> Result<ToolDefinition> {
         side_effect: Default::default(),
         http: None,
         timeout_secs: None,
+        requires: Vec::new(),
     })
 }
 

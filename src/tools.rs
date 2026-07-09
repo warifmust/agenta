@@ -35,6 +35,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "propose_create_agent",
     "propose_attach_kb",
     "propose_detach_kb",
+    "check_command",
     "remember_feedback",
 ];
 
@@ -132,6 +133,13 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
             "Propose detaching a knowledge base from an existing agent (reverse of propose_attach_kb). \
              Drafts a proposal the user approves. \
              Parameters: {\"agent\": \"<existing agent name>\", \"kb\": \"<knowledge base name>\", \"rationale\": \"<why>\"}.",
+        ),
+        (
+            "check_command",
+            "Check whether an external command or interpreter (e.g. argo, python3, node, ffmpeg, kubectl) \
+             is installed and on PATH in the environment tools run in. Call this BEFORE proposing a script \
+             tool that shells out to such a command, so you don't build a tool that can't run. \
+             Parameters: {\"command\": \"<bare command name>\"}. Returns FOUND (with path) or NOT FOUND.",
         ),
         (
             "remember_feedback",
@@ -247,6 +255,38 @@ fn validate_params(
     }
 
     Ok(())
+}
+
+/// The external command a script handler actually invokes — used to preflight its
+/// existence. Unwraps `/usr/bin/env <cmd>` to `<cmd>`. For shell wrappers
+/// (`sh -c`, `bash -lc`) it returns the wrapper (always present); commands invoked
+/// *inside* the script can't be inferred statically — declare those in `requires`.
+fn handler_command(program: &str, args: &[String]) -> Option<String> {
+    let base = program.rsplit('/').next().unwrap_or(program);
+    if base == "env" {
+        // `/usr/bin/env python3 …` → the real command is the first token that isn't
+        // an `env` flag (`-S`, `-i`, …) or a `VAR=value` assignment.
+        return args
+            .iter()
+            .find(|a| !a.starts_with('-') && !a.contains('='))
+            .cloned();
+    }
+    Some(program.to_string())
+}
+
+/// Is `cmd` runnable — an existing file path, or a bare name found on PATH? Uses
+/// the daemon's PATH, which is exactly what the sealed tool env inherits
+/// (BASELINE_ENV), so this predicts the real spawn environment.
+fn command_on_path(cmd: &str) -> bool {
+    if cmd.contains('/') {
+        return std::path::Path::new(cmd).is_file();
+    }
+    std::env::var("PATH")
+        .map(|path| {
+            path.split(':')
+                .any(|dir| !dir.is_empty() && std::path::Path::new(dir).join(cmd).is_file())
+        })
+        .unwrap_or(false)
 }
 
 /// Resolve the tool timeout. Precedence: the tool's own `timeout_secs` (for
@@ -407,6 +447,26 @@ pub async fn execute_tool(
     );
     let args: Vec<String> = tokens.map(|a| expand_tilde(&a)).collect();
 
+    // ── Preflight: the tool's external commands must exist on PATH ────────────
+    // Fail with a clear message instead of a cryptic spawn error when a required
+    // command/interpreter isn't installed (e.g. a tool that shells out to `argo`
+    // when argo isn't on PATH). Checks the handler's own command plus any declared
+    // in `requires`.
+    let mut needed: Vec<String> = Vec::new();
+    if let Some(cmd) = handler_command(&program, &args) {
+        needed.push(cmd);
+    }
+    needed.extend(tool.requires.iter().cloned());
+    for cmd in &needed {
+        if !command_on_path(cmd) {
+            return Err(anyhow!(
+                "Tool '{}' needs `{}`, but it is not installed or not on PATH in this environment. \
+                 Install it, put its full path in the handler, or use an HTTP tool instead.",
+                tool_name, cmd
+            ));
+        }
+    }
+
     let mut command = Command::new(&program);
     command
         .args(&args)
@@ -545,6 +605,7 @@ mod tests {
             side_effect: Default::default(),
             http: None,
             timeout_secs: None,
+            requires: Vec::new(),
         }];
         (agent, path)
     }
