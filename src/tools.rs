@@ -503,7 +503,13 @@ pub async fn execute_tool(
 
     if let Some(mut stdin) = child.stdin.take() {
         let payload = parameters.to_string();
-        stdin.write_all(payload.as_bytes()).await?;
+        // Best-effort: a tool that never reads stdin (e.g. `echo done`) can close
+        // its read end and exit before we finish writing, yielding a BrokenPipe
+        // (EPIPE). The params are also passed via AGENTA_TOOL_PARAMS, so a failed
+        // stdin write is not fatal — don't let it abort an otherwise-successful run.
+        let _ = stdin.write_all(payload.as_bytes()).await;
+        // Drop stdin to signal EOF to tools that DO consume it.
+        drop(stdin);
     }
 
     // `timeout_secs` was resolved from the tool up top.
