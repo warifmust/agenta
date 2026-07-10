@@ -754,6 +754,24 @@ impl DeepAgentExecutor {
             };
             let executor = AgentExecutor::new(self.storage.clone(), self.backend.clone());
             return match executor.execute_ephemeral(&named, Some(input)).await {
+                // execute_ephemeral is a single tool-LESS LLM call. If the spawned
+                // agent actually has tools, they did NOT run here — so whatever it
+                // "produced" (searches, sends, file writes) is hallucinated. Label
+                // the result so neither the caller (e.g. MIND) nor the user mistakes
+                // this tool-less preview for a real execution.
+                Ok(out) if !named.tools.is_empty() => {
+                    let tool_names: Vec<&str> =
+                        named.tools.iter().map(|t| t.name.as_str()).collect();
+                    Some(format!(
+                        "⚠️ Preview only — this was a single LLM call with NO tools executed. \
+\"{}\" has tools ({}) that did NOT run, so any searching/sending/writing described below \
+did not actually happen. For a real run: agenta run {} --input \"…\"\n\n{}",
+                        agent_name,
+                        tool_names.join(", "),
+                        agent_name,
+                        out
+                    ))
+                }
                 Ok(out) => Some(out),
                 Err(e)  => Some(format!("Agent {} failed: {}", agent_name, e)),
             };
