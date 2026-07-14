@@ -11,7 +11,7 @@ use crossterm::{
 use owo_colors::OwoColorize;
 
 use crate::core::{AppConfig, DaemonRequest, DaemonResponse};
-use super::commands::daemon_request;
+use super::commands::{daemon_request, styled_table};
 
 /// All slash commands: (command, description). Single source of truth for the
 /// live palette and `/help` so they can never drift apart.
@@ -526,10 +526,7 @@ async fn cmd_list_kb(config: &AppConfig) -> Result<()> {
         println!("{}", "No knowledge bases. Create one: agenta knowledge create <name>".dimmed());
         return Ok(());
     }
-    use comfy_table::Table;
-    let mut table = Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    let mut table = styled_table();
     table.set_header(vec!["NAME", "EMBEDDER", "DIM"]);
     for kb in &kbs {
         table.add_row(vec![kb.name.as_str(), kb.embedder.as_str(), &kb.dimension.to_string()]);
@@ -631,10 +628,7 @@ async fn cmd_list(config: &AppConfig) -> Result<()> {
         println!("{}", "No agents found. Use /create-agent to create one.".dimmed());
         return Ok(());
     }
-    use comfy_table::{Table, Cell, CellAlignment};
-    let mut table = Table::new();
-    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    let mut table = styled_table();
     table.set_header(vec!["NAME", "MODEL", "STATUS", "PROVIDER", "MODE"]);
     for agent in &agents {
         table.add_row(vec![
@@ -655,13 +649,10 @@ async fn cmd_list_tools(config: &AppConfig) -> Result<()> {
         println!("{}", "No tools found. Use /create-tool to create one.".dimmed());
         return Ok(());
     }
-    use comfy_table::Table;
     // Keep the DESCRIPTION column compact — truncate long descriptions with an ellipsis
     // so a single verbose tool doesn't blow out the whole table width.
     const DESC_MAX: usize = 50;
-    let mut table = Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    let mut table = styled_table();
     table.set_header(vec!["NAME", "DESCRIPTION", "ENABLED"]);
     for tool in &tools {
         let desc = tool["description"].as_str().unwrap_or("-");
@@ -1161,9 +1152,7 @@ fn detail_cell(v: &serde_json::Value) -> String {
 /// A Property/Value table that wraps long values to the terminal — matches `agenta
 /// tool get`.
 fn detail_table() -> comfy_table::Table {
-    let mut table = comfy_table::Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+    let mut table = styled_table();
     table.set_header(vec!["Property", "Value"]);
     table
 }
