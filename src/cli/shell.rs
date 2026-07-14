@@ -331,6 +331,19 @@ impl PaletteReader {
 
         let menu = matches_in(self.commands, &self.buf);
         let menu_open = self.buf.starts_with('/') && !menu.is_empty();
+
+        // When the input fills exactly to the right edge, terminals leave the cursor
+        // in a "pending wrap" at the end of the row instead of advancing to the next
+        // line. Our row math (below) counts it as a new row, so without forcing the
+        // advance the stored cursor_row is one too high and the next clear_all()
+        // MoveUp overshoots — shoving the earlier lines upward. An explicit newline
+        // makes the terminal's position and our bookkeeping agree.
+        let prompt_cols = self.prompt.chars().count();
+        let input_cols = prompt_cols + self.buf.chars().count();
+        if !menu_open && !self.buf.is_empty() && input_cols % width == 0 {
+            write!(out, "\r\n")?;
+        }
+
         if menu_open {
             for (i, (cmd, desc)) in menu.iter().enumerate() {
                 write!(out, "\r\n")?;
