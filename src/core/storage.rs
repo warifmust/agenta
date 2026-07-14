@@ -51,6 +51,12 @@ pub trait Storage: Send + Sync {
     /// Cancel all running executions for an agent
     async fn cancel_running_executions(&self, agent_id: &str) -> Result<()>;
 
+    /// Reconcile runs orphaned by a previous daemon exit (crash or restart).
+    /// A freshly-started daemon owns no running tasks, so any execution still
+    /// marked "running" was interrupted — cancel it and return its agent to
+    /// "active". Returns the number of executions reconciled.
+    async fn reconcile_interrupted_runs(&self) -> Result<u64>;
+
     /// Get active scheduled agents
     async fn get_scheduled_agents(&self) -> Result<Vec<Agent>>;
 
@@ -953,6 +959,20 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn reconcile_interrupted_runs(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE executions SET status = '"cancelled"', completed_at = ?1 WHERE status = '"running"'"#,
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(r#"UPDATE agents SET status = '"active"' WHERE status = '"running"'"#)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
         sqlx::query(
             r#"
@@ -1709,6 +1729,20 @@ impl Storage for PostgresStorage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn reconcile_interrupted_runs(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let res = sqlx::query(
+            r#"UPDATE executions SET status = '"cancelled"', completed_at = $1 WHERE status = '"running"'"#,
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(r#"UPDATE agents SET status = '"active"' WHERE status = '"running"'"#)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {

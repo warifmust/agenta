@@ -49,6 +49,16 @@ impl DaemonState {
     }
 
     pub async fn start_background_tasks(&self) -> anyhow::Result<()> {
+        // Reconcile runs orphaned by a previous daemon exit (crash or restart).
+        // A fresh daemon owns no running tasks, so anything still "running" was
+        // interrupted — cancel it and return its agent to active, so it doesn't
+        // sit as a permanent "running" ghost.
+        match self.storage.reconcile_interrupted_runs().await {
+            Ok(0) => {}
+            Ok(n) => info!("Reconciled {} interrupted run(s) from a previous daemon", n),
+            Err(e) => warn!("Startup run reconciliation failed: {}", e),
+        }
+
         // Start cron scheduler
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         *self.event_sender.write().await = Some(tx.clone());
