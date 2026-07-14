@@ -190,12 +190,23 @@ pub async fn handle_knowledge_command(command: KnowledgeCommands, config: &AppCo
             let kbs = store.list_kbs().await?;
             if kbs.is_empty() {
                 println!("{}", "No knowledge bases.".dimmed());
-            }
-            for kb in kbs {
-                println!(
-                    "  {}  ({}, {}-dim)  {}",
-                    kb.name.bold().cyan(), kb.embedder, kb.dimension, kb.created_at.dimmed()
-                );
+            } else {
+                let mut table = crate::cli::commands::styled_table();
+                table.set_header(vec!["Name", "Embedder", "Dim", "Created"]);
+                for kb in kbs {
+                    let created = kb
+                        .created_at
+                        .get(0..16)
+                        .unwrap_or(&kb.created_at)
+                        .replace('T', " ");
+                    table.add_row(vec![
+                        kb.name,
+                        kb.embedder,
+                        kb.dimension.to_string(),
+                        created,
+                    ]);
+                }
+                println!("{table}");
             }
         }
         KnowledgeCommands::Remove { name } => {

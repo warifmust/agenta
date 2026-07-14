@@ -1805,7 +1805,7 @@ fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
 
 /// Shared table style used across every CLI table (list + detail views), so the
 /// UI stays consistent: condensed UTF-8 borders + dynamic wrapping to terminal width.
-fn styled_table() -> Table {
+pub(crate) fn styled_table() -> Table {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
     table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
