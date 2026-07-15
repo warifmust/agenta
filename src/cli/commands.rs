@@ -1287,12 +1287,37 @@ async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {
         // command (or its job-control group) takes the daemon down with it.
         let daemon_bin = resolve_daemon_binary()?;
         use std::os::unix::process::CommandExt;
-        let _child = std::process::Command::new(daemon_bin)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()?;
+
+        // Send the daemon's output to a log file rather than /dev/null. Without this
+        // a startup crash is silent: the socket never appears, and all we could do
+        // was guess at the cause. The log lets us show the real error below.
+        let log_path = data_dir.join("daemon.log");
+        let log_out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path);
+
+        let mut cmd = std::process::Command::new(daemon_bin);
+        cmd.stdin(std::process::Stdio::null()).process_group(0);
+        match &log_out {
+            Ok(f) => {
+                let (out, err) = (f.try_clone(), f.try_clone());
+                match (out, err) {
+                    (Ok(o), Ok(e)) => {
+                        cmd.stdout(o).stderr(e);
+                    }
+                    _ => {
+                        cmd.stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                    }
+                }
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
+        let _child = cmd.spawn()?;
 
         // Wait for daemon to start
         for _ in 0..20 {
@@ -1303,11 +1328,38 @@ async fn daemon_start(config: &AppConfig, foreground: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        return Err(anyhow!(
-            "Daemon did not come up within timeout. Another process may be holding the socket \
-             or ports 8789/8790. Inspect with `pgrep -fl agenta-daemon` and `lsof -i :8789`, \
-             then run `agenta daemon stop` and try again."
-        ));
+        // It never came up. Surface the daemon's own error — that's almost always
+        // the real reason — instead of guessing about port conflicts.
+        let tail = std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| {
+                s.lines()
+                    .rev()
+                    .take(15)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|s| !s.trim().is_empty());
+
+        return Err(match tail {
+            Some(t) => anyhow!(
+                "Daemon failed to start. Its last output ({}):\n\n{}\n\n\
+                 If that looks like a port/socket clash, check `pgrep -fl agenta-daemon` \
+                 and `lsof -i :8789`, then `agenta daemon stop` and retry.",
+                log_path.display(),
+                t
+            ),
+            None => anyhow!(
+                "Daemon did not come up within timeout, and wrote no output to {}. \
+                 Another process may be holding the socket or ports 8789/8790. Inspect with \
+                 `pgrep -fl agenta-daemon` and `lsof -i :8789`, then run `agenta daemon stop` \
+                 and try again. For full output run: agenta daemon start --foreground",
+                log_path.display()
+            ),
+        });
     }
 
     Ok(())

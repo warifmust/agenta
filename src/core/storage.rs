@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{
     postgres::PgPoolOptions,
-    sqlite::SqlitePoolOptions,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Pool, Row, Sqlite, Postgres,
 };
 use std::path::Path;
+use std::str::FromStr;
 
 use super::agent::{Agent, ExecutionResult, ToolExecution, ToolResource, ScriptDefinition, ScriptExecution, ScriptExecutionStatus};
 use super::proposal::{Proposal, ProposalStatus};
@@ -156,9 +157,14 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub async fn new(database_url: &str) -> Result<Self> {
+        // sqlx will NOT create a missing SQLite file on its own — it fails with
+        // SQLITE_CANTOPEN (code 14) instead, which breaks every fresh install
+        // (the db doesn't exist until the first run). Ask for it explicitly.
+        let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(options)
             .await?;
 
         let storage = Self { pool };
@@ -167,6 +173,12 @@ impl SqliteStorage {
     }
 
     pub async fn from_path(path: &Path) -> Result<Self> {
+        // SQLite can create the file, but not the directory holding it.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
         let database_url = format!("sqlite:{}", path.display());
         Self::new(&database_url).await
     }
@@ -2559,4 +2571,34 @@ fn row_to_script_execution_pg(row: &sqlx::postgres::PgRow) -> Option<ScriptExecu
         error: get_optional_string("error"),
         triggered_by: get_string("triggered_by").unwrap_or_else(|| "manual".to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh install has no database file yet — sqlx will not create one unless
+    /// asked, and failing that surfaces as an opaque SQLITE_CANTOPEN (code 14).
+    /// This path regresses easily because dev setups usually point at Postgres, so
+    /// pin it: opening a brand-new path must create both the directory and the file.
+    #[tokio::test]
+    async fn sqlite_storage_creates_a_missing_database_file_and_dir() {
+        let dir = std::env::temp_dir().join(format!("agenta-sqlite-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("nested").join("agenta.db");
+        assert!(!db.exists(), "precondition: database must not exist yet");
+
+        let storage = SqliteStorage::from_path(&db)
+            .await
+            .expect("a fresh install must be able to create its database");
+
+        assert!(db.exists(), "the database file should be created on first open");
+
+        // The schema should be initialised, i.e. the store is actually usable.
+        storage
+            .list_agents()
+            .await
+            .expect("schema should be initialised and queryable");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
