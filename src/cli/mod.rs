@@ -142,6 +142,11 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         prompt_file: Option<String>,
 
+        /// Edit the system prompt in $EDITOR, preloaded with the current one.
+        /// The shell never sees the text, so backticks and quotes are safe.
+        #[arg(long)]
+        edit_prompt: bool,
+
         /// New description
         #[arg(short, long)]
         description: Option<String>,

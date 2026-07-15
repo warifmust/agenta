@@ -33,6 +33,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_agent",
     "propose_create_tool",
     "propose_create_agent",
+    "propose_update_agent",
     "propose_attach_kb",
     "propose_detach_kb",
     "check_command",
@@ -119,6 +120,18 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
              \"description\": \"<optional>\", \"rationale\": \"<why>\"}. \
              If the user asks for BOTH a tool and an agent that uses it, propose the tool first and have \
              the user approve it, then propose the agent referencing that tool by name.",
+        ),
+        (
+            "propose_update_agent",
+            "Propose a change to an EXISTING agent — use this to rewrite or improve an agent's system \
+             prompt, description, or model. Drafts a proposal the user approves; does NOT apply it \
+             directly, so never claim the agent has changed. \
+             Parameters: {\"agent\": \"<existing agent name>\", \
+             \"system_prompt\": \"<the full new prompt — send the WHOLE prompt, it replaces the old one>\", \
+             \"description\": \"<optional>\", \"model\": \"<optional>\", \"rationale\": \"<why>\"}. \
+             At least one of system_prompt/description/model is required. Call get_agent first so your \
+             rewrite builds on the current prompt instead of dropping parts of it. This is the right way \
+             to fix an agent's behaviour — do NOT tell the user to run `agenta update` by hand.",
         ),
         (
             "propose_attach_kb",

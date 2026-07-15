@@ -157,6 +157,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             model: new_model,
             prompt: new_prompt,
             prompt_file: new_prompt_file,
+            edit_prompt: new_edit_prompt,
             description: new_description,
             temperature: new_temp,
             max_tokens: new_max_tokens,
@@ -199,6 +200,15 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(prompt) = new_prompt {
                 agent.system_prompt = prompt;
+            }
+            if new_edit_prompt {
+                match edit_text_in_editor(&agent.system_prompt, &agent.name)? {
+                    Some(edited) => agent.system_prompt = edited,
+                    None => {
+                        println!("{}", "No changes — prompt left as-is.".dimmed());
+                        return Ok(());
+                    }
+                }
             }
             if let Some(desc) = new_description {
                 agent.description = Some(desc);
@@ -1914,6 +1924,48 @@ fn apply_provider_to_config(
     }
 
     doc
+}
+
+/// Open `initial` in the user's editor and hand back what they saved.
+///
+/// This exists because a long system prompt is miserable to pass on a command
+/// line: the shell expands backticks (so `` `tavily_search` `` in a prompt runs
+/// as a command), eats quotes, and mangles newlines. Here the text only ever
+/// travels through a file, so it survives verbatim.
+///
+/// Returns Ok(None) when the text came back unchanged or empty, so callers can
+/// treat "user bailed out" as a no-op rather than wiping the prompt.
+fn edit_text_in_editor(initial: &str, label: &str) -> Result<Option<String>> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let path = std::env::temp_dir().join(format!("agenta-{}-{}.md", label, std::process::id()));
+    std::fs::write(&path, initial)
+        .with_context(|| format!("writing temp prompt to {}", path.display()))?;
+
+    // Editors need the real terminal, so inherit stdio rather than capturing it.
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("launching editor '{}' (set $EDITOR to change)", editor))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err(anyhow!("Editor '{}' exited with {}", editor, status));
+    }
+
+    let edited = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading back {}", path.display()))?;
+    let _ = std::fs::remove_file(&path);
+
+    if edited.trim().is_empty() || edited == initial {
+        return Ok(None);
+    }
+    Ok(Some(edited))
 }
 
 pub(crate) fn styled_table() -> Table {

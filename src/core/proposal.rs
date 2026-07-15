@@ -48,6 +48,15 @@ pub enum ProposalAction {
     AttachKb { agent: String, kb: String },
     /// Detach a knowledge base from an existing agent (by names).
     DetachKb { agent: String, kb: String },
+    /// Revise an existing agent in place. Only the fields present are changed —
+    /// deliberately limited to prompt/description/model so a proposal can refine
+    /// an agent but never destroy one (there is no delete variant by design).
+    UpdateAgent {
+        agent: String,
+        system_prompt: Option<String>,
+        description: Option<String>,
+        model: Option<String>,
+    },
 }
 
 impl ProposalAction {
@@ -58,6 +67,7 @@ impl ProposalAction {
             ProposalAction::CreateAgent(a) => format!("create agent '{}'", a.name),
             ProposalAction::AttachKb { agent, kb } => format!("attach kb '{}' to '{}'", kb, agent),
             ProposalAction::DetachKb { agent, kb } => format!("detach kb '{}' from '{}'", kb, agent),
+            ProposalAction::UpdateAgent { agent, .. } => format!("update agent '{}'", agent),
         }
     }
 
@@ -77,6 +87,10 @@ impl ProposalAction {
             // Attaching/detaching a KB only changes what context an agent retrieves;
             // fully reversible. Low risk.
             ProposalAction::AttachKb { .. } | ProposalAction::DetachKb { .. } => Risk::Low,
+            // Rewriting an agent's prompt changes how it behaves on the next run,
+            // and the old wording is gone once applied — worth a second look, but
+            // it can't touch tools, data, or the agent's existence.
+            ProposalAction::UpdateAgent { .. } => Risk::Elevated,
         }
     }
 }

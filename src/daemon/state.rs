@@ -826,6 +826,43 @@ impl DaemonState {
                 self.storage.create_agent(agent).await?;
                 Ok(format!("Created agent '{}'", agent.name))
             }
+            ProposalAction::UpdateAgent {
+                agent,
+                system_prompt,
+                description,
+                model,
+            } => {
+                let mut a = self
+                    .storage
+                    .get_agent_by_name(agent)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent))?;
+
+                let mut changed: Vec<&str> = Vec::new();
+                if let Some(p) = system_prompt {
+                    if p.trim().is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Refusing to set an empty system prompt on '{}'",
+                            agent
+                        ));
+                    }
+                    a.system_prompt = p.clone();
+                    changed.push("system prompt");
+                }
+                if let Some(d) = description {
+                    a.description = Some(d.clone());
+                    changed.push("description");
+                }
+                if let Some(m) = model {
+                    a.model = m.clone();
+                    changed.push("model");
+                }
+                if changed.is_empty() {
+                    return Ok(format!("Nothing to change on '{}'", agent));
+                }
+                self.storage.update_agent(&a).await?;
+                Ok(format!("Updated {} on '{}'", changed.join(" + "), agent))
+            }
             ProposalAction::AttachKb { agent, kb } => {
                 let mut a = self
                     .storage

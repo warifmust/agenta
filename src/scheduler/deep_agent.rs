@@ -335,6 +335,7 @@ impl DeepAgentExecutor {
             "get_agent"   => self.builtin_get_agent(parameters).await,
             "propose_create_tool" => self.builtin_propose_create_tool(parent, parameters).await,
             "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
+            "propose_update_agent" => self.builtin_propose_update_agent(parent, parameters).await,
             "propose_attach_kb" => self.builtin_propose_kb(parent, parameters, true).await,
             "propose_detach_kb" => self.builtin_propose_kb(parent, parameters, false).await,
             "check_command" => self.builtin_check_command(parameters).await,
@@ -585,6 +586,75 @@ impl DeepAgentExecutor {
     /// Propose attaching (attach=true) or detaching a knowledge base to/from an
     /// existing agent. Verifies the agent exists here; the KB's existence is checked
     /// at apply time. Drafts a proposal — does not mutate.
+    /// Propose a revision to an existing agent. Deliberately limited to
+    /// prompt/description/model: MIND can refine an agent it built, but there is
+    /// no delete path — the worst an approved proposal can do is reword it.
+    async fn builtin_propose_update_agent(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+    ) -> Option<String> {
+        let agent = match params.get("agent").and_then(|v| v.as_str()) {
+            Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+            _ => {
+                return Some(
+                    "Error: propose_update_agent requires a non-empty 'agent' (the name).".into(),
+                )
+            }
+        };
+
+        match self.storage.get_agent_by_name(&agent).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Some(format!(
+                    "Agent '{}' not found — call list_agents for the real names on this machine.",
+                    agent
+                ))
+            }
+            Err(e) => return Some(format!("Error looking up agent: {}", e)),
+        }
+
+        let field = |k: &str| {
+            params
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())
+        };
+        let system_prompt = field("system_prompt");
+        let description = field("description");
+        let model = field("model");
+
+        if system_prompt.is_none() && description.is_none() && model.is_none() {
+            return Some(
+                "Error: propose_update_agent needs at least one of 'system_prompt', \
+                 'description' or 'model' to change."
+                    .into(),
+            );
+        }
+
+        let action = ProposalAction::UpdateAgent {
+            agent: agent.clone(),
+            system_prompt,
+            description,
+            model,
+        };
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let proposal = Proposal::new(action, rationale, parent.name.clone());
+        let id: String = proposal.id.chars().take(8).collect();
+        match self.storage.create_proposal(&proposal).await {
+            Ok(_) => Some(format!(
+                "Proposal {} created: update agent '{}'. Tell the user to run `agenta approve {}` (or reject {}).",
+                id, agent, id, id
+            )),
+            Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
     async fn builtin_propose_kb(
         &self,
         parent: &Agent,
