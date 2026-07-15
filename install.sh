@@ -140,6 +140,17 @@ install_from_release() {
     && [ -f "${tmp}/agenta-daemon" ]        \
     || { rm -rf "$tmp"; return 1; }
 
+  # The files existing isn't proof they RUN here: a glibc/ABI mismatch extracts
+  # perfectly and then fails to start. Without this check we'd install a binary
+  # that can't execute and never fall back to building from source. Returning 1
+  # hands off to the cargo path instead of leaving a broken install.
+  chmod +x "${tmp}/agenta" "${tmp}/agenta-daemon" 2>/dev/null || true
+  if ! "${tmp}/agenta" --version >/dev/null 2>&1; then
+    echo "Info: prebuilt binary for ${target} does not run on this system (ABI/glibc mismatch)." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
   ensure_install_dir
   place_binaries "$tmp" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"

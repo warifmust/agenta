@@ -16,9 +16,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Build the Linux binaries with `cross`, not natively. A native build on
+          # ubuntu-latest links against that runner's glibc (2.39 on 24.04), so the
+          # binary refuses to start on anything older — Debian 12 (2.36), Ubuntu
+          # 22.04 (2.35), Rocky 9 (2.34) — which is most of the VMs people actually
+          # run. cross builds in an old-glibc image (~2.18), so the binary runs
+          # essentially anywhere. aarch64 already did this; x86_64 was the outlier.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            use_cross: false
+            use_cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
