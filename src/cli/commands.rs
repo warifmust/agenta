@@ -1073,11 +1073,21 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     println!();
 
     // ── Step 2: API key (cloud providers only) ────────────────────────────────
-    let api_key = if provider != "ollama" {
-        let (key_url, env_var) = match provider {
-            "deepseek"    => ("platform.deepseek.com/api_keys", "DEEPSEEK_API_KEY"),
-            "openrouter"  => ("openrouter.ai/keys",             "OPENROUTER_API_KEY"),
-            _             => ("platform.openai.com/api-keys",   "OPENAI_API_KEY"),
+    // Which env var this provider's key lives under (None = ollama, no key needed).
+    // Needed again further down: config.toml must point at it, or the key we save
+    // to .env is never actually used.
+    let key_env_var: Option<&str> = match provider {
+        "ollama"      => None,
+        "deepseek"    => Some("DEEPSEEK_API_KEY"),
+        "openrouter"  => Some("OPENROUTER_API_KEY"),
+        _             => Some("OPENAI_API_KEY"),
+    };
+
+    let api_key = if let Some(env_var) = key_env_var {
+        let key_url = match provider {
+            "deepseek"    => "platform.deepseek.com/api_keys",
+            "openrouter"  => "openrouter.ai/keys",
+            _             => "platform.openai.com/api-keys",
         };
         println!("{}", "  Step 2/3 — API Key".bold());
         println!("  Get your key at: {}", key_url.cyan());
@@ -1139,17 +1149,16 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
         .join(".agenta")
         .join("config.toml");
 
-    if !config_path.exists() {
-        // Write a fresh config with the chosen provider as default
-        let default_cfg = AppConfig {
-            default_provider: Some(provider.to_string()),
-            ..AppConfig::default()
-        };
-        let toml_str = toml::to_string_pretty(&default_cfg)?;
-        std::fs::create_dir_all(config_path.parent().unwrap())?;
-        std::fs::write(&config_path, toml_str)?;
-        println!("  {} ~/.agenta/config.toml", "✓ Config written to".green());
-    }
+    let existing: Option<toml::Value> = if config_path.exists() {
+        std::fs::read_to_string(&config_path).ok().and_then(|s| s.parse().ok())
+    } else {
+        None
+    };
+    let doc = apply_provider_to_config(existing, provider, key_env_var);
+
+    std::fs::create_dir_all(config_path.parent().unwrap())?;
+    std::fs::write(&config_path, toml::to_string_pretty(&doc)?)?;
+    println!("  {} ~/.agenta/config.toml", "✓ Config written to".green());
 
     // ── Start daemon if needed ────────────────────────────────────────────────
     let daemon_running = is_daemon_running(config).await;
@@ -1857,6 +1866,56 @@ fn resolve_daemon_binary() -> Result<std::path::PathBuf> {
 
 /// Shared table style used across every CLI table (list + detail views), so the
 /// UI stays consistent: condensed UTF-8 borders + dynamic wrapping to terminal width.
+/// Wire the chosen provider into config.toml, preserving anything already there.
+///
+/// `existing` is the current config (None on a fresh install, where we seed from
+/// defaults so the file still lists every setting). `key_env_var` is the env var
+/// holding the provider's API key, or None for ollama which needs no key.
+///
+/// The `[providers.<name>].api_key = "$VAR"` reference is the load-bearing part:
+/// the wizard saves the key into ~/.agenta/.env, but without this pointer
+/// `AppConfig::provider_api_key()` returns None and every cloud request is sent
+/// with no Authorization header (HTTP 401). Secrets are referenced, never inlined.
+fn apply_provider_to_config(
+    existing: Option<toml::Value>,
+    provider: &str,
+    key_env_var: Option<&str>,
+) -> toml::Value {
+    let mut doc = existing.unwrap_or_else(|| {
+        toml::Value::try_from(AppConfig::default())
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()))
+    });
+    if !doc.is_table() {
+        doc = toml::Value::Table(toml::map::Map::new());
+    }
+
+    if let toml::Value::Table(ref mut root) = doc {
+        root.insert(
+            "default_provider".into(),
+            toml::Value::String(provider.to_string()),
+        );
+
+        if let Some(env_var) = key_env_var {
+            let providers = root
+                .entry("providers".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            if let toml::Value::Table(ref mut ptable) = providers {
+                let entry = ptable
+                    .entry(provider.to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                if let toml::Value::Table(ref mut pcfg) = entry {
+                    pcfg.insert(
+                        "api_key".into(),
+                        toml::Value::String(format!("${}", env_var)),
+                    );
+                }
+            }
+        }
+    }
+
+    doc
+}
+
 pub(crate) fn styled_table() -> Table {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
@@ -2768,5 +2827,74 @@ async fn attach_tool_to_agent(config: &AppConfig, tool_name: &str, agent_name: &
         }
         DaemonResponse::Error { message } => Err(anyhow!("{}", message)),
         _ => Err(anyhow!("Unexpected response")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wizard saves the API key to .env, but the daemon only finds it via a
+    /// [providers.<name>].api_key = "$VAR" pointer in config.toml. Without that
+    /// pointer every cloud request goes out unauthenticated (HTTP 401) — which
+    /// silently broke 3 of the wizard's 4 provider choices.
+    #[test]
+    fn fresh_config_wires_the_cloud_provider_to_its_env_key() {
+        let doc = apply_provider_to_config(None, "openrouter", Some("OPENROUTER_API_KEY"));
+        let toml_str = toml::to_string_pretty(&doc).unwrap();
+
+        let cfg: AppConfig = toml::from_str(&toml_str).expect("config must parse");
+        assert_eq!(cfg.default_provider.as_deref(), Some("openrouter"));
+
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or-test");
+        assert_eq!(
+            cfg.provider_api_key("openrouter").as_deref(),
+            Some("sk-or-test"),
+            "config must resolve the provider key from .env"
+        );
+        std::env::remove_var("OPENROUTER_API_KEY");
+
+        // The secret itself is never written into config.toml.
+        assert!(toml_str.contains("$OPENROUTER_API_KEY"));
+        assert!(!toml_str.contains("sk-or-test"));
+    }
+
+    /// Re-running setup (e.g. via `agenta upgrade`) must be able to switch provider.
+    /// It used to skip the file entirely if it already existed, leaving the old
+    /// provider — and no key pointer — in place.
+    #[test]
+    fn rerunning_setup_switches_provider_and_keeps_other_settings() {
+        // A realistic existing config: a full one as the wizard first wrote it,
+        // with the user's own tweak to database_path.
+        let mut existing = toml::Value::try_from(AppConfig::default()).unwrap();
+        if let toml::Value::Table(ref mut t) = existing {
+            t.insert("default_provider".into(), toml::Value::String("ollama".into()));
+            t.insert(
+                "database_path".into(),
+                toml::Value::String("/custom/path/agenta.db".into()),
+            );
+        }
+
+        let doc = apply_provider_to_config(Some(existing), "deepseek", Some("DEEPSEEK_API_KEY"));
+        let toml_str = toml::to_string_pretty(&doc).unwrap();
+        let cfg: AppConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(cfg.default_provider.as_deref(), Some("deepseek"), "provider must switch");
+        assert_eq!(
+            cfg.database_path, "/custom/path/agenta.db",
+            "unrelated settings must be preserved"
+        );
+        assert!(toml_str.contains("$DEEPSEEK_API_KEY"));
+    }
+
+    /// Ollama needs no key, so it must not get an api_key pointer.
+    #[test]
+    fn ollama_gets_no_api_key_pointer() {
+        let doc = apply_provider_to_config(None, "ollama", None);
+        let toml_str = toml::to_string_pretty(&doc).unwrap();
+        let cfg: AppConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(cfg.default_provider.as_deref(), Some("ollama"));
+        assert!(cfg.provider_api_key("ollama").is_none());
     }
 }
