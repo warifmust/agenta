@@ -595,11 +595,48 @@ impl DaemonState {
             .get_tool(id_or_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Tool not found"))?;
+        let previous_name = existing.name.clone();
         tool.id = existing.id;
         tool.created_at = existing.created_at;
         tool.updated_at = chrono::Utc::now();
         self.storage.update_tool(&tool).await?;
+        // Agents carry their own copy of each tool, so updating the registry alone
+        // leaves them running the old definition — the update looks applied but
+        // changes nothing where it matters. Push it out to them too.
+        self.sync_tool_to_agents(&previous_name, &tool).await?;
         Ok(())
+    }
+
+    /// Refresh every agent's embedded copy of `tool` (matched by its previous
+    /// name, so a rename still finds them). Returns how many agents were updated.
+    pub async fn sync_tool_to_agents(
+        &self,
+        previous_name: &str,
+        tool: &ToolResource,
+    ) -> anyhow::Result<usize> {
+        let agents = self.storage.list_agents().await?;
+        let mut updated = 0usize;
+        for mut agent in agents {
+            let mut touched = false;
+            for slot in agent.tools.iter_mut() {
+                if slot.name == previous_name {
+                    let mut next = tool.as_definition();
+                    // `timeout_secs` and `requires` live only on the agent's copy —
+                    // the registry doesn't model them — so they're per-agent tuning
+                    // (ACE's run_pipeline needs 900s, not the 120s default). Carry
+                    // them across, or syncing would silently undo that.
+                    next.timeout_secs = slot.timeout_secs;
+                    next.requires = slot.requires.clone();
+                    *slot = next;
+                    touched = true;
+                }
+            }
+            if touched {
+                self.storage.update_agent(&agent).await?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub async fn delete_tool(&self, id_or_name: &str) -> anyhow::Result<bool> {
@@ -825,6 +862,26 @@ impl DaemonState {
                 }
                 self.storage.create_agent(agent).await?;
                 Ok(format!("Created agent '{}'", agent.name))
+            }
+            ProposalAction::UpdateTool { previous_name, tool } => {
+                let existing = self
+                    .get_tool(previous_name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Tool '{}' not found", previous_name))?;
+                let mut next = tool.clone();
+                next.id = existing.id;
+                next.created_at = existing.created_at;
+                next.updated_at = chrono::Utc::now();
+                self.storage.update_tool(&next).await?;
+                let synced = self.sync_tool_to_agents(previous_name, &next).await?;
+                Ok(format!(
+                    "Updated tool '{}'{}",
+                    next.name,
+                    match synced {
+                        0 => String::new(),
+                        n => format!(" (refreshed in {} agent(s))", n),
+                    }
+                ))
             }
             ProposalAction::UpdateAgent {
                 agent,

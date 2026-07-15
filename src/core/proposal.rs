@@ -57,6 +57,13 @@ pub enum ProposalAction {
         description: Option<String>,
         model: Option<String>,
     },
+    /// Replace an existing tool's definition. Payload is the full new tool; it
+    /// keeps the old tool's identity and is pushed out to agents using it.
+    /// `previous_name` is how we find those agents when the tool is renamed.
+    UpdateTool {
+        previous_name: String,
+        tool: ToolResource,
+    },
 }
 
 impl ProposalAction {
@@ -68,6 +75,7 @@ impl ProposalAction {
             ProposalAction::AttachKb { agent, kb } => format!("attach kb '{}' to '{}'", kb, agent),
             ProposalAction::DetachKb { agent, kb } => format!("detach kb '{}' from '{}'", kb, agent),
             ProposalAction::UpdateAgent { agent, .. } => format!("update agent '{}'", agent),
+            ProposalAction::UpdateTool { tool, .. } => format!("update tool '{}'", tool.name),
         }
     }
 
@@ -91,6 +99,15 @@ impl ProposalAction {
             // and the old wording is gone once applied — worth a second look, but
             // it can't touch tools, data, or the agent's existence.
             ProposalAction::UpdateAgent { .. } => Risk::Elevated,
+            // A handler is executable code, and this rewrites a tool you already
+            // approved and attached to agents — a read-only tool could be quietly
+            // turned into something that writes. Rate it on the NEW definition and
+            // never below Elevated: silently re-trusting an existing tool is the
+            // thing to avoid.
+            ProposalAction::UpdateTool { tool, .. } => match tool.side_effect {
+                SideEffect::Destructive => Risk::Destructive,
+                _ => Risk::Elevated,
+            },
         }
     }
 }

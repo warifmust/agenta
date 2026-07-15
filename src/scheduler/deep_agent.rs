@@ -336,6 +336,7 @@ impl DeepAgentExecutor {
             "propose_create_tool" => self.builtin_propose_create_tool(parent, parameters).await,
             "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
             "propose_update_agent" => self.builtin_propose_update_agent(parent, parameters).await,
+            "propose_update_tool" => self.builtin_propose_update_tool(parent, parameters).await,
             "propose_attach_kb" => self.builtin_propose_kb(parent, parameters, true).await,
             "propose_detach_kb" => self.builtin_propose_kb(parent, parameters, false).await,
             "check_command" => self.builtin_check_command(parameters).await,
@@ -586,6 +587,110 @@ impl DeepAgentExecutor {
     /// Propose attaching (attach=true) or detaching a knowledge base to/from an
     /// existing agent. Verifies the agent exists here; the KB's existence is checked
     /// at apply time. Drafts a proposal — does not mutate.
+    /// Propose a revision to an existing tool.
+    ///
+    /// Patch semantics on purpose: we start from the tool as it exists and apply
+    /// only the fields given, so fixing one thing (say, adding a header) can't
+    /// silently drop the schema or the secret allowlist. The proposal still
+    /// carries the fully-resolved tool, so what the user approves is exactly what
+    /// gets written.
+    async fn builtin_propose_update_tool(
+        &self,
+        parent: &Agent,
+        params: &serde_json::Value,
+    ) -> Option<String> {
+        let name = match params
+            .get("tool")
+            .or_else(|| params.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => {
+                return Some(
+                    "Error: propose_update_tool requires a non-empty 'tool' (the tool's name)."
+                        .into(),
+                )
+            }
+        };
+
+        let existing = match self.storage.get_tool_by_name(&name).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return Some(format!(
+                    "Tool '{}' not found — call list_tools for the real names on this machine.",
+                    name
+                ))
+            }
+            Err(e) => return Some(format!("Error looking up tool: {}", e)),
+        };
+
+        let mut next = existing.clone();
+        let mut changed: Vec<&str> = Vec::new();
+
+        if let Some(d) = params.get("description").and_then(|v| v.as_str()) {
+            if !d.trim().is_empty() {
+                next.description = d.to_string();
+                changed.push("description");
+            }
+        }
+        if let Some(h) = params.get("handler").and_then(|v| v.as_str()) {
+            if !h.trim().is_empty() {
+                next.handler = Some(h.to_string());
+                changed.push("handler");
+            }
+        }
+        if let Some(p) = params.get("parameters").filter(|p| !p.is_null()) {
+            next.parameters = p.clone();
+            changed.push("parameters");
+        }
+        if let Some(secrets) = params.get("secrets").and_then(|v| v.as_array()) {
+            next.secrets = secrets
+                .iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect();
+            changed.push("secrets");
+        }
+        if let Some(se) = params.get("side_effect").and_then(|v| v.as_str()) {
+            next.side_effect = match se.to_lowercase().replace('-', "_").as_str() {
+                "write" => SideEffect::Write,
+                "destructive" => SideEffect::Destructive,
+                _ => SideEffect::ReadOnly,
+            };
+            changed.push("side_effect");
+        }
+        if let Some(http) = params.get("http").filter(|h| !h.is_null()) {
+            next.http = serde_json::from_value(http.clone()).ok();
+            changed.push("http");
+        }
+
+        if changed.is_empty() {
+            return Some(
+                "Error: propose_update_tool needs at least one field to change \
+                 (handler, description, parameters, secrets, side_effect or http)."
+                    .into(),
+            );
+        }
+
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let action = ProposalAction::UpdateTool {
+            previous_name: name.clone(),
+            tool: next,
+        };
+        let proposal = Proposal::new(action, rationale, parent.name.clone());
+        let id: String = proposal.id.chars().take(8).collect();
+        match self.storage.create_proposal(&proposal).await {
+            Ok(_) => Some(format!(
+                "Proposal {} created: update tool '{}' ({}). Tell the user to run `agenta approve {}` (or reject {}).",
+                id, name, changed.join(" + "), id, id
+            )),
+            Err(e) => Some(format!("Error creating proposal: {}", e)),
+        }
+    }
+
     /// Propose a revision to an existing agent. Deliberately limited to
     /// prompt/description/model: MIND can refine an agent it built, but there is
     /// no delete path — the worst an approved proposal can do is reword it.

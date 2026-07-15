@@ -34,6 +34,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "propose_create_tool",
     "propose_create_agent",
     "propose_update_agent",
+    "propose_update_tool",
     "propose_attach_kb",
     "propose_detach_kb",
     "check_command",
@@ -132,6 +133,20 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
              At least one of system_prompt/description/model is required. Call get_agent first so your \
              rewrite builds on the current prompt instead of dropping parts of it. This is the right way \
              to fix an agent's behaviour — do NOT tell the user to run `agenta update` by hand.",
+        ),
+        (
+            "propose_update_tool",
+            "Propose a change to an EXISTING tool — use this to FIX a tool (a broken handler, a missing \
+             header, a wrong schema, a wrong side-effect). Drafts a proposal the user approves; does NOT \
+             apply it directly, so never claim the tool is fixed. \
+             Parameters: {\"tool\": \"<existing tool name>\", and any of: \
+             \"handler\": \"<new command or URL>\", \"description\": \"<...>\", \
+             \"parameters\": <new JSON schema>, \"secrets\": [\"ENV_VAR\"], \
+             \"side_effect\": \"read_only|write|destructive\", \
+             \"http\": {\"method\":\"GET\",\"headers\":{...}}, \"rationale\": \"<why>\"}. \
+             Only send the fields you want to change — everything else is kept as-is. Call get_tool first \
+             to see the current definition. Applying also refreshes the tool inside every agent using it. \
+             Do NOT tell the user to run `agenta tool update` by hand.",
         ),
         (
             "propose_attach_kb",
