@@ -75,6 +75,12 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 return create_interactive(config).await;
             }
 
+            // --name is optional on the parser so `--interactive` can prompt for
+            // it; in the non-interactive path it's required.
+            let name = name.ok_or_else(|| {
+                anyhow!("--name is required (or use --interactive to be prompted for it)")
+            })?;
+
             let system_prompt = if let Some(file) = prompt_file {
                 std::fs::read_to_string(file)?
             } else {
@@ -558,9 +564,18 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             Ok(())
         }
 
-        Commands::Completion { shell: _ } => {
-            // TODO: Generate shell completions
-            println!("Shell completion generation not yet implemented");
+        Commands::Completion { shell } => {
+            use clap::CommandFactory;
+            use clap_complete::{generate, Shell};
+            let shell: Shell = shell.parse().map_err(|_| {
+                anyhow!(
+                    "Unknown shell '{}'. Supported: bash, zsh, fish, powershell, elvish",
+                    shell
+                )
+            })?;
+            let mut cmd = crate::cli::Cli::command();
+            let bin = cmd.get_name().to_string();
+            generate(shell, &mut cmd, bin, &mut std::io::stdout());
             Ok(())
         }
 

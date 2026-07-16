@@ -28,9 +28,9 @@ pub enum Commands {
 
     /// Create a new agent
     Create {
-        /// Agent name
+        /// Agent name (required unless --interactive, which prompts for it)
         #[arg(short, long)]
-        name: String,
+        name: Option<String>,
 
         /// Model to use (e.g., llama2, mistral)
         #[arg(short, long, default_value = "llama2")]
