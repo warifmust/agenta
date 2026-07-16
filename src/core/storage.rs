@@ -303,6 +303,13 @@ impl SqliteStorage {
         let _ = sqlx::query("ALTER TABLE tools ADD COLUMN http_config TEXT")
             .execute(&self.pool)
             .await;
+        // Migration: registry-level per-tool timeout + dependency list (SQLite).
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN timeout_secs INTEGER")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN requires TEXT")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -555,6 +562,13 @@ impl PostgresStorage {
             .execute(&self.pool)
             .await;
         let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS http_config TEXT")
+            .execute(&self.pool)
+            .await;
+        // Migration: registry-level per-tool timeout + dependency list (Postgres).
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS timeout_secs BIGINT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE tools ADD COLUMN IF NOT EXISTS requires TEXT")
             .execute(&self.pool)
             .await;
 
@@ -988,8 +1002,8 @@ impl Storage for SqliteStorage {
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
         )
         .bind(&tool.id)
@@ -1001,6 +1015,8 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&tool.secrets)?)
         .bind(serde_json::to_string(&tool.side_effect)?)
         .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(tool.timeout_secs.map(|t| t as i64))
+        .bind(serde_json::to_string(&tool.requires)?)
         .bind(tool.created_at.to_rfc3339())
         .bind(tool.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -1011,7 +1027,7 @@ impl Storage for SqliteStorage {
     async fn get_tool(&self, id: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools WHERE id = ?1
             "#,
         )
@@ -1024,7 +1040,7 @@ impl Storage for SqliteStorage {
     async fn get_tool_by_name(&self, name: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools WHERE name = ?1
             "#,
         )
@@ -1046,8 +1062,10 @@ impl Storage for SqliteStorage {
                 secrets = ?6,
                 side_effect = ?7,
                 http_config = ?8,
-                updated_at = ?9
-            WHERE id = ?10
+                timeout_secs = ?9,
+                requires = ?10,
+                updated_at = ?11
+            WHERE id = ?12
             "#,
         )
         .bind(&tool.name)
@@ -1058,6 +1076,8 @@ impl Storage for SqliteStorage {
         .bind(serde_json::to_string(&tool.secrets)?)
         .bind(serde_json::to_string(&tool.side_effect)?)
         .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(tool.timeout_secs.map(|t| t as i64))
+        .bind(serde_json::to_string(&tool.requires)?)
         .bind(tool.updated_at.to_rfc3339())
         .bind(&tool.id)
         .execute(&self.pool)
@@ -1076,7 +1096,7 @@ impl Storage for SqliteStorage {
     async fn list_tools(&self) -> Result<Vec<ToolResource>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools
             ORDER BY created_at DESC
             "#,
@@ -1760,8 +1780,8 @@ impl Storage for PostgresStorage {
     async fn create_tool(&self, tool: &ToolResource) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            INSERT INTO tools (id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(&tool.id)
@@ -1773,6 +1793,8 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&tool.secrets)?)
         .bind(serde_json::to_string(&tool.side_effect)?)
         .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(tool.timeout_secs.map(|t| t as i64))
+        .bind(serde_json::to_string(&tool.requires)?)
         .bind(tool.created_at.to_rfc3339())
         .bind(tool.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -1783,7 +1805,7 @@ impl Storage for PostgresStorage {
     async fn get_tool(&self, id: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools WHERE id = $1
             "#,
         )
@@ -1796,7 +1818,7 @@ impl Storage for PostgresStorage {
     async fn get_tool_by_name(&self, name: &str) -> Result<Option<ToolResource>> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools WHERE name = $1
             "#,
         )
@@ -1818,8 +1840,10 @@ impl Storage for PostgresStorage {
                 secrets = $6,
                 side_effect = $7,
                 http_config = $8,
-                updated_at = $9
-            WHERE id = $10
+                timeout_secs = $9,
+                requires = $10,
+                updated_at = $11
+            WHERE id = $12
             "#,
         )
         .bind(&tool.name)
@@ -1830,6 +1854,8 @@ impl Storage for PostgresStorage {
         .bind(serde_json::to_string(&tool.secrets)?)
         .bind(serde_json::to_string(&tool.side_effect)?)
         .bind(tool.http.as_ref().map(serde_json::to_string).transpose()?)
+        .bind(tool.timeout_secs.map(|t| t as i64))
+        .bind(serde_json::to_string(&tool.requires)?)
         .bind(tool.updated_at.to_rfc3339())
         .bind(&tool.id)
         .execute(&self.pool)
@@ -1848,7 +1874,7 @@ impl Storage for PostgresStorage {
     async fn list_tools(&self) -> Result<Vec<ToolResource>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, created_at, updated_at
+            SELECT id, name, description, parameters, handler, enabled, secrets, side_effect, http_config, timeout_secs, requires, created_at, updated_at
             FROM tools
             ORDER BY created_at DESC
             "#,
@@ -2365,6 +2391,14 @@ fn row_to_tool_sqlite(row: &sqlx::sqlite::SqliteRow) -> Option<ToolResource> {
             .unwrap_or_default(),
         http: get_optional_str("http_config")
             .and_then(|s| serde_json::from_str(s).ok()),
+        timeout_secs: row
+            .try_get::<Option<i64>, _>("timeout_secs")
+            .ok()
+            .flatten()
+            .map(|v| v as u64),
+        requires: get_optional_str("requires")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
         created_at: get_str("created_at")?.parse().ok()?,
         updated_at: get_str("updated_at")?.parse().ok()?,
     })
@@ -2394,6 +2428,14 @@ fn row_to_tool_pg(row: &sqlx::postgres::PgRow) -> Option<ToolResource> {
             .unwrap_or_default(),
         http: get_optional_string("http_config")
             .and_then(|s| serde_json::from_str(&s).ok()),
+        timeout_secs: row
+            .try_get::<Option<i64>, _>("timeout_secs")
+            .ok()
+            .flatten()
+            .map(|v| v as u64),
+        requires: get_optional_string("requires")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         created_at: get_string("created_at")?.parse().ok()?,
         updated_at: get_string("updated_at")?.parse().ok()?,
     })

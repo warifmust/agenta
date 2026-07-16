@@ -89,6 +89,13 @@ pub struct ToolResource {
     /// HTTP handler config. See `ToolDefinition::http`.
     #[serde(default)]
     pub http: Option<HttpHandler>,
+    /// Wall-clock timeout for this tool's handler, in seconds. See
+    /// `ToolDefinition::timeout_secs`. Registry-level default carried into agents.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// External commands this tool needs on PATH. See `ToolDefinition::requires`.
+    #[serde(default)]
+    pub requires: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -111,6 +118,8 @@ impl ToolResource {
             secrets: Vec::new(),
             side_effect: SideEffect::default(),
             http: None,
+            timeout_secs: None,
+            requires: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -125,8 +134,8 @@ impl ToolResource {
             secrets: self.secrets.clone(),
             side_effect: self.side_effect,
             http: self.http.clone(),
-            timeout_secs: None,
-            requires: Vec::new(),
+            timeout_secs: self.timeout_secs,
+            requires: self.requires.clone(),
         }
     }
 }

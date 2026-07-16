@@ -599,6 +599,13 @@ pub enum ToolCommands {
         /// Replace HTTP headers, "Key: Value" (repeatable, implies HTTP tool).
         #[arg(long = "http-header")]
         http_headers: Vec<String>,
+        /// Per-tool handler timeout in seconds (0 clears it, back to the default).
+        #[arg(long = "timeout-secs")]
+        timeout_secs: Option<u64>,
+        /// Commands this tool needs on PATH, comma-separated (e.g. "ffmpeg,jq").
+        /// Empty string clears the list. Omit to leave unchanged.
+        #[arg(long)]
+        requires: Option<String>,
     },
     /// Delete tool
     Delete { id: String },

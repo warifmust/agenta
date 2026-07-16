@@ -13,7 +13,7 @@ use crossterm::{
 };
 use owo_colors::OwoColorize;
 
-use crate::core::{AppConfig, DaemonRequest, DaemonResponse};
+use crate::core::{AppConfig, DaemonRequest, DaemonResponse, ScriptDefinition};
 use super::commands::{daemon_request, styled_table};
 
 /// All slash commands: (command, description). Single source of truth for the
@@ -460,8 +460,8 @@ pub(crate) async fn dispatch(input: &str, config: &AppConfig) -> Result<bool> {
         "/create-agent"          => wizard_create_agent(config).await?,
         "/update-agent"          => wizard_update_agent(config).await?,
         "/create-tool"           => wizard_create_tool(config).await?,
-        "/update-tool"           => println!("{}", "Coming soon.".dimmed()),
-        "/create-script"         => println!("{}", "Scripts coming soon.".dimmed()),
+        "/update-tool"           => wizard_update_tool(config).await?,
+        "/create-script"         => wizard_create_script(config).await?,
         "/get"                   => picker_get(config).await?,
         "/get-tool"              => picker_get_tool(config).await?,
         "/delete"                => picker_delete(config).await?,
@@ -821,6 +821,99 @@ async fn wizard_create_agent(config: &AppConfig) -> Result<()> {
         _ => {}
     }
 
+    Ok(())
+}
+
+async fn wizard_update_tool(config: &AppConfig) -> Result<()> {
+    use inquire::{Confirm, Select, Text};
+
+    let tools = fetch_tools(config).await?;
+    if tools.is_empty() {
+        println!("{}", "No tools found. Create one with /create-tool.".dimmed());
+        return Ok(());
+    }
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    let selected = Select::new("Select tool to update:", names).prompt()?;
+
+    // Fetch the full tool so we send a complete definition back (the daemon
+    // replaces the whole tool, not a partial patch).
+    let mut tool = match daemon_request(
+        config,
+        DaemonRequest::GetTool { id: selected.to_string() },
+    )
+    .await?
+    {
+        DaemonResponse::ToolDetails { tool } => tool,
+        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+        _ => return Err(anyhow::anyhow!("Unexpected response")),
+    };
+
+    println!("{}", "  Leave blank to keep the current value.".dimmed());
+
+    let new_desc = Text::new("Description:")
+        .with_default(tool["description"].as_str().unwrap_or(""))
+        .prompt()?;
+    if !new_desc.trim().is_empty() {
+        tool["description"] = serde_json::Value::String(new_desc);
+    }
+
+    let new_handler = Text::new("Handler (command or URL):")
+        .with_default(tool["handler"].as_str().unwrap_or(""))
+        .prompt()?;
+    if !new_handler.trim().is_empty() {
+        tool["handler"] = serde_json::Value::String(new_handler);
+    }
+
+    let enabled = Confirm::new("Enabled?")
+        .with_default(tool["enabled"].as_bool().unwrap_or(true))
+        .prompt()?;
+    tool["enabled"] = serde_json::Value::Bool(enabled);
+
+    let id = tool["id"].as_str().unwrap_or("").to_string();
+    match daemon_request(config, DaemonRequest::UpdateTool { id, tool }).await? {
+        DaemonResponse::Success { message } => println!("{} {}", "✓".green(), message),
+        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn wizard_create_script(config: &AppConfig) -> Result<()> {
+    use inquire::Text;
+
+    let name = Text::new("Script name:").prompt()?;
+    if name.trim().is_empty() {
+        println!("{}", "Cancelled — a name is required.".dimmed());
+        return Ok(());
+    }
+    let handler = Text::new("Handler command (e.g. /usr/bin/env bash /path/to/script.sh):").prompt()?;
+    if handler.trim().is_empty() {
+        println!("{}", "Cancelled — a handler is required.".dimmed());
+        return Ok(());
+    }
+    let description = Text::new("Description (optional):")
+        .prompt_skippable()?
+        .filter(|s| !s.trim().is_empty());
+    let schedule = Text::new("Cron schedule (optional, blank = manual):")
+        .prompt_skippable()?
+        .filter(|s| !s.trim().is_empty());
+
+    let script = ScriptDefinition::new(
+        name.trim().to_string(),
+        handler.trim().to_string(),
+        description,
+        schedule,
+    );
+    match daemon_request(
+        config,
+        DaemonRequest::CreateScript { script: serde_json::to_value(script)? },
+    )
+    .await?
+    {
+        DaemonResponse::Success { message } => println!("{} {}", "✓".green(), message),
+        DaemonResponse::Error { message } => return Err(anyhow::anyhow!("{}", message)),
+        _ => {}
+    }
     Ok(())
 }
 

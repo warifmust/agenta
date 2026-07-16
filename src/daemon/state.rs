@@ -632,12 +632,16 @@ impl DaemonState {
             for slot in agent.tools.iter_mut() {
                 if slot.name == previous_name {
                     let mut next = tool.as_definition();
-                    // `timeout_secs` and `requires` live only on the agent's copy —
-                    // the registry doesn't model them — so they're per-agent tuning
-                    // (ACE's run_pipeline needs 900s, not the 120s default). Carry
-                    // them across, or syncing would silently undo that.
-                    next.timeout_secs = slot.timeout_secs;
-                    next.requires = slot.requires.clone();
+                    // The registry value is the base (as_definition carries it), but a
+                    // per-agent override still wins — so a sync can't clobber e.g.
+                    // ACE's run_pipeline 900s timeout, while a registry-level timeout
+                    // still reaches agents that never set their own.
+                    if slot.timeout_secs.is_some() {
+                        next.timeout_secs = slot.timeout_secs;
+                    }
+                    if !slot.requires.is_empty() {
+                        next.requires = slot.requires.clone();
+                    }
                     *slot = next;
                     touched = true;
                 }

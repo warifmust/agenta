@@ -1753,6 +1753,8 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
             side_effect,
             http_method,
             http_headers,
+            timeout_secs,
+            requires,
         } => {
             let current = match daemon_request(config, DaemonRequest::GetTool { id: id.clone() }).await? {
                 DaemonResponse::ToolDetails { tool } => serde_json::from_value::<ToolResource>(tool)?,
@@ -1782,6 +1784,18 @@ async fn handle_tool_command(command: ToolCommands, config: &AppConfig) -> Resul
                 if let Some(m) = http_method { cfg.method = m; }
                 if !http_headers.is_empty() { cfg.headers = parse_http_headers(&http_headers)?; }
                 tool.http = Some(cfg);
+            }
+            // 0 clears the timeout back to the runtime default; any other value sets it.
+            if let Some(secs) = timeout_secs {
+                tool.timeout_secs = if secs == 0 { None } else { Some(secs) };
+            }
+            if let Some(list) = requires {
+                tool.requires = list
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
             }
 
             let request = DaemonRequest::UpdateTool {
@@ -2266,6 +2280,12 @@ fn print_tool_details(tool: &ToolResource) {
         tool.secrets.join(", ")
     };
     table.add_row(vec!["Secrets", &secrets]);
+    if let Some(t) = tool.timeout_secs {
+        table.add_row(vec!["Timeout", &format!("{}s", t)]);
+    }
+    if !tool.requires.is_empty() {
+        table.add_row(vec!["Requires", &tool.requires.join(", ")]);
+    }
     if let Some(http) = &tool.http {
         table.add_row(vec!["Type", &format!("HTTP ({})", http.method)]);
         table.add_row(vec!["URL", tool.handler.as_deref().unwrap_or("N/A")]);
