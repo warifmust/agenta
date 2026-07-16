@@ -3,8 +3,11 @@ use std::io::{stdout, Write};
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    queue,
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
+    execute, queue,
     style::{Attribute, SetAttribute},
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
@@ -122,6 +125,10 @@ pub(crate) struct PaletteReader {
     selected: usize,  // index into the current matches
     cursor_row: u16,  // row offset of the cursor below the prompt's first row (last render)
     hist_idx: Option<usize>,
+    /// Multi-line pastes, held aside while the buffer shows a short placeholder.
+    /// Expanded back into the line on submit. Keeps a 50-line paste from flooding
+    /// the prompt while still sending the whole thing.
+    pastes: Vec<String>,
 }
 
 impl PaletteReader {
@@ -141,6 +148,7 @@ impl PaletteReader {
             selected: 0,
             cursor_row: 0,
             hist_idx: None,
+            pastes: Vec::new(),
         }
     }
 
@@ -150,11 +158,60 @@ impl PaletteReader {
         self.selected = 0;
         self.cursor_row = 0;
         self.hist_idx = None;
+        self.pastes.clear();
 
         enable_raw_mode()?;
+        // Ask the terminal to bracket pasted text. Without this a paste is just a
+        // fast burst of keys, so every newline reads as Enter and each line gets
+        // submitted as its own message.
+        let _ = execute!(stdout(), EnableBracketedPaste);
         let result = self.event_loop(history);
+        let _ = execute!(stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
         result
+    }
+
+    /// Marker shown in the buffer in place of a multi-line paste.
+    fn paste_marker(index: usize, lines: usize) -> String {
+        format!("[Pasted text #{} +{} lines]", index, lines)
+    }
+
+    /// Insert pasted text at the cursor.
+    ///
+    /// A single-line paste is indistinguishable from typing, so it goes in as-is.
+    /// A multi-line paste is stashed and represented by a short marker instead:
+    /// dropping 50 raw lines into a one-line prompt is unreadable, and the marker
+    /// makes it obvious the whole block is queued as ONE message rather than one
+    /// message per line. `expand_pastes` puts the real text back on submit.
+    fn insert_paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+
+        let line_count = normalized.lines().count();
+        let insert = if line_count > 1 {
+            self.pastes.push(normalized);
+            Self::paste_marker(self.pastes.len(), line_count)
+        } else {
+            normalized
+        };
+
+        let idx = self.byte_idx();
+        self.buf.insert_str(idx, &insert);
+        self.cursor += insert.chars().count();
+        self.selected = 0;
+        self.hist_idx = None;
+    }
+
+    /// Swap any paste markers back for the text they stand in for.
+    fn expand_pastes(&self, line: &str) -> String {
+        let mut out = line.to_string();
+        for (i, paste) in self.pastes.iter().enumerate() {
+            let marker = Self::paste_marker(i + 1, paste.lines().count());
+            out = out.replace(&marker, paste);
+        }
+        out
     }
 
     fn event_loop(&mut self, history: &[String]) -> Result<LineResult> {
@@ -162,6 +219,11 @@ impl PaletteReader {
         loop {
             let ev = match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => k,
+                Event::Paste(text) => {
+                    self.insert_paste(&text);
+                    self.render()?;
+                    continue;
+                }
                 Event::Resize(..) => {
                     self.render()?;
                     continue;
@@ -237,7 +299,7 @@ impl PaletteReader {
                     let line = if menu_open {
                         menu[self.selected.min(menu.len() - 1)].0.to_string()
                     } else {
-                        self.buf.clone()
+                        self.expand_pastes(&self.buf)
                     };
                     return self.finish_line(line);
                 }
@@ -1237,4 +1299,58 @@ async fn picker_get_tool(config: &AppConfig) -> Result<()> {
         print_tool_detail(tool);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    fn reader() -> PaletteReader {
+        PaletteReader::new("> ", &[], (0, 0, 0))
+    }
+
+    /// The bug this guards: a multi-line paste used to arrive as a burst of keys
+    /// with an Enter per newline, so every line was submitted as its own message
+    /// (and its own LLM run). It must become ONE message.
+    #[test]
+    fn multiline_paste_submits_as_a_single_message() {
+        let mut r = reader();
+        let pasted = "# PERSONA\nYou are TRAVY.\nBe concise.";
+        r.insert_paste(pasted);
+
+        // The prompt stays readable — a marker, not 3 raw lines.
+        assert_eq!(r.buf, "[Pasted text #1 +3 lines]");
+        // ...but the whole block is what actually gets sent.
+        assert_eq!(r.expand_pastes(&r.buf), pasted);
+    }
+
+    #[test]
+    fn single_line_paste_goes_in_verbatim() {
+        let mut r = reader();
+        r.insert_paste("just one line");
+        assert_eq!(r.buf, "just one line");
+        assert_eq!(r.expand_pastes(&r.buf), "just one line");
+    }
+
+    /// Windows/editor line endings must not inflate the line count or leak \r.
+    #[test]
+    fn crlf_is_normalised() {
+        let mut r = reader();
+        r.insert_paste("one\r\ntwo");
+        assert_eq!(r.buf, "[Pasted text #1 +2 lines]");
+        assert_eq!(r.expand_pastes(&r.buf), "one\ntwo");
+    }
+
+    /// A paste can be surrounded by typed text, and several pastes can coexist.
+    #[test]
+    fn markers_expand_around_typed_text_and_multiple_pastes() {
+        let mut r = reader();
+        r.insert_paste("alpha\nbeta");
+        r.buf.push_str(" and ");
+        r.cursor = r.buf.chars().count();
+        r.insert_paste("gamma\ndelta");
+
+        assert_eq!(r.buf, "[Pasted text #1 +2 lines] and [Pasted text #2 +2 lines]");
+        assert_eq!(r.expand_pastes(&r.buf), "alpha\nbeta and gamma\ndelta");
+    }
 }

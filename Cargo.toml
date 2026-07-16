@@ -91,7 +91,10 @@ shlex = "1"
 
 # Terminal UI
 ratatui = "0.29"
-crossterm = "0.28"
+# bracketed-paste lets the terminal mark pasted text, so a multi-line paste
+# arrives as one Event::Paste instead of a burst of keystrokes with an Enter per
+# newline (which submitted each line as its own message).
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
 
 # HTTP server for triggers (local webhooks)
 axum = "0.7"
