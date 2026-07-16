@@ -101,3 +101,24 @@ jobs:
             --generate-notes \
             dist/* \
           || gh release upload "${{ github.ref_name }}" dist/* --clobber
+
+  notify-docs:
+    name: Rebuild docs site
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # The docs version badge is fetched at BUILD time, so a new release doesn't
+      # update it until the docs site rebuilds. Ping the Netlify build hook so the
+      # badge (and anything else version-derived) refreshes on its own. No-ops
+      # cleanly if the secret isn't configured, so this never blocks a release.
+      - name: Trigger Netlify docs rebuild
+        env:
+          HOOK: ${{ secrets.DOCS_BUILD_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "DOCS_BUILD_HOOK_URL secret not set — skipping docs rebuild."
+            echo "Add it (Settings → Secrets and variables → Actions) to auto-refresh the docs on release."
+            exit 0
+          fi
+          echo "Triggering Netlify docs rebuild for ${{ github.ref_name }}..."
+          curl -fsS -X POST -d '{}' "$HOOK" && echo "Docs rebuild triggered."
