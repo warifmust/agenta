@@ -17,9 +17,6 @@ pub struct Cli {
     #[arg(short, long, help = "Configuration file path")]
     pub config: Option<String>,
 
-    #[arg(short, long, help = "Output format (json, table, yaml)", default_value = "table")]
-    pub output: String,
-
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -305,8 +302,9 @@ pub enum Commands {
         #[arg(short, long)]
         input: String,
 
-        /// Format (json, yaml)
-        #[arg(short, long, default_value = "json")]
+        /// Format (json, yaml). Long-only: `-f` is reserved for `--force` here,
+        /// so `--format` and `--force` don't collide on the same short flag.
+        #[arg(long, default_value = "json")]
         format: String,
 
         /// Overwrite existing agents with the same name
@@ -697,4 +695,20 @@ pub enum ScriptCommands {
         #[arg(short, long, default_value = "20")]
         lines: usize,
     },
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// clap only validates arg definitions (duplicate short flags, bad defaults,
+    /// etc.) at runtime via a debug assertion — which is exactly how `agenta
+    /// import` shipped a hard panic: `--format` and `--force` both claimed `-f`.
+    /// Run that assertion over the whole command tree so a broken definition fails
+    /// the test suite instead of the user's terminal.
+    #[test]
+    fn cli_definition_has_no_conflicts() {
+        Cli::command().debug_assert();
+    }
 }

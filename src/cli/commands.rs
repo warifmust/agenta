@@ -2282,12 +2282,33 @@ fn print_tools_table(tools: &[ToolResource]) {
         return;
     }
     let mut table = styled_table();
-    table.set_header(vec!["Name", "Enabled", "Handler", "Updated"]);
+    table.set_header(vec!["Name", "Effect", "Secrets", "Enabled", "Handler", "Updated"]);
     for tool in tools {
+        let effect = match tool.side_effect {
+            SideEffect::ReadOnly => "read-only",
+            SideEffect::Write => "write",
+            SideEffect::Destructive => "destructive",
+        };
+        let secrets = if tool.secrets.is_empty() {
+            "—".to_string()
+        } else {
+            tool.secrets.join(", ")
+        };
+        // Keep the handler column from blowing out the table — a long URL or
+        // command is truncated with an ellipsis; use `agenta tool get` for the full
+        // value.
+        let handler = tool.handler.clone().unwrap_or_else(|| "N/A".to_string());
+        let handler = if handler.chars().count() > 48 {
+            format!("{}…", handler.chars().take(47).collect::<String>())
+        } else {
+            handler
+        };
         table.add_row(vec![
             tool.name.clone(),
+            effect.to_string(),
+            secrets,
             if tool.enabled { "yes".to_string() } else { "no".to_string() },
-            tool.handler.clone().unwrap_or_else(|| "N/A".to_string()),
+            handler,
             tool.updated_at.format("%Y-%m-%d %H:%M").to_string(),
         ]);
     }

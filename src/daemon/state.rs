@@ -177,6 +177,17 @@ impl DaemonState {
         mut agent: Agent,
     ) -> anyhow::Result<String> {
         agent.status = AgentStatus::Active;
+
+        // Validate the cron schedule BEFORE persisting. Scheduling happens after
+        // the insert below, so a bad expression there would fail *after* the agent
+        // was already committed — leaving an orphan agent with an unusable schedule.
+        if let ExecutionMode::Scheduled = agent.execution_mode {
+            if let Some(expr) = &agent.schedule {
+                expr.parse::<cron::Schedule>()
+                    .map_err(|e| anyhow::anyhow!("Invalid cron expression: {}", e))?;
+            }
+        }
+
         self.storage.create_agent(&agent).await?;
 
         // Schedule if needed
