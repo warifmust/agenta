@@ -186,6 +186,7 @@ struct App {
     exec_scroll: u16,
     daemon_ok: bool,
     daemon_version: String,
+    pending_proposals: usize,
     last_refresh: Instant,
 }
 
@@ -200,6 +201,7 @@ impl App {
             exec_scroll: 0,
             daemon_ok: false,
             daemon_version: String::new(),
+            pending_proposals: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
         }
     }
@@ -255,6 +257,14 @@ impl App {
         {
             self.executions = executions;
         }
+
+        self.pending_proposals = match daemon_request(
+            &self.config,
+            DaemonRequest::ListProposals { status: Some("pending".to_string()) },
+        ).await {
+            Ok(DaemonResponse::ProposalList { proposals }) => proposals.len(),
+            _ => 0,
+        };
     }
 }
 
@@ -453,18 +463,46 @@ fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
     let ver = if app.daemon_version.is_empty() { "—".to_string() } else { format!("v{}", app.daemon_version) };
     let (dot, dcol) = if app.daemon_ok { ("●", Color::Green) } else { ("✗", Color::Red) };
 
-    let spans = vec![
+    // Failures across all agents in the last 24h — the fleet's at-a-glance health.
+    let now = Utc::now();
+    let fails_24h = app.executions.iter().filter(|e| {
+        e["status"].as_str() == Some("failed")
+            && e["started_at"].as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| (now - t.with_timezone(&Utc)).num_hours() < 24)
+                .unwrap_or(false)
+    }).count();
+
+    let dim = Color::from_u32(0x3a3a3a);
+    let mut spans = vec![
         // Brand mark only — the `a*` glyph, not the word "agenta" (avoids
         // duplicating the name shown elsewhere).
         Span::styled("a* ", Style::default().fg(Color::from_u32(0xFF7A45)).add_modifier(Modifier::BOLD)),
         Span::styled(ver, Style::default().fg(Color::DarkGray)),
-        Span::styled("  daemon ", Style::default().fg(Color::from_u32(0x3a3a3a))),
+        Span::styled("  daemon ", Style::default().fg(dim)),
         Span::styled(dot, Style::default().fg(dcol)),
-        Span::styled(
-            "  Tab:panel  j/k:nav  r:refresh  q:quit",
-            Style::default().fg(Color::from_u32(0x3a3a3a)),
-        ),
     ];
+
+    // Pending-proposals badge — mutations MIND has drafted and is waiting on you
+    // to approve. Amber so it reads as "needs attention", hidden when there are none.
+    if app.pending_proposals > 0 {
+        spans.push(Span::styled(
+            format!("  ⏳ {} pending", app.pending_proposals),
+            Style::default().fg(Color::from_u32(0xE0A030)),
+        ));
+    }
+
+    // 24h failure count — dim "0 fails" when healthy, red when not.
+    spans.push(if fails_24h > 0 {
+        Span::styled(format!("  ✗ {} fails/24h", fails_24h), Style::default().fg(Color::Red))
+    } else {
+        Span::styled("  ✓ 0 fails/24h", Style::default().fg(dim))
+    });
+
+    spans.push(Span::styled(
+        "   Tab:panel  j/k:nav  r:refresh  q:quit",
+        Style::default().fg(dim),
+    ));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
