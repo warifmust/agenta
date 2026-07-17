@@ -14,7 +14,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
+use std::str::FromStr;
 
 use crate::core::{Agent, AppConfig, DaemonRequest, DaemonResponse};
 use super::commands::daemon_request;
@@ -43,6 +44,60 @@ fn fmt_tokens(n: u64) -> String {
     } else {
         format!("{} tok", n)
     }
+}
+
+/// Compact magnitude of a duration in seconds: "<1m", "45m", "2h", "3d". Used
+/// for both "next run in" and "last run ago" — the column header says which.
+fn fmt_delta(secs: i64) -> String {
+    let s = secs.abs();
+    if s < 60 { "<1m".to_string() }
+    else if s < 3600 { format!("{}m", s / 60) }
+    else if s < 86_400 { format!("{}h", s / 3600) }
+    else { format!("{}d", s / 86_400) }
+}
+
+/// Next scheduled fire for an agent as a relative string ("45m", "2h"), or "—"
+/// for on-demand (mode: once) agents and unparseable schedules. Cron is evaluated
+/// in local time to match the scheduler (which fires in the server timezone).
+fn fmt_next_run(agent: &serde_json::Value) -> String {
+    if agent["execution_mode"].as_str() != Some("scheduled") {
+        return "—".to_string();
+    }
+    let Some(expr) = agent["schedule"].as_str() else { return "—".to_string(); };
+    let Ok(schedule) = cron::Schedule::from_str(expr) else { return "—".to_string(); };
+    let now = Local::now();
+    match schedule.after(&now).next() {
+        Some(next) => fmt_delta((next - now).num_seconds()),
+        None => "—".to_string(),
+    }
+}
+
+/// Per-agent run summary for the list. Last-run comes from the agent's own
+/// authoritative `last_run` field (always current); success rate is best-effort
+/// over the recently-loaded executions ("—" when none are in the window).
+/// Returns ("2h"|"—", "100%"|"—").
+fn agent_run_summary(agent: &serde_json::Value, execs: &[serde_json::Value]) -> (String, String) {
+    let last_str = agent["last_run"].as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| fmt_delta((Utc::now() - t.with_timezone(&Utc)).num_seconds()))
+        .unwrap_or_else(|| "—".to_string());
+
+    let agent_id = agent["id"].as_str().unwrap_or("");
+    let (mut done, mut failed) = (0u32, 0u32);
+    for e in execs {
+        if e["agent_id"].as_str() != Some(agent_id) { continue; }
+        match e["status"].as_str() {
+            Some("completed") => done += 1,
+            Some("failed") => failed += 1,
+            _ => {}
+        }
+    }
+    let succ_str = if done + failed == 0 {
+        "—".to_string()
+    } else {
+        format!("{}%", done * 100 / (done + failed))
+    };
+    (last_str, succ_str)
 }
 
 fn fmt_ts(ts: &str) -> String {
@@ -436,14 +491,30 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
             list_area,
         );
     } else {
+        let dim = Style::default().fg(Color::from_u32(0x3a3a3a));
+        // Fixed column header on the first row; agent rows scroll beneath it.
+        let [header_area, rows_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ]).areas(list_area);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("   {:<7}", "agent"), dim),
+                Span::styled(format!("{:>5}", "next"), dim),
+                Span::styled(format!(" {:>4}", "last"), dim),
+                Span::styled(format!(" {:>4}", "ok"), dim),
+            ])),
+            header_area,
+        );
+
         let mut lines: Vec<Line> = vec![];
         for (i, agent) in app.agents.iter().enumerate() {
             let name = agent["name"].as_str().unwrap_or("?");
             let short = abbrev(name);
-            let model = agent["model"].as_str().unwrap_or("?");
-            let model_short: String = model.chars().take(11).collect();
             let status = agent["status"].as_str().unwrap_or("idle");
-            let deep = !agent["deep_agent_config"].is_null();
+
+            let next = fmt_next_run(agent);
+            let (last, succ) = agent_run_summary(agent, &app.executions);
 
             let (dot, dot_color) = match status {
                 "running" | "Running" => ("▶", Color::Green),
@@ -459,28 +530,34 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(name_color)
             };
             let prefix = if selected { "▶ " } else { "  " };
-            let deep_tag = if deep { Span::styled("⚡", Style::default().fg(Color::Yellow)) } else { Span::raw(" ") };
+
+            // next-run stands out only when there is one; "—" stays dim.
+            let next_style = if next == "—" { dim } else { Style::default().fg(Color::from_u32(0xFF7A45)) };
+            // success rate: green ≥90%, red <60%, dim otherwise (and for "—").
+            let succ_style = match succ.trim_end_matches('%').parse::<u32>() {
+                Ok(p) if p >= 90 => Style::default().fg(Color::Green),
+                Ok(p) if p < 60  => Style::default().fg(Color::Red),
+                Ok(_)            => Style::default().fg(Color::Gray),
+                Err(_)           => dim,
+            };
 
             lines.push(Line::from(vec![
                 Span::raw(prefix),
                 Span::styled(dot, Style::default().fg(dot_color)),
                 Span::raw(" "),
                 Span::styled(format!("{:<7}", short.chars().take(7).collect::<String>()), name_style),
-                Span::raw(" "),
-                deep_tag,
-                Span::styled(
-                    format!(" {}", model_short),
-                    Style::default().fg(Color::from_u32(0x444444)),
-                ),
+                Span::styled(format!("{:>5}", next), next_style),
+                Span::styled(format!(" {:>4}", last), Style::default().fg(Color::from_u32(0x777777))),
+                Span::styled(format!(" {:>4}", succ), succ_style),
             ]));
         }
 
-        let h = list_area.height as usize;
+        let h = rows_area.height as usize;
         let scroll = if app.selected_agent >= h {
             (app.selected_agent + 1).saturating_sub(h) as u16
         } else { 0 };
 
-        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
+        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), rows_area);
     }
 
 }
