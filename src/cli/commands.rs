@@ -937,14 +937,16 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
     println!("  3. Copy the token it gives you (looks like 123456:ABC...)");
     println!();
 
-    print!("  Bot token: ");
+    // Never echoed — a bot token is a credential like any other.
+    print!("  Bot token (hidden): ");
     std::io::stdout().flush()?;
-    let token = prompt_line().unwrap_or_default();
+    let token = prompt_secret().unwrap_or_default();
 
     if token.is_empty() {
         println!("  {} No token entered — skipping Telegram setup.", "⚠".yellow());
         return Ok(());
     }
+    println!("  {} {}", "✓ Token:".green(), redact_secret(&token).dimmed());
 
     // List agents so user can pick
     let agents: Vec<String> = match daemon_request(config, DaemonRequest::ListAgents).await {
@@ -1057,6 +1059,63 @@ fn prompt_line() -> Option<String> {
     }
 }
 
+/// Read a secret from the terminal without echoing it, so a pasted API key or bot
+/// token never lands in scrollback, a screenshot, or a copied terminal session.
+/// Falls back to a plain read when there's no usable terminal (headless/CI), where
+/// there is no echo to suppress anyway.
+fn prompt_secret() -> Option<String> {
+    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if enable_raw_mode().is_err() {
+        return prompt_line();
+    }
+
+    let mut secret = String::new();
+    loop {
+        match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Enter => break,
+                KeyCode::Backspace => {
+                    secret.pop();
+                }
+                // Raw mode swallows the usual SIGINT, so honour Ctrl-C by hand.
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = disable_raw_mode();
+                    println!();
+                    std::process::exit(130);
+                }
+                KeyCode::Char(c) => secret.push(c),
+                KeyCode::Esc => {
+                    secret.clear();
+                    break;
+                }
+                _ => {}
+            },
+            // A bracketed paste arrives as one event rather than a char stream.
+            Ok(Event::Paste(p)) => secret.push_str(&p),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let _ = disable_raw_mode();
+    println!();
+    Some(secret)
+}
+
+/// Redact a secret for display: enough to tell which key it is, never enough to
+/// use it — `sk-or-v1…3bbd`.
+fn redact_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 12 {
+        return "•".repeat(n);
+    }
+    let head: String = s.chars().take(8).collect();
+    let tail: String = s.chars().skip(n - 4).collect();
+    format!("{}…{}", head, tail)
+}
+
 async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     // ── Step 0: already set up? ───────────────────────────────────────────────
     let already_have_mind = matches!(
@@ -1116,10 +1175,11 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
         };
         println!("{}", "  Step 2/3 — API Key".bold());
         println!("  Get your key at: {}", key_url.cyan());
-        print!("  API key: ");
+        // Never echoed — a pasted key would otherwise sit in scrollback forever.
+        print!("  API key (hidden): ");
         std::io::stdout().flush()?;
 
-        let key = prompt_line().unwrap_or_default();
+        let key = prompt_secret().unwrap_or_default();
 
         if !key.is_empty() {
             // Append to ~/.agenta/.env
@@ -1136,7 +1196,11 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
                 .map(|l| format!("{}\n", l))
                 .collect();
             std::fs::write(&env_path, format!("{}{}", filtered, entry))?;
-            println!("  {} saved to ~/.agenta/.env", "✓ Key".green());
+            println!(
+                "  {} saved to ~/.agenta/.env  {}",
+                "✓ Key".green(),
+                redact_secret(&key).dimmed()
+            );
         } else {
             println!("  {} — you can add it later to ~/.agenta/.env", "⚠ Skipped".yellow());
         }
@@ -2978,6 +3042,26 @@ async fn attach_tool_to_agent(config: &AppConfig, tool_name: &str, agent_name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Secrets are echoed back to confirm the right key was pasted, so the redaction
+    /// must never leak enough to reuse the key — a real key leaked exactly this way,
+    /// by being echoed in full at the prompt.
+    #[test]
+    fn redact_secret_shows_head_and_tail_but_never_the_body() {
+        // Shaped like a provider key but deliberately not one — never put a real
+        // credential in a test; secret scanning will (rightly) block the push.
+        let key = "sk-test-0000EXAMPLEexampleEXAMPLEexampleEXAMPLEexample1234beef";
+        let shown = redact_secret(key);
+
+        assert_eq!(shown, "sk-test-…beef");
+        // The secret body must not survive anywhere in the redacted form.
+        assert!(!shown.contains("EXAMPLE"));
+        assert!(shown.chars().count() < 20);
+
+        // Short values are masked entirely — there is no safe head/tail to show.
+        assert_eq!(redact_secret("123456:ABC"), "••••••••••");
+        assert_eq!(redact_secret(""), "");
+    }
 
     /// The wizard saves the API key to .env, but the daemon only finds it via a
     /// [providers.<name>].api_key = "$VAR" pointer in config.toml. Without that
