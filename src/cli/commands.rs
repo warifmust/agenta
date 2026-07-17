@@ -1116,6 +1116,30 @@ fn redact_secret(s: &str) -> String {
     format!("{}…{}", head, tail)
 }
 
+/// MIND's output budget. AgentConfig's default (2048) is far too small here:
+/// reasoning models (DeepSeek et al.) spend `max_tokens` on their reasoning before
+/// writing a single word of the answer, so a builder task — read some tools, then
+/// compose a long system prompt — burns the whole budget thinking and returns
+/// `content: null`, which surfaces as an empty reply. 16k leaves room to reason and
+/// still answer.
+const MIND_MAX_TOKENS: u32 = 16_000;
+
+/// Build the MIND system agent. Kept separate from the wizard's I/O so the defaults
+/// that matter (deep-agent loop, output budget) are unit-testable.
+fn new_mind(model: &str, provider: &str, deep_config: DeepAgentConfig) -> Agent {
+    let mut mind = Agent::new(
+        crate::core::MIND_AGENT_NAME.to_string(),
+        model.to_string(),
+        crate::core::MIND_SYSTEM_PROMPT.to_string(),
+    );
+    mind.is_system = true;
+    mind.provider = Some(provider.to_string());
+    mind.status = AgentStatus::Active;
+    mind.deep_agent_config = Some(deep_config);
+    mind.config.max_tokens = MIND_MAX_TOKENS;
+    mind
+}
+
 async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     // ── Step 0: already set up? ───────────────────────────────────────────────
     let already_have_mind = matches!(
@@ -1308,16 +1332,7 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
             _ => return Err(anyhow!("Unexpected response from daemon")),
         }
     } else {
-        let mut mind = Agent::new(
-            crate::core::MIND_AGENT_NAME.to_string(),
-            model.clone(),
-            crate::core::MIND_SYSTEM_PROMPT.to_string(),
-        );
-        mind.is_system = true;
-        mind.provider = Some(provider.to_string());
-        mind.status = AgentStatus::Active;
-        mind.deep_agent_config = Some(deep_config);
-
+        let mind = new_mind(&model, provider, deep_config);
         let agent_value = serde_json::to_value(&mind)?;
         match daemon_request(&fresh_config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
             DaemonResponse::Success { .. } => {
@@ -3042,6 +3057,34 @@ async fn attach_tool_to_agent(config: &AppConfig, tool_name: &str, agent_name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MIND is a builder: it reads tools then composes long system prompts. On a
+    /// reasoning model the `max_tokens` budget is spent on reasoning FIRST, so
+    /// AgentConfig's 2048 default left nothing for the answer — the model returned
+    /// `content: null` and MIND replied with an empty message and no error.
+    #[test]
+    fn mind_gets_a_reasoning_sized_output_budget() {
+        let deep = DeepAgentConfig {
+            max_iterations: 10,
+            enable_reflection: true,
+            available_tools: vec![],
+            stop_conditions: vec!["task_complete".to_string()],
+            allow_sub_agents: false,
+            subagent_spawn_message: None,
+        };
+        let mind = new_mind("deepseek/deepseek-v4-pro", "openrouter", deep);
+
+        assert_eq!(mind.config.max_tokens, 16_000);
+        // Well clear of the default that caused the empty replies.
+        assert!(mind.config.max_tokens > crate::core::agent::AgentConfig::default().max_tokens);
+
+        // The rest of what makes MIND MIND — a regression here silently breaks the
+        // builder builtins, which only run in the deep-agent loop.
+        assert!(mind.is_system);
+        assert!(mind.deep_agent_config.is_some());
+        assert_eq!(mind.provider.as_deref(), Some("openrouter"));
+        assert_eq!(mind.status, AgentStatus::Active);
+    }
 
     /// Secrets are echoed back to confirm the right key was pasted, so the redaction
     /// must never leak enough to reuse the key — a real key leaked exactly this way,
