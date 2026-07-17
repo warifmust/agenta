@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
+use chrono::{DateTime, Utc};
 
 use crate::core::{Agent, AppConfig, DaemonRequest, DaemonResponse};
 use super::commands::{daemon_request, read_installed_tool};
@@ -34,6 +35,17 @@ fn abbrev(name: &str) -> String {
         name.to_string()
     } else {
         chars[..MAX - 1].iter().collect::<String>() + "…"
+    }
+}
+
+/// Compact token count: 12345 -> "12.3k tok", 2_100_000 -> "2.1M tok".
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tok", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k tok", n as f64 / 1_000.0)
+    } else {
+        format!("{} tok", n)
     }
 }
 
@@ -136,21 +148,16 @@ enum Panel {
 }
 
 impl Panel {
+    // View-only dashboard: focus toggles between the agent list and its detail.
+    // Chat and Tools are no longer standalone panels, so Tab never lands there.
     fn next(self) -> Self {
         match self {
-            Panel::Agents     => Panel::Executions,
-            Panel::Executions => Panel::Chat,
-            Panel::Chat       => Panel::Tools,
-            Panel::Tools      => Panel::Agents,
+            Panel::Agents => Panel::Executions,
+            _ => Panel::Agents,
         }
     }
     fn prev(self) -> Self {
-        match self {
-            Panel::Agents     => Panel::Tools,
-            Panel::Executions => Panel::Agents,
-            Panel::Chat       => Panel::Executions,
-            Panel::Tools      => Panel::Chat,
-        }
+        self.next()
     }
 }
 
@@ -1242,31 +1249,106 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
 fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let [topbar, body] = Layout::vertical([
+    // View-only monitoring layout: header line, then agents list + detail side by
+    // side, then an activity graph across the bottom. No chat/composer, no
+    // standalone tools panel — tools/KBs live in the per-agent detail.
+    let [topbar, main, graph_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(6),
     ]).areas(area);
 
-    let [top_half, bottom_half] = Layout::vertical([
+    let [agents_area, detail_area] = Layout::horizontal([
         Constraint::Percentage(38),
         Constraint::Percentage(62),
-    ]).areas(body);
-
-    let [agents_area, executions_area] = Layout::horizontal([
-        Constraint::Percentage(32),
-        Constraint::Percentage(68),
-    ]).areas(top_half);
-
-    let [chat_area, tools_area] = Layout::horizontal([
-        Constraint::Percentage(62),
-        Constraint::Percentage(38),
-    ]).areas(bottom_half);
+    ]).areas(main);
 
     render_topbar(f, app, topbar);
     render_agents(f, app, agents_area);
-    render_executions(f, app, executions_area);
-    render_chat(f, app, chat_area);
-    render_tools(f, app, tools_area);
+    render_executions(f, app, detail_area);
+    render_activity(f, app, graph_area);
+}
+
+/// Token-usage timeline — tokens spent across ALL agents over the last 7 days,
+/// bucketed to the panel's full width (newest on the right). A bucket that
+/// contained a FAILED run is drawn in red so a broken/expensive spike stands out;
+/// healthy usage is brand orange. Bars are built from block glyphs so each column
+/// can carry its own colour.
+fn render_activity(f: &mut Frame, app: &App, area: Rect) {
+    const WINDOW_MIN: i64 = 7 * 24 * 60; // 7 days
+    let n = (area.width.saturating_sub(2) as usize).max(1);
+    let now = Utc::now();
+
+    let mut tokens = vec![0u64; n];
+    let mut failed = vec![false; n];
+    for e in &app.executions {
+        let Some(ts) = e["started_at"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        else {
+            continue;
+        };
+        let mins_ago = (now - ts.with_timezone(&Utc)).num_minutes();
+        if !(0..WINDOW_MIN).contains(&mins_ago) {
+            continue;
+        }
+        let frac = mins_ago as f64 / WINDOW_MIN as f64; // 0=now, 1=oldest
+        let idx = (((1.0 - frac) * (n as f64 - 1.0)).round() as usize).min(n - 1);
+        tokens[idx] += e["metadata"]["total_tokens"].as_u64().unwrap_or(0);
+        if e["status"].as_str() == Some("failed") {
+            failed[idx] = true;
+        }
+    }
+
+    let total_tokens: u64 = tokens.iter().sum();
+    let any_failed = failed.iter().any(|&f| f);
+    let max = *tokens.iter().max().unwrap_or(&0);
+
+    let title = format!(
+        " tokens · all agents · {} / 7d{}  (← older · newer →) ",
+        fmt_tokens(total_tokens),
+        if any_failed { "  ⚠ failures in red" } else { "" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::from_u32(0x3A3A3A)))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if max == 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled("  no token usage in the last 7 days", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    // Build the bar chart top-down: one Line per row, one Span per column, so each
+    // column keeps its own colour. Eighth-block glyphs give sub-cell resolution.
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let h = inner.height as usize;
+    let orange = Color::from_u32(0xFF7A45);
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    for row in 0..h {
+        let from_bottom = h - 1 - row; // 0 = bottom row
+        let mut spans: Vec<Span> = Vec::with_capacity(n);
+        for x in 0..n {
+            let filled = tokens[x] as f64 / max as f64 * h as f64; // height in cells
+            let level = filled - from_bottom as f64; // how full this cell is (0..1+)
+            let color = if failed[x] { Color::Red } else { orange };
+            let ch = if level >= 1.0 {
+                '█'
+            } else if level <= 0.0 {
+                ' '
+            } else {
+                BLOCKS[((level * 8.0).round() as usize).clamp(1, 8) - 1]
+            };
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Topbar ─────────────────────────────────────────────────────────────────────
@@ -1280,13 +1362,15 @@ fn render_topbar(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("  {}", msg), Style::default().fg(col))
     } else {
         Span::styled(
-            "  Tab:panel  j/k:nav  i:compose  n:new tool  d:delete  q:quit",
+            "  Tab:panel  j/k:nav  r:refresh  q:quit",
             Style::default().fg(Color::from_u32(0x3a3a3a)),
         )
     };
 
     let mut spans = vec![
-        Span::styled("agenta ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        // Brand mark only — the `a*` glyph, not the word "agenta" (avoids
+        // duplicating the name shown elsewhere).
+        Span::styled("a* ", Style::default().fg(Color::from_u32(0xFF7A45)).add_modifier(Modifier::BOLD)),
         Span::styled(ver, Style::default().fg(Color::DarkGray)),
         Span::styled("  daemon ", Style::default().fg(Color::from_u32(0x3a3a3a))),
         Span::styled(dot, Style::default().fg(dcol)),
@@ -1333,12 +1417,8 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         AgentMode::List => {}
     }
 
-    // Footer hints (2 lines)
-    let footer_h = 2u16;
-    let [list_area, footer_area] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(footer_h),
-    ]).areas(inner);
+    // View-only: no action footer — the list fills the panel.
+    let list_area = inner;
 
     if app.agents.is_empty() {
         f.render_widget(
@@ -1398,25 +1478,6 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
     }
 
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(" [n]", Style::default().fg(Color::Cyan)),
-                Span::styled(" new  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[v]", Style::default().fg(Color::Cyan)),
-                Span::styled(" view  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[e]", Style::default().fg(Color::Cyan)),
-                Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[d]", Style::default().fg(Color::Cyan)),
-                Span::styled(" delete", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled(" [a]", Style::default().fg(Color::Cyan)),
-                Span::styled(" attach tool", Style::default().fg(Color::DarkGray)),
-            ]),
-        ]),
-        footer_area,
-    );
 }
 
 fn render_agent_view(f: &mut Frame, agent: &serde_json::Value, area: Rect) {
@@ -1579,21 +1640,88 @@ fn render_agent_confirm_delete(f: &mut Frame, agent_name: &str, area: Rect) {
 fn render_executions(f: &mut Frame, app: &App, area: Rect) {
     let short = app.active_short();
     let active = app.active_panel == Panel::Executions;
-    let block = panel_block(format!("runs · {}", short), active);
+    let block = panel_block(short.clone(), active);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let runs = app.runs_for_active();
-    if runs.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled("  no runs yet", Style::default().fg(Color::DarkGray))),
-            inner,
-        );
-        return;
-    }
-
     let w = inner.width as usize;
     let mut lines: Vec<Line> = vec![];
+
+    // ── Agent info: status · model · mode/schedule · tools · KBs · stats ──
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    if let Some(agent) = app.active_agent() {
+        let status = agent["status"].as_str().unwrap_or("?");
+        let scolor = match status {
+            "running" | "active" => Color::Green,
+            _ => Color::DarkGray,
+        };
+        let model = agent["model"].as_str().unwrap_or("—");
+        let mode = agent["execution_mode"].as_str().unwrap_or("—");
+        let mode_line = match agent["schedule"].as_str() {
+            Some(s) if mode == "scheduled" => format!("{}  {}", mode, s),
+            _ => mode.to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" status ", dim), Span::styled(status.to_string(), Style::default().fg(scolor)),
+            Span::styled("   model ", dim), Span::styled(model.to_string(), val),
+        ]));
+        lines.push(Line::from(vec![Span::styled(" mode   ", dim), Span::styled(mode_line, val)]));
+
+        let tools = agent["tools"].as_array().map(|arr| {
+            let n: Vec<&str> = arr.iter().filter_map(|t| t["name"].as_str()).collect();
+            if n.is_empty() { "—".to_string() } else { n.join(", ") }
+        }).unwrap_or_else(|| "—".to_string());
+        lines.push(Line::from(vec![Span::styled(" tools  ", dim), Span::styled(tools, val)]));
+
+        let kbs = agent["config"]["knowledge_bases"].as_array().map(|arr| {
+            let n: Vec<&str> = arr.iter().filter_map(|k| k.as_str()).collect();
+            if n.is_empty() { "—".to_string() } else { n.join(", ") }
+        }).unwrap_or_else(|| "—".to_string());
+        lines.push(Line::from(vec![Span::styled(" KBs    ", dim), Span::styled(kbs, val)]));
+
+        let total = runs.len();
+        let completed = runs.iter().filter(|e| e["status"].as_str() == Some("completed")).count();
+        let failed = runs.iter().filter(|e| e["status"].as_str() == Some("failed")).count();
+        let success = if total > 0 { format!("{}%", completed * 100 / total) } else { "—".to_string() };
+        let durs: Vec<i64> = runs.iter().filter_map(|e| {
+            let s = DateTime::parse_from_rfc3339(e["started_at"].as_str()?).ok()?;
+            let c = DateTime::parse_from_rfc3339(e["completed_at"].as_str()?).ok()?;
+            Some((c - s).num_seconds().max(0))
+        }).collect();
+        let avg = if durs.is_empty() { "—".to_string() } else { format!("{}s", durs.iter().sum::<i64>() / durs.len() as i64) };
+        let tok_sum: u64 = runs.iter().map(|e| e["metadata"]["total_tokens"].as_u64().unwrap_or(0)).sum();
+        lines.push(Line::from(vec![
+            Span::styled(" runs   ", dim), Span::styled(total.to_string(), val),
+            Span::styled("  ✓", dim), Span::styled(success, Style::default().fg(Color::Green)),
+            Span::styled("  avg ", dim), Span::styled(avg, val),
+            Span::styled("  ✗", dim),
+            Span::styled(failed.to_string(), if failed > 0 { Style::default().fg(Color::Red) } else { dim }),
+            Span::styled("  🪙 ", dim), Span::styled(fmt_tokens(tok_sum), val),
+        ]));
+
+        // Context-fullness meter: peak input tokens vs the agent's context window.
+        // Yellow past 70%, red past 90% — an agent brushing the cap is truncating.
+        let window = agent["config"]["context_window"].as_u64().unwrap_or(0);
+        let peak = runs.iter()
+            .map(|e| e["metadata"]["peak_context_tokens"].as_u64().unwrap_or(0))
+            .max().unwrap_or(0);
+        if window > 0 && peak > 0 {
+            let pct = (peak * 100 / window).min(999);
+            let ccolor = if pct >= 90 { Color::Red } else if pct >= 70 { Color::Yellow } else { Color::Gray };
+            lines.push(Line::from(vec![
+                Span::styled(" context", dim),
+                Span::styled(format!(" {} / {}", peak, window), Style::default().fg(ccolor)),
+                Span::styled(format!(" ({}%) peak", pct), dim),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(" ── recent runs ──────────", Style::default().fg(Color::from_u32(0x3a3a3a)))));
+    }
+
+    if runs.is_empty() {
+        lines.push(Line::from(Span::styled("  no runs yet", dim)));
+    }
 
     for (i, e) in runs.iter().enumerate() {
         let status = e["status"].as_str().unwrap_or("?");
