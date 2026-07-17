@@ -150,6 +150,14 @@ impl DeepAgentExecutor {
             ChatMessage { role: "user".to_string(),   content: input.to_string() },
         ];
 
+        // Sum tokens across every model call in this run, stashed into the
+        // execution's metadata after each call so it's present no matter how the
+        // loop exits. Metadata is a free-form JSON blob, so no schema change.
+        let mut total_tokens: u64 = 0;
+        // Peak input/context tokens across iterations — how full the context got at
+        // its fullest (the last iteration usually has the biggest prompt).
+        let mut peak_context: u64 = 0;
+
         for iteration in 0..self.max_iterations {
             execution.iterations = iteration + 1;
             info!("Harness iteration {}/{} for agent: {}", iteration + 1, self.max_iterations, agent.name);
@@ -164,6 +172,16 @@ impl DeepAgentExecutor {
 
             let response = self.backend.chat(request).await?;
             let content  = response.message.content.clone();
+
+            total_tokens += response.tokens().unwrap_or(0);
+            peak_context = peak_context.max(response.context_tokens().unwrap_or(0));
+            if total_tokens > 0 || peak_context > 0 {
+                if !execution.metadata.is_object() {
+                    execution.metadata = serde_json::json!({});
+                }
+                execution.metadata["total_tokens"] = serde_json::json!(total_tokens);
+                execution.metadata["peak_context_tokens"] = serde_json::json!(peak_context);
+            }
 
             // Add assistant turn to history
             messages.push(ChatMessage {

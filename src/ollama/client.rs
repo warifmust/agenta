@@ -70,6 +70,42 @@ pub struct ChatResponse {
     pub created_at: String,
     pub message: ChatMessage,
     pub done: bool,
+    // Token usage. OpenAI-compatible providers report `total_tokens`; Ollama
+    // returns prompt_eval_count + eval_count on its /api/chat response (captured
+    // directly here via serde). Either way, `tokens()` gives the count.
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    /// Input/context tokens (OpenAI `prompt_tokens`). Ollama reports the same via
+    /// `prompt_eval_count` below.
+    #[serde(default)]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_eval_count: Option<i64>,
+    #[serde(default)]
+    pub eval_count: Option<i64>,
+}
+
+impl ChatResponse {
+    /// Total tokens this call used, if the provider reported it.
+    pub fn tokens(&self) -> Option<u64> {
+        if let Some(t) = self.total_tokens {
+            return Some(t);
+        }
+        if self.prompt_eval_count.is_some() || self.eval_count.is_some() {
+            let p = self.prompt_eval_count.unwrap_or(0).max(0);
+            let e = self.eval_count.unwrap_or(0).max(0);
+            return Some((p + e) as u64);
+        }
+        None
+    }
+
+    /// Input/context tokens for this call (how full the context got), if reported.
+    pub fn context_tokens(&self) -> Option<u64> {
+        if let Some(p) = self.prompt_tokens {
+            return Some(p);
+        }
+        self.prompt_eval_count.map(|c| c.max(0) as u64)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

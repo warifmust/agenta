@@ -57,6 +57,8 @@ struct OpenAIChoice {
 struct OpenAIUsage {
     #[serde(default)]
     total_tokens: i64,
+    #[serde(default)]
+    prompt_tokens: i64,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -91,7 +93,10 @@ impl OpenAICompatClient {
         (temperature, top_p, max_tokens)
     }
 
-    async fn call(&self, req: OpenAIRequest) -> Result<String> {
+    /// Returns (content, total_tokens, prompt_tokens) from the provider's `usage`
+    /// block (each None if it didn't report one). prompt_tokens is the input/context
+    /// side, used for the context-fullness meter.
+    async fn call(&self, req: OpenAIRequest) -> Result<(String, Option<u64>, Option<u64>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let response = self
@@ -113,6 +118,8 @@ impl OpenAICompatClient {
             AgentaError::Ollama(format!("Failed to parse response: {}", e))
         })?;
 
+        let tokens = parsed.usage.as_ref().map(|u| u.total_tokens.max(0) as u64);
+        let prompt = parsed.usage.as_ref().map(|u| u.prompt_tokens.max(0) as u64);
         let content = parsed
             .choices
             .into_iter()
@@ -120,7 +127,7 @@ impl OpenAICompatClient {
             .map(|c| c.message.content)
             .unwrap_or_default();
 
-        Ok(content)
+        Ok((content, tokens, prompt))
     }
 }
 
@@ -146,7 +153,7 @@ impl ModelBackend for OpenAICompatClient {
             stream: false,
         };
 
-        let content = self.call(openai_req).await?;
+        let (content, tokens, _prompt) = self.call(openai_req).await?;
 
         Ok(GenerateResponse {
             model: request.model,
@@ -158,7 +165,7 @@ impl ModelBackend for OpenAICompatClient {
             load_duration: None,
             prompt_eval_count: None,
             prompt_eval_duration: None,
-            eval_count: None,
+            eval_count: tokens.map(|t| t as i64),
             eval_duration: None,
         })
     }
@@ -182,13 +189,17 @@ impl ModelBackend for OpenAICompatClient {
             stream: false,
         };
 
-        let content = self.call(openai_req).await?;
+        let (content, total_tokens, prompt_tokens) = self.call(openai_req).await?;
 
         Ok(ChatResponse {
             model: request.model,
             created_at: String::new(),
             message: ChatMessage { role: "assistant".to_string(), content },
             done: true,
+            total_tokens,
+            prompt_tokens,
+            prompt_eval_count: None,
+            eval_count: None,
         })
     }
 }
