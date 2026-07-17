@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use chrono::Utc;
 use regex::Regex;
 use std::sync::Arc;
@@ -181,6 +182,43 @@ impl DeepAgentExecutor {
                 }
                 execution.metadata["total_tokens"] = serde_json::json!(total_tokens);
                 execution.metadata["peak_context_tokens"] = serde_json::json!(peak_context);
+            }
+
+            // ── Unusable turn ─────────────────────────────────────────────────
+            // Reasoning models (DeepSeek et al.) spend max_tokens on their reasoning
+            // BEFORE writing any answer, so too small a budget yields `content: null`
+            // (reasoning ate all of it) or an answer cut off mid-sentence. Neither is
+            // a usable turn, and both used to sail through: an empty answer was
+            // returned as "prose" and looked like success, while a truncated one — a
+            // half-written system prompt, a chopped TOOL_CALL — read as complete.
+            // Fail loudly, with the numbers needed to fix it.
+            if content.trim().is_empty() || response.truncated() {
+                let budget = params.num_predict.unwrap_or(0);
+                let reason = if content.trim().is_empty() {
+                    "returned no content (its reasoning used the whole output budget)"
+                } else {
+                    "was cut off mid-answer"
+                };
+                // Report OUTPUT tokens, not total: the budget caps output only, so
+                // quoting prompt+completion here would point at the wrong number.
+                let output_used = match (response.tokens(), response.context_tokens()) {
+                    (Some(total), Some(prompt)) => total.saturating_sub(prompt),
+                    (Some(total), None) => total,
+                    _ => 0,
+                };
+                return Err(anyhow!(
+                    "Model {} {} at iteration {}. It stopped because: {}. \
+                     It generated {} output tokens against a max_tokens of {}. \
+                     Raise it (e.g. `agenta update {} --max-tokens {}`).",
+                    agent.model,
+                    reason,
+                    iteration + 1,
+                    response.finish_reason.as_deref().unwrap_or("unknown"),
+                    output_used,
+                    budget,
+                    agent.name,
+                    (budget * 2).max(16_000),
+                ));
             }
 
             // Add assistant turn to history

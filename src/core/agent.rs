@@ -373,7 +373,11 @@ impl Default for AgentConfig {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
-            max_tokens: 2048,
+            // Reasoning models (DeepSeek et al.) spend max_tokens on their reasoning
+            // BEFORE writing any of the answer, so the old 2048 default returned
+            // `content: null` on anything demanding and the agent replied blank.
+            // This is a cap, not an allocation — you only pay for tokens generated.
+            max_tokens: 16_000,
             context_window: 4096,
             stop_sequences: vec![],
             seed: None,

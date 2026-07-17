@@ -3075,8 +3075,9 @@ mod tests {
         let mind = new_mind("deepseek/deepseek-v4-pro", "openrouter", deep);
 
         assert_eq!(mind.config.max_tokens, 16_000);
-        // Well clear of the default that caused the empty replies.
-        assert!(mind.config.max_tokens > crate::core::agent::AgentConfig::default().max_tokens);
+        // MIND is the most reasoning-heavy agent there is; it must never end up with
+        // less headroom than an ordinary one, whatever the shared default drifts to.
+        assert!(mind.config.max_tokens >= crate::core::agent::AgentConfig::default().max_tokens);
 
         // The rest of what makes MIND MIND — a regression here silently breaks the
         // builder builtins, which only run in the deep-agent loop.

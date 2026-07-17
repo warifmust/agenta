@@ -51,6 +51,9 @@ struct OpenAIResponse {
 #[derive(Deserialize)]
 struct OpenAIChoice {
     message: OpenAIMessage,
+    /// "stop" | "length" | … — "length" means the answer was cut off at max_tokens.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,10 +96,11 @@ impl OpenAICompatClient {
         (temperature, top_p, max_tokens)
     }
 
-    /// Returns (content, total_tokens, prompt_tokens) from the provider's `usage`
-    /// block (each None if it didn't report one). prompt_tokens is the input/context
-    /// side, used for the context-fullness meter.
-    async fn call(&self, req: OpenAIRequest) -> Result<(String, Option<u64>, Option<u64>)> {
+    /// Returns (content, total_tokens, prompt_tokens, finish_reason) from the
+    /// provider's `usage` block and choice (each None if it didn't report one).
+    /// prompt_tokens is the input/context side, used for the context-fullness meter;
+    /// finish_reason tells the caller whether the answer was cut off at max_tokens.
+    async fn call(&self, req: OpenAIRequest) -> Result<(String, Option<u64>, Option<u64>, Option<String>)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let response = self
@@ -120,14 +124,14 @@ impl OpenAICompatClient {
 
         let tokens = parsed.usage.as_ref().map(|u| u.total_tokens.max(0) as u64);
         let prompt = parsed.usage.as_ref().map(|u| u.prompt_tokens.max(0) as u64);
-        let content = parsed
+        let (content, finish_reason) = parsed
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| (c.message.content, c.finish_reason))
             .unwrap_or_default();
 
-        Ok((content, tokens, prompt))
+        Ok((content, tokens, prompt, finish_reason))
     }
 }
 
@@ -153,7 +157,7 @@ impl ModelBackend for OpenAICompatClient {
             stream: false,
         };
 
-        let (content, tokens, _prompt) = self.call(openai_req).await?;
+        let (content, tokens, _prompt, _finish) = self.call(openai_req).await?;
 
         Ok(GenerateResponse {
             model: request.model,
@@ -189,7 +193,7 @@ impl ModelBackend for OpenAICompatClient {
             stream: false,
         };
 
-        let (content, total_tokens, prompt_tokens) = self.call(openai_req).await?;
+        let (content, total_tokens, prompt_tokens, finish_reason) = self.call(openai_req).await?;
 
         Ok(ChatResponse {
             model: request.model,
@@ -200,6 +204,7 @@ impl ModelBackend for OpenAICompatClient {
             prompt_tokens,
             prompt_eval_count: None,
             eval_count: None,
+            finish_reason,
         })
     }
 }

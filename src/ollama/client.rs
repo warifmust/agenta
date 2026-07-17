@@ -83,9 +83,20 @@ pub struct ChatResponse {
     pub prompt_eval_count: Option<i64>,
     #[serde(default)]
     pub eval_count: Option<i64>,
+    /// Why the model stopped. OpenAI-compatible providers send `finish_reason`
+    /// ("stop" | "length" | …); Ollama sends `done_reason` on /api/chat. "length"
+    /// means the output hit max_tokens and is cut off — the answer is incomplete.
+    #[serde(default, alias = "done_reason")]
+    pub finish_reason: Option<String>,
 }
 
 impl ChatResponse {
+    /// True when the model ran out of output budget mid-answer, so `content` is
+    /// truncated (or empty, if reasoning consumed the whole budget first).
+    pub fn truncated(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
+
     /// Total tokens this call used, if the provider reported it.
     pub fn tokens(&self) -> Option<u64> {
         if let Some(t) = self.total_tokens {
@@ -278,5 +289,46 @@ impl OllamaClient {
             Ok(response) => Ok(response.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ollama reports why it stopped as `done_reason`, OpenAI-compatible providers
+    /// as `finish_reason`. Both must land in the same field, or truncation goes
+    /// undetected and a cut-off answer is treated as complete.
+    #[test]
+    fn truncation_is_detected_from_either_provider_spelling() {
+        let ollama: ChatResponse = serde_json::from_str(
+            r#"{"model":"qwen3","created_at":"","done":true,"done_reason":"length",
+                "message":{"role":"assistant","content":"half an ans"}}"#,
+        )
+        .expect("ollama shape should parse");
+        assert!(ollama.truncated());
+
+        let openai: ChatResponse = serde_json::from_str(
+            r#"{"model":"m","created_at":"","done":true,"finish_reason":"length",
+                "message":{"role":"assistant","content":"half an ans"}}"#,
+        )
+        .expect("openai shape should parse");
+        assert!(openai.truncated());
+
+        let complete: ChatResponse = serde_json::from_str(
+            r#"{"model":"m","created_at":"","done":true,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"a whole answer"}}"#,
+        )
+        .expect("complete shape should parse");
+        assert!(!complete.truncated());
+
+        // A provider that reports nothing must not look truncated.
+        let silent: ChatResponse = serde_json::from_str(
+            r#"{"model":"m","created_at":"","done":true,
+                "message":{"role":"assistant","content":"hi"}}"#,
+        )
+        .expect("minimal shape should parse");
+        assert!(!silent.truncated());
+        assert_eq!(silent.finish_reason, None);
     }
 }
