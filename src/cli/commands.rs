@@ -1198,35 +1198,72 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     // ── Reload config (picks up .env written above) ───────────────────────────
     let fresh_config = AppConfig::load().unwrap_or_else(|_| config.clone());
 
-    // ── Create MIND ───────────────────────────────────────────────────────────
-    let mut mind = Agent::new(
-        crate::core::MIND_AGENT_NAME.to_string(),
-        model.clone(),
-        crate::core::MIND_SYSTEM_PROMPT.to_string(),
-    );
-    mind.is_system = true;
-    mind.provider = Some(provider.to_string());
-    mind.status = AgentStatus::Active;
+    // ── Create MIND, or adopt the one already in the database ─────────────────
+    // `agenta uninstall` leaves ~/.agenta intact by design, so a reinstall finds
+    // MIND still there and creating it again trips the unique constraint on
+    // agents.name. Adopt it instead: point it at the provider/model just chosen
+    // and re-assert the deep-agent config (repairing a MIND written by an older
+    // version), while leaving any tools/config attached to it alone.
     // MIND is a deep agent — the builder builtins (propose_create_tool) and its
     // multi-step reasoning only run in the deep-agent loop.
-    mind.deep_agent_config = Some(DeepAgentConfig {
+    let deep_config = DeepAgentConfig {
         max_iterations: 10,
         enable_reflection: true,
         available_tools: vec![],
         stop_conditions: vec!["task_complete".to_string()],
         allow_sub_agents: false,
         subagent_spawn_message: None,
-    });
+    };
 
-    let agent_value = serde_json::to_value(&mind)?;
-    match daemon_request(&fresh_config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
-        DaemonResponse::Success { .. } => {
-            println!("  {} MIND", "✓ Created system agent".green());
+    // Ask by name via GetAgent, not ListAgents: `list_agents` is `WHERE is_system = 0`,
+    // so it never returns MIND. This repeats the Step 0 check, which is unreliable on a
+    // fresh install because it runs before the daemon above is started.
+    let existing_mind = match daemon_request(
+        &fresh_config,
+        DaemonRequest::GetAgent { id: crate::core::MIND_AGENT_NAME.into() },
+    ).await {
+        Ok(DaemonResponse::AgentDetails { agent }) => Some(agent),
+        _ => None,
+    };
+
+    if let Some(mut existing) = existing_mind {
+        let id = existing["id"].as_str().unwrap_or_default().to_string();
+        existing["model"] = serde_json::json!(model);
+        existing["provider"] = serde_json::json!(provider);
+        existing["status"] = serde_json::json!(AgentStatus::Active);
+        existing["is_system"] = serde_json::json!(true);
+        existing["deep_agent_config"] = serde_json::to_value(&deep_config)?;
+
+        match daemon_request(&fresh_config, DaemonRequest::UpdateAgent { id, agent: existing }).await? {
+            DaemonResponse::Success { .. } => {
+                println!("  {} MIND → {}", "✓ Reused existing system agent".green(), model);
+            }
+            DaemonResponse::Error { message } => {
+                return Err(anyhow!("Failed to update MIND: {}", message));
+            }
+            _ => return Err(anyhow!("Unexpected response from daemon")),
         }
-        DaemonResponse::Error { message } => {
-            return Err(anyhow!("Failed to create MIND: {}", message));
+    } else {
+        let mut mind = Agent::new(
+            crate::core::MIND_AGENT_NAME.to_string(),
+            model.clone(),
+            crate::core::MIND_SYSTEM_PROMPT.to_string(),
+        );
+        mind.is_system = true;
+        mind.provider = Some(provider.to_string());
+        mind.status = AgentStatus::Active;
+        mind.deep_agent_config = Some(deep_config);
+
+        let agent_value = serde_json::to_value(&mind)?;
+        match daemon_request(&fresh_config, DaemonRequest::CreateAgent { agent: agent_value }).await? {
+            DaemonResponse::Success { .. } => {
+                println!("  {} MIND", "✓ Created system agent".green());
+            }
+            DaemonResponse::Error { message } => {
+                return Err(anyhow!("Failed to create MIND: {}", message));
+            }
+            _ => return Err(anyhow!("Unexpected response from daemon")),
         }
-        _ => return Err(anyhow!("Unexpected response from daemon")),
     }
 
     // ── Optional: Telegram ────────────────────────────────────────────────────
