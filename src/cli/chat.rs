@@ -205,6 +205,20 @@ async fn run_mind_streaming(
                 if tools.len() > printed_tools {
                     clear_status_line();
                     for (name, res) in &tools[printed_tools..] {
+                        // The plan is a pseudo-entry, rendered as a numbered block so
+                        // the user sees the whole intended sequence up front.
+                        if name == "plan" {
+                            let steps: Vec<&str> = res.lines().filter(|l| !l.trim().is_empty()).collect();
+                            println!(
+                                "  {} {}",
+                                "📋".dimmed(),
+                                format!("plan · {} task(s)", steps.len()).dimmed(),
+                            );
+                            for (i, step) in steps.iter().enumerate() {
+                                println!("     {}", format!("{}. {}", i + 1, step.trim()).dimmed());
+                            }
+                            continue;
+                        }
                         let summary = summarize_result(res);
                         if summary.is_empty() {
                             println!("  {} {}", "↳".dimmed(), format!("called {name}").dimmed());

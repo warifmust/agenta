@@ -13,6 +13,48 @@ fn expand_home(path: &str) -> String {
     path.to_string()
 }
 
+/// Pull the numbered/bulleted steps out of a `PLAN:` turn. Returns None if the
+/// content isn't a plan, so a normal action turn falls straight through. Lenient
+/// about the marker's casing and the bullet style, bounded so a runaway "plan"
+/// can't flood the trace.
+fn extract_plan(content: &str) -> Option<Vec<String>> {
+    let upper = content.to_uppercase();
+    let marker = upper.find("PLAN:")?;
+    let body = &content[marker + "PLAN:".len()..];
+
+    let mut steps: Vec<String> = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            // A blank line after we've started collecting ends the plan block.
+            if !steps.is_empty() {
+                break;
+            }
+            continue;
+        }
+        // Stop if the model ran the plan straight into an action or the answer.
+        if line.contains("TOOL_CALL:") || line.contains("TASK_COMPLETE:") {
+            break;
+        }
+        // Strip a leading "1.", "1)", "-", "*" bullet, keep the text.
+        let cleaned = line
+            .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | ' '))
+            .trim();
+        if !cleaned.is_empty() {
+            steps.push(cleaned.to_string());
+        }
+        if steps.len() >= 12 {
+            break;
+        }
+    }
+
+    if steps.is_empty() {
+        None
+    } else {
+        Some(steps)
+    }
+}
+
 use crate::core::{
     Agent, AgentStatus, DeepAgentConfig, ExecutionMode, ExecutionResult, Proposal, ProposalAction,
     ProposalStatus, SideEffect, Storage, ToolCall, ToolResource,
@@ -158,6 +200,10 @@ impl DeepAgentExecutor {
         // Peak input/context tokens across iterations — how full the context got at
         // its fullest (the last iteration usually has the biggest prompt).
         let mut peak_context: u64 = 0;
+        // Whether the plan turn has happened. MIND states a plan up front (even for a
+        // one-step task) so the user sees what it intends before it acts — captured
+        // once, then execution proceeds.
+        let mut planned = false;
 
         for iteration in 0..self.max_iterations {
             execution.iterations = iteration + 1;
@@ -233,6 +279,37 @@ impl DeepAgentExecutor {
                 role:    "assistant".to_string(),
                 content: content.clone(),
             });
+
+            // ── Plan turn ─────────────────────────────────────────────────────
+            // The first turn states a plan before any action, so the user sees what
+            // MIND intends up front. Capture it into the trace (same live pipe as
+            // tool calls) and prompt execution. If the model jumped straight to a
+            // tool call, we record whatever plan text it gave and let the action
+            // proceed rather than forcing an extra turn.
+            if !planned {
+                if let Some(steps) = extract_plan(&content) {
+                    planned = true;
+                    execution.metadata["plan"] = serde_json::json!(steps);
+                    execution.tool_calls.push(ToolCall {
+                        tool_name:  "plan".to_string(),
+                        parameters: serde_json::json!({}),
+                        result:     steps.join("\n"),
+                        timestamp:  Utc::now(),
+                    });
+                    let _ = self.storage.update_execution(execution).await;
+
+                    if !content.contains("TOOL_CALL:") {
+                        messages.push(ChatMessage {
+                            role:    "user".to_string(),
+                            content: "Plan recorded. Now carry it out — ONE tool call \
+                                      per turn, starting with step 1. Write TASK_COMPLETE \
+                                      only when every step is done."
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                }
+            }
 
             // ── Tool call FIRST ───────────────────────────────────────────────
             // Execute any TOOL_CALL before checking completion/stop. Models often
@@ -1144,5 +1221,35 @@ did not actually happen. For a real run: agenta run {} --input \"…\"\n\n{}",
             }
             Err(e) => Some(format!("Sub-agent failed: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_plan;
+
+    #[test]
+    fn extract_plan_parses_numbered_steps() {
+        let content = "PLAN:\n1. Propose flight_price tool\n2. Propose TravelAgent\n3. Note sub-agent capability\n";
+        let steps = extract_plan(content).expect("should parse a plan");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], "Propose flight_price tool");
+        assert_eq!(steps[2], "Note sub-agent capability");
+    }
+
+    #[test]
+    fn extract_plan_handles_bullets_and_a_blank_boundary() {
+        let content = "PLAN:\n- look things up\n- answer\n\nsome trailing chatter";
+        let steps = extract_plan(content).unwrap();
+        assert_eq!(steps, vec!["look things up", "answer"]);
+    }
+
+    #[test]
+    fn extract_plan_stops_at_an_action_and_returns_none_without_marker() {
+        // A plan that ran straight into a tool call keeps only the plan lines.
+        let content = "PLAN:\n1. list tools\nTOOL_CALL: {\"tool\":\"list_tools\"}";
+        assert_eq!(extract_plan(content).unwrap(), vec!["list tools"]);
+        // No PLAN: marker → not a plan turn.
+        assert!(extract_plan("Just answering directly, no plan here.").is_none());
     }
 }
