@@ -104,9 +104,8 @@ pub async fn run_chat(config: &AppConfig) -> Result<()> {
         let mind_input = build_mind_input(&convo, &input);
         match run_mind_streaming(config, &mind_input).await {
             Ok((reply, tools)) => {
-                for (name, _) in &tools {
-                    println!("  {} {}", "↳".dimmed(), format!("called {name}").dimmed());
-                }
+                // The trace was already printed live during the run; just keep it
+                // for `/trace`.
                 last_trace = tools;
                 let reply = reply.trim().to_string();
                 println!();
@@ -158,6 +157,10 @@ async fn run_mind_streaming(
     let started = std::time::Instant::now();
     let timeout = Duration::from_secs(15 * 60);
     let mut frame = 0usize;
+    // How many tool-call lines we've already printed above the spinner. The daemon
+    // checkpoints the execution after each tool call, so this grows live and turns
+    // the old 10-minute silence into a running "↳ called X" trace.
+    let mut printed_tools = 0usize;
 
     loop {
         if started.elapsed() > timeout {
@@ -165,12 +168,14 @@ async fn run_mind_streaming(
             return Err(anyhow!("MIND timed out. Check: agenta logs MIND"));
         }
 
+        // Spinner + live elapsed, so it's always visibly making progress.
         print!(
-            "\r\x1b[2K  {}  {}",
+            "\r\x1b[2K  {}  {} {}",
             FRAMES[frame % FRAMES.len()]
                 .truecolor(ORANGE.0, ORANGE.1, ORANGE.2)
                 .bold(),
-            "thinking".dimmed()
+            "thinking".dimmed(),
+            format!("· {}", fmt_elapsed(started.elapsed())).dimmed(),
         );
         std::io::stdout().flush().ok();
         frame += 1;
@@ -184,6 +189,18 @@ async fn run_mind_streaming(
         .await?
         {
             DaemonResponse::ExecutionResult { result } => {
+                let tools = extract_tool_calls(&result);
+
+                // Print any tool calls that landed since the last poll, above the
+                // spinner, so the user sees what MIND is doing as it happens.
+                if tools.len() > printed_tools {
+                    clear_status_line();
+                    for (name, _) in &tools[printed_tools..] {
+                        println!("  {} {}", "↳".dimmed(), format!("called {name}").dimmed());
+                    }
+                    printed_tools = tools.len();
+                }
+
                 let status = result
                     .get("status")
                     .and_then(|v| v.as_str())
@@ -202,8 +219,10 @@ async fn run_mind_streaming(
                             return Err(anyhow!(err.trim().to_string()));
                         }
                     }
+                    // A quiet footer with the total, so "how long did that take?" is
+                    // always answerable without a stopwatch.
+                    println!("  {}", format!("done in {}", fmt_elapsed(started.elapsed())).dimmed());
                     let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-                    let tools = extract_tool_calls(&result);
                     return Ok((clean_output(output), tools));
                 }
             }
@@ -221,6 +240,12 @@ async fn run_mind_streaming(
 
         tokio::time::sleep(Duration::from_millis(140)).await;
     }
+}
+
+/// Compact elapsed time for the spinner and footer: "0:07", "1:42", "12:05".
+fn fmt_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// Reveal the reply with a typewriter effect under a left border, so it reads as

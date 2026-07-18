@@ -248,6 +248,14 @@ impl DeepAgentExecutor {
                             timestamp:  Utc::now(),
                         });
                     }
+                    // Persist mid-run so a watcher (the chat spinner polling
+                    // GetExecution) sees the tool trace grow live instead of getting
+                    // the whole thing at the end. Best-effort: a failed checkpoint
+                    // must never abort the run, and the final update_execution still
+                    // writes the authoritative record.
+                    if let Err(e) = self.storage.update_execution(execution).await {
+                        info!("mid-run execution checkpoint failed (non-fatal): {}", e);
+                    }
                     let joined = calls
                         .iter()
                         .map(|(n, r)| format!("{}: {}", n, r))
