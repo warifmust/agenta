@@ -29,8 +29,10 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_files",
     "list_tools",
     "list_agents",
+    "list_proposals",
     "get_tool",
     "get_agent",
+    "get_proposal",
     "propose_create_tool",
     "propose_create_agent",
     "propose_update_agent",
@@ -83,6 +85,23 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
             "list_agents",
             "List every agent in agenta (name, model, status, attached knowledge bases). \
              Use this to answer \"what agents exist\". No parameters.",
+        ),
+        (
+            "list_proposals",
+            "List proposals with their REAL ids, as they exist on this machine right now. \
+             ALWAYS call this before telling the user any proposal id or approve/reject \
+             command — ids you remember from earlier in the conversation may already have \
+             been approved, rejected, or superseded, and a remembered id is a guess. \
+             Use it for \"what's pending\", \"approve them all\", or to check an id the user \
+             gives you. \
+             Parameters: {\"status\": \"<pending|approved|rejected|failed — omit for pending>\"}",
+        ),
+        (
+            "get_proposal",
+            "Read one proposal in full by id: what it would change, the rationale, risk, \
+             and status. Use it to answer \"what's in that proposal\" or to confirm an id \
+             is real before quoting it. \
+             Parameters: {\"id\": \"<proposal id, full or short prefix>\"}",
         ),
         (
             "get_tool",

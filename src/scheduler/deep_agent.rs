@@ -15,7 +15,7 @@ fn expand_home(path: &str) -> String {
 
 use crate::core::{
     Agent, AgentStatus, DeepAgentConfig, ExecutionMode, ExecutionResult, Proposal, ProposalAction,
-    SideEffect, Storage, ToolCall, ToolResource,
+    ProposalStatus, SideEffect, Storage, ToolCall, ToolResource,
 };
 use crate::ollama::client::{ChatMessage, ChatRequest};
 use crate::ollama::models::ModelParameters;
@@ -387,8 +387,10 @@ impl DeepAgentExecutor {
             "spawn_agent" => self.spawn_subagent(parent, parameters).await,
             "list_tools"  => self.builtin_list_tools().await,
             "list_agents" => self.builtin_list_agents().await,
+            "list_proposals" => self.builtin_list_proposals(parameters).await,
             "get_tool"    => self.builtin_get_tool(parameters).await,
             "get_agent"   => self.builtin_get_agent(parameters).await,
+            "get_proposal" => self.builtin_get_proposal(parameters).await,
             "propose_create_tool" => self.builtin_propose_create_tool(parent, parameters).await,
             "propose_create_agent" => self.builtin_propose_create_agent(parent, parameters).await,
             "propose_update_agent" => self.builtin_propose_update_agent(parent, parameters).await,
@@ -450,6 +452,87 @@ impl DeepAgentExecutor {
             }
             Ok(_) => Some("No agents exist yet.".to_string()),
             Err(e) => Some(format!("Error listing agents: {}", e)),
+        }
+    }
+
+    /// List proposals as they are RIGHT NOW. Without this, MIND could only quote ids
+    /// it remembered from its own propose_* calls — unverifiable, and stale the moment
+    /// the user approves or rejects one in another terminal.
+    async fn builtin_list_proposals(&self, params: &serde_json::Value) -> Option<String> {
+        // Default to pending: "what still needs me?" is the question being asked.
+        let status = match params.get("status").and_then(|v| v.as_str()) {
+            None | Some("") | Some("pending") => Some(ProposalStatus::Pending),
+            Some("approved") | Some("applied") => Some(ProposalStatus::Applied),
+            Some("rejected") => Some(ProposalStatus::Rejected),
+            Some("failed") => Some(ProposalStatus::Failed),
+            Some("all") | Some("any") => None,
+            Some(other) => return Some(format!(
+                "Unknown status '{}'. Use pending, approved, rejected, failed, or all.",
+                other
+            )),
+        };
+
+        match self.storage.list_proposals(status).await {
+            Ok(proposals) if !proposals.is_empty() => {
+                let mut out = format!("{} proposal(s):\n", proposals.len());
+                for p in &proposals {
+                    let rationale: String = p.rationale.chars().take(90).collect();
+                    out.push_str(&format!(
+                        "- {} [{}, risk {:?}, by {}]: {} — {}\n",
+                        p.id,
+                        format!("{:?}", p.status).to_lowercase(),
+                        p.risk,
+                        p.proposed_by,
+                        p.action.summary(),
+                        rationale,
+                    ));
+                }
+                out.push_str(
+                    "\nThese ids are real. Quote them exactly; never invent or recall one.\n",
+                );
+                Some(out)
+            }
+            Ok(_) => Some("No proposals match. Nothing is awaiting the user.".to_string()),
+            Err(e) => Some(format!("Error listing proposals: {}", e)),
+        }
+    }
+
+    /// Read one proposal in full. Accepts a short id prefix, since that is what the
+    /// CLI prints and therefore what the user copies back.
+    async fn builtin_get_proposal(&self, params: &serde_json::Value) -> Option<String> {
+        let id = params.get("id").and_then(|v| v.as_str())?.trim();
+
+        let found = match self.storage.get_proposal(id).await {
+            Ok(Some(p)) => Some(p),
+            // Not an exact id — fall back to a prefix match over everything.
+            Ok(None) => match self.storage.list_proposals(None).await {
+                Ok(all) => all.into_iter().find(|p| p.id.starts_with(id)),
+                Err(e) => return Some(format!("Error reading proposals: {}", e)),
+            },
+            Err(e) => return Some(format!("Error reading proposal: {}", e)),
+        };
+
+        match found {
+            Some(p) => Some(format!(
+                "id: {}\nstatus: {:?}\nrisk: {:?}\nproposed_by: {}\ncreated: {}\n\
+                 action: {}\nrationale: {}\n{}",
+                p.id,
+                p.status,
+                p.risk,
+                p.proposed_by,
+                p.created_at.to_rfc3339(),
+                p.action.summary(),
+                p.rationale,
+                p.result
+                    .as_deref()
+                    .map(|r| format!("result: {}\n", r))
+                    .unwrap_or_default(),
+            )),
+            None => Some(format!(
+                "No proposal '{}' exists. Call list_proposals to see the real ids — \
+                 do not guess.",
+                id
+            )),
         }
     }
 
