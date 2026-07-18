@@ -161,6 +161,9 @@ async fn run_mind_streaming(
     // checkpoints the execution after each tool call, so this grows live and turns
     // the old 10-minute silence into a running "↳ called X" trace.
     let mut printed_tools = 0usize;
+    // Latest harness step, from the record. The daemon checkpoints it before each
+    // model call, so it advances even during a long reasoning turn.
+    let mut step: u64 = 0;
 
     loop {
         if started.elapsed() > timeout {
@@ -168,14 +171,18 @@ async fn run_mind_streaming(
             return Err(anyhow!("MIND timed out. Check: agenta logs MIND"));
         }
 
-        // Spinner + live elapsed, so it's always visibly making progress.
+        // Spinner: reassuring phrase (softens as time passes) · step · elapsed.
+        // No fake percentage — just honest signals that it's alive and advancing.
+        let elapsed = started.elapsed();
+        let step_part = if step > 0 { format!(" · step {step}") } else { String::new() };
         print!(
-            "\r\x1b[2K  {}  {} {}",
+            "\r\x1b[2K  {}  {}{} {}",
             FRAMES[frame % FRAMES.len()]
                 .truecolor(ORANGE.0, ORANGE.1, ORANGE.2)
                 .bold(),
-            "thinking".dimmed(),
-            format!("· {}", fmt_elapsed(started.elapsed())).dimmed(),
+            phase_label(elapsed).dimmed(),
+            step_part.dimmed(),
+            format!("· {}", fmt_elapsed(elapsed)).dimmed(),
         );
         std::io::stdout().flush().ok();
         frame += 1;
@@ -189,14 +196,26 @@ async fn run_mind_streaming(
         .await?
         {
             DaemonResponse::ExecutionResult { result } => {
+                step = result.get("iterations").and_then(|v| v.as_u64()).unwrap_or(step);
                 let tools = extract_tool_calls(&result);
 
                 // Print any tool calls that landed since the last poll, above the
-                // spinner, so the user sees what MIND is doing as it happens.
+                // spinner, each with a one-line summary of what it returned — so the
+                // trace shows not just that MIND acted but what it learned.
                 if tools.len() > printed_tools {
                     clear_status_line();
-                    for (name, _) in &tools[printed_tools..] {
-                        println!("  {} {}", "↳".dimmed(), format!("called {name}").dimmed());
+                    for (name, res) in &tools[printed_tools..] {
+                        let summary = summarize_result(res);
+                        if summary.is_empty() {
+                            println!("  {} {}", "↳".dimmed(), format!("called {name}").dimmed());
+                        } else {
+                            println!(
+                                "  {} {} {}",
+                                "↳".dimmed(),
+                                format!("called {name}").dimmed(),
+                                format!("→ {summary}").dimmed(),
+                            );
+                        }
                     }
                     printed_tools = tools.len();
                 }
@@ -246,6 +265,37 @@ async fn run_mind_streaming(
 fn fmt_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Reassuring spinner phrase that softens as time passes, so a long single model
+/// turn (where there is genuinely nothing to stream) reads as "still going" rather
+/// than "frozen". Purely cosmetic — it makes no claim about progress it can't see.
+fn phase_label(elapsed: Duration) -> &'static str {
+    match elapsed.as_secs() {
+        0..=29 => "thinking",
+        30..=89 => "still working",
+        _ => "still working — long tasks can take a few minutes",
+    }
+}
+
+/// One-line gist of a tool result for the live trace: first non-empty line, cleaned
+/// of the "TOOL: " prefix the harness prepends, whitespace-collapsed and truncated.
+/// Returns "" when there's nothing worth showing.
+fn summarize_result(res: &str) -> String {
+    let line = res
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    // Results come back as "toolname: <payload>"; drop the redundant name prefix.
+    let line = line.splitn(2, ": ").last().unwrap_or(line);
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max = 64;
+    if collapsed.chars().count() > max {
+        format!("{}…", collapsed.chars().take(max).collect::<String>())
+    } else {
+        collapsed
+    }
 }
 
 /// Reveal the reply with a typewriter effect under a left border, so it reads as
@@ -793,4 +843,34 @@ fn print_help() {
     );
     println!("    ↑/↓ history · /trace last tool calls · /exit leave (agents keep running)");
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_result_gives_a_clean_one_liner() {
+        // Strips the "toolname: " prefix the harness prepends.
+        assert_eq!(summarize_result("check_command: docker is running"), "docker is running");
+        // First non-empty line only, whitespace collapsed.
+        assert_eq!(
+            summarize_result("\n\n  list_agents:   14   agents\nmore detail"),
+            "14 agents"
+        );
+        // Nothing worth showing.
+        assert_eq!(summarize_result("   \n  "), "");
+        // Long output is truncated with an ellipsis.
+        let long = format!("t: {}", "x".repeat(200));
+        let out = summarize_result(&long);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 65);
+    }
+
+    #[test]
+    fn phase_label_softens_over_time() {
+        assert_eq!(phase_label(Duration::from_secs(5)), "thinking");
+        assert_eq!(phase_label(Duration::from_secs(45)), "still working");
+        assert!(phase_label(Duration::from_secs(120)).contains("few minutes"));
+    }
 }

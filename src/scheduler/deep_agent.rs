@@ -163,6 +163,13 @@ impl DeepAgentExecutor {
             execution.iterations = iteration + 1;
             info!("Harness iteration {}/{} for agent: {}", iteration + 1, self.max_iterations, agent.name);
 
+            // Checkpoint the step number BEFORE the model call, which is the longest
+            // wait in the loop (a reasoning model can think for a minute here). This
+            // is what lets a watcher show "step N" advancing instead of freezing.
+            if let Err(e) = self.storage.update_execution(execution).await {
+                info!("mid-run step checkpoint failed (non-fatal): {}", e);
+            }
+
             let request = ChatRequest {
                 model:    agent.model.clone(),
                 messages: messages.clone(),
