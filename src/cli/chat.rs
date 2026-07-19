@@ -211,7 +211,7 @@ async fn run_mind_streaming(
                             let steps: Vec<&str> = res.lines().filter(|l| !l.trim().is_empty()).collect();
                             println!(
                                 "  {} {}",
-                                "📋".dimmed(),
+                                "↳".dimmed(),
                                 format!("plan · {} task(s)", steps.len()).dimmed(),
                             );
                             for (i, step) in steps.iter().enumerate() {
