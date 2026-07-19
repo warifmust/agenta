@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agenta"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "anyhow",
  "async-trait",
