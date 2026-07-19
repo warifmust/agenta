@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use regex::Regex;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -90,10 +91,13 @@ async fn poll_telegram_bot(
             }
             Err(e) => {
                 consecutive_errors += 1;
+                // Don't claim "check your token" — this fires on network timeouts
+                // too, and the redacted error text already says what went wrong
+                // (e.g. "operation timed out" vs "401 Unauthorized").
                 if consecutive_errors == 1 {
-                    warn!("[{}] Telegram bot error: {} — check your token in ~/.agenta/.env", label, e);
+                    warn!("[{}] Telegram getUpdates failed (retrying every 10s): {}", label, redact_bot_token(&e.to_string()));
                 } else {
-                    tracing::debug!("[{}] getUpdates error ({}): {} — retrying in 10s", label, consecutive_errors, e);
+                    tracing::debug!("[{}] getUpdates error #{} (retrying every 10s): {}", label, consecutive_errors, redact_bot_token(&e.to_string()));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 continue;
@@ -143,7 +147,7 @@ async fn poll_telegram_bot(
                         {
                             warn!(
                                 "[{}] Failed sending progress to chat {}: {}",
-                                lbl_prog, chat_id, e
+                                lbl_prog, chat_id, redact_bot_token(&e.to_string())
                             );
                         }
                     }
@@ -197,7 +201,7 @@ async fn poll_telegram_bot(
                 typing_cancel.cancel();
 
                 if let Err(e) = send_telegram_message(&h, &bu, chat_id, &reply).await {
-                    warn!("[{}] Failed sending reply to chat {}: {}", lbl, chat_id, e);
+                    warn!("[{}] Failed sending reply to chat {}: {}", lbl, chat_id, redact_bot_token(&e.to_string()));
                 }
             });
         }
@@ -306,6 +310,19 @@ fn split_for_telegram(input: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
+/// Strip Telegram bot tokens out of a string before it's logged. reqwest errors
+/// embed the full request URL — `https://api.telegram.org/bot<token>/getUpdates` —
+/// so logging the raw error would write every bot's token to daemon.log in plain
+/// text. Replace the `bot<token>` segment with a marker. Compiled per call, but
+/// only ever on an error path, so the cost is irrelevant.
+fn redact_bot_token(s: &str) -> String {
+    // Token shape in the URL path: `bot<digits>:<letters/digits/_-...>`.
+    match Regex::new(r"bot[0-9]+:[A-Za-z0-9_-]+") {
+        Ok(re) => re.replace_all(s, "bot<redacted>").into_owned(),
+        Err(_) => s.to_string(),
+    }
+}
+
 fn resolve_agent_and_input(text: &str, default_agent: Option<&str>) -> (String, String) {
     // "/agent <name> <message>" overrides default agent
     if let Some(rest) = text.strip_prefix("/agent ") {
@@ -354,7 +371,25 @@ fn sanitize_for_chat(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_for_chat;
+    use super::{redact_bot_token, sanitize_for_chat};
+
+    #[test]
+    fn redact_bot_token_scrubs_tokens_from_error_strings() {
+        // Shaped exactly like a reqwest error, which is how the leak happened —
+        // the token rides along inside the request URL. Fake token, never a real one.
+        let err = "error sending request for url (https://api.telegram.org/bot123456789:AA-FakeTokenExample_00/getUpdates?offset=0): operation timed out";
+        let out = redact_bot_token(err);
+
+        assert!(out.contains("bot<redacted>"), "token segment must be masked");
+        assert!(!out.contains("123456789:AA"), "no part of the token may survive");
+        // The useful diagnostic context is preserved.
+        assert!(out.contains("operation timed out"));
+        assert!(out.contains("getUpdates"));
+
+        // Multiple tokens in one string are all scrubbed; token-free strings pass through.
+        assert_eq!(redact_bot_token("bot111:AAA and bot222:BBB"), "bot<redacted> and bot<redacted>");
+        assert_eq!(redact_bot_token("401 Unauthorized"), "401 Unauthorized");
+    }
 
     #[test]
     fn sanitize_for_chat_removes_markdown_noise() {
