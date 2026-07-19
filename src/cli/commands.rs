@@ -628,8 +628,26 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 .map_err(|e| anyhow!("Failed to run upgrade: {}", e))?;
 
             if status.success() {
-                println!("Upgrade complete. Restart the daemon to apply:");
-                println!("  agenta daemon stop && agenta daemon start");
+                // The binaries were just replaced, but a running daemon is still the
+                // OLD process — leave it and the CLI is new while the daemon is stale
+                // (live-trace/plan checkpoints missing, etc.). Restart it so the new
+                // daemon binary actually takes effect. This is the two-binary footgun;
+                // don't make the user remember the manual step.
+                if is_daemon_running(&config).await {
+                    println!("Upgrade complete. Restarting daemon to load the new binary...");
+                    if let Err(e) = daemon_stop(&config).await {
+                        println!("  {} couldn't stop the old daemon: {}", "⚠".yellow(), e);
+                    }
+                    match daemon_start(&config, false).await {
+                        Ok(_) => println!("  {} daemon now running the new version", "✓".green()),
+                        Err(e) => {
+                            println!("  {} daemon didn't restart: {}", "⚠".yellow(), e);
+                            println!("  Start it manually: agenta daemon start");
+                        }
+                    }
+                } else {
+                    println!("Upgrade complete.");
+                }
                 Ok(())
             } else {
                 Err(anyhow!("Upgrade failed with exit code: {}", status))
