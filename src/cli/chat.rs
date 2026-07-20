@@ -525,7 +525,7 @@ fn prompt_trust_cwd() {
     }
 
     println!();
-    println!("  {} MIND can read files under the directory you launched from:", "📂".dimmed());
+    println!("  {} MIND can read files under the directory you launched from:", "⚠".truecolor(0xE0, 0xA0, 0x30));
     println!("    {}", cwd.display().to_string().truecolor(ORANGE.0, ORANGE.1, ORANGE.2));
     let trust = inquire::Confirm::new("  Trust this directory (now and in future)?")
         .with_default(false)
