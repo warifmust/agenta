@@ -488,15 +488,37 @@ fn clear_status_line() {
 /// the conversation) plus the new message. A single execution is otherwise
 /// stateless.
 fn build_mind_input(convo: &[(String, String)], new_msg: &str) -> String {
-    if convo.is_empty() {
-        return new_msg.to_string();
+    let mut s = working_dir_context();
+    if !convo.is_empty() {
+        s.push_str("[Conversation so far — for context]\n");
+        for (user, mind) in convo {
+            s.push_str(&format!("User: {user}\nYou (MIND): {mind}\n\n"));
+        }
+        s.push_str("[The user's new message — respond to this]\n");
     }
-    let mut s = String::from("[Conversation so far — for context]\n");
-    for (user, mind) in convo {
-        s.push_str(&format!("User: {user}\nYou (MIND): {mind}\n\n"));
-    }
-    s.push_str(&format!("[The user's new message — respond to this]\n{new_msg}"));
+    s.push_str(new_msg);
     s
+}
+
+/// A working-directory banner prepended to MIND's input. The chat CLI runs in the
+/// user's shell cwd, but the agent executes inside the daemon (a different
+/// directory) — so without this, MIND has no idea that "the repo", "this project",
+/// or "." means the folder the user is standing in. It also tells MIND to use
+/// absolute paths, because the file tools resolve relative paths against the
+/// daemon's location, not this one. Interactive chat only; scheduled/Telegram runs
+/// have no meaningful cwd and don't get this.
+fn working_dir_context() -> String {
+    match std::env::current_dir() {
+        Ok(cwd) => format!(
+            "[Working directory: {}]\n\
+             The user is running you from this directory. When they say \"the repo\", \
+             \"this project\", \"here\", or use a relative path, they mean this directory. \
+             Use ABSOLUTE paths under it for read_file / list_files — the file tools \
+             resolve relative paths against the daemon's location, not this one.\n\n",
+            cwd.display()
+        ),
+        Err(_) => String::new(),
+    }
 }
 
 /// Pull the `(tool_name, result)` calls out of a completed execution record.
