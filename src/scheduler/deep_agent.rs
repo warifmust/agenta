@@ -381,17 +381,31 @@ impl DeepAgentExecutor {
             return Ok(content.trim().to_string());
         }
 
-        // Max iterations hit — return the last assistant response
-        let last = messages
+        // Max iterations hit without a TASK_COMPLETE — the run didn't finish. Fail
+        // loudly (like the truncation guard) rather than passing off a half-done run
+        // as success, and summarise what DID happen instead of dumping the raw last
+        // turn (which is usually a TOOL_CALL JSON blob and reads as garbage).
+        let actions: Vec<String> = execution
+            .tool_calls
             .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .map(|m| m.content.clone())
-            .unwrap_or_else(|| "Task did not complete within the iteration limit.".to_string());
-
-        Ok(format!(
-            "Reached maximum iterations ({}). Last response:\n{}",
-            self.max_iterations, last
+            .filter(|t| t.tool_name != "plan")
+            .map(|t| t.tool_name.clone())
+            .collect();
+        let did = if actions.is_empty() {
+            "no actions completed".to_string()
+        } else {
+            actions.join(", ")
+        };
+        Err(anyhow!(
+            "{} ran out of steps ({} iterations) before finishing. \
+             Actions taken: {}. \
+             Approve any proposals it drafted (`agenta proposals`), then ask it to \
+             continue — or give it more room with `agenta update {} --deep-iterations {}`.",
+            agent.name,
+            self.max_iterations,
+            did,
+            agent.name,
+            self.max_iterations * 2,
         ))
     }
 

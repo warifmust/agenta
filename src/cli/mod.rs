@@ -73,7 +73,7 @@ pub enum Commands {
         deep: bool,
 
         /// Deep agent max iterations
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "20")]
         deep_iterations: u32,
 
         /// Enable memory (agent recalls past executions)
@@ -184,9 +184,10 @@ pub enum Commands {
         #[arg(long)]
         deep: Option<bool>,
 
-        /// Deep agent max iterations (only when enabling deep mode)
-        #[arg(long, default_value = "10")]
-        deep_iterations: u32,
+        /// Deep agent max iterations. Applies on its own — raise the limit without
+        /// re-passing --deep. Omit to leave it unchanged.
+        #[arg(long)]
+        deep_iterations: Option<u32>,
 
         /// Add (or update) a single installed tool by name, e.g. --add-tool tavily_search
         #[arg(long, value_name = "TOOL_NAME")]

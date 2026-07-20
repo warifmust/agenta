@@ -306,12 +306,12 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                     let tool_names: Vec<String> = agent.tools.iter().map(|t| t.name.clone()).collect();
                     agent.deep_agent_config = Some(match agent.deep_agent_config.take() {
                         Some(mut cfg) => {
-                            cfg.max_iterations = new_deep_iterations;
+                            if let Some(n) = new_deep_iterations { cfg.max_iterations = n; }
                             cfg.available_tools = tool_names;
                             cfg
                         }
                         None => DeepAgentConfig {
-                            max_iterations: new_deep_iterations,
+                            max_iterations: new_deep_iterations.unwrap_or(20),
                             enable_reflection: true,
                             available_tools: tool_names,
                             stop_conditions: vec!["task_complete".to_string()],
@@ -321,7 +321,16 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                     });
                 }
                 Some(false) => agent.deep_agent_config = None,
-                None => {}
+                // --deep not passed. Still honor --deep-iterations on its own so you
+                // can raise the limit without re-enabling deep mode (previously this
+                // silently did nothing — the whole point of the flag).
+                None => {
+                    if let Some(n) = new_deep_iterations {
+                        if let Some(cfg) = agent.deep_agent_config.as_mut() {
+                            cfg.max_iterations = n;
+                        }
+                    }
+                }
             }
             if let Some(msg) = new_spawn_message {
                 if let Some(config) = agent.deep_agent_config.as_mut() {
@@ -1311,9 +1320,11 @@ async fn bootstrap_mind(config: &AppConfig) -> Result<()> {
     // and re-assert the deep-agent config (repairing a MIND written by an older
     // version), while leaving any tools/config attached to it alone.
     // MIND is a deep agent — the builder builtins (propose_create_tool) and its
-    // multi-step reasoning only run in the deep-agent loop.
+    // multi-step reasoning only run in the deep-agent loop. It gets more iterations
+    // than a task agent because a build is inherently multi-step: explore the repo,
+    // then propose a tool, then propose an agent — 10 wasn't enough to finish.
     let deep_config = DeepAgentConfig {
-        max_iterations: 10,
+        max_iterations: 20,
         enable_reflection: true,
         available_tools: vec![],
         stop_conditions: vec!["task_complete".to_string()],
