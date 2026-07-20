@@ -3016,18 +3016,42 @@ async fn pull_tool(config: &AppConfig, name: &str, version: &str, attach: Option
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-    let tool_val = serde_json::json!({
-        "name": name,
-        "description": description,
-        "parameters": parameters,
-        "handler": format!("/usr/bin/env bash {}", handler_path.display()),
-    });
-    if let Err(e) = daemon_request(config, DaemonRequest::CreateTool { tool: tool_val }).await {
-        // Non-fatal — daemon may not be running, files are still on disk
-        eprintln!("{} Could not register with daemon: {}", "!".yellow(), e);
-    }
+    // Build a COMPLETE ToolResource. `id`, `enabled`, and the timestamps are
+    // required with no serde defaults, so a partial JSON payload fails to
+    // deserialize daemon-side — and `daemon_request` returns that failure as
+    // `Ok(DaemonResponse::Error)`, which the old `if let Err` check swallowed,
+    // printing a false "installed" while the tool never registered.
+    let mut tool = ToolResource::new(
+        name.to_string(),
+        description.clone(),
+        parameters,
+        Some(format!("/usr/bin/env bash {}", handler_path.display())),
+    );
+    tool.secrets = env_vars.clone();
+    let tool_val = serde_json::to_value(&tool)?;
 
-    println!("{} Tool installed: {}", "✓".green(), name.cyan());
+    let registered = match daemon_request(config, DaemonRequest::CreateTool { tool: tool_val }).await {
+        Ok(DaemonResponse::Success { .. }) => true,
+        Ok(DaemonResponse::Error { message }) => {
+            eprintln!("{} Written to disk but NOT registered with the daemon: {}", "!".yellow(), message);
+            false
+        }
+        Ok(_) => {
+            eprintln!("{} Written to disk but the daemon returned an unexpected response.", "!".yellow());
+            false
+        }
+        Err(e) => {
+            eprintln!("{} Written to disk but NOT registered — daemon not reachable: {}", "!".yellow(), e);
+            eprintln!("  {}", "Start it with `agenta daemon start`, then re-run this pull.".dimmed());
+            false
+        }
+    };
+
+    if registered {
+        println!("{} Tool installed: {}", "✓".green(), name.cyan());
+    } else {
+        println!("{} Tool files written but not usable yet — see the warning above: {}", "⚠".yellow(), name.cyan());
+    }
     println!("  Location : {}", install_dir.display());
     println!("  Handler  : {}", handler_path.display());
     if !description.is_empty() {
