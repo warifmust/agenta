@@ -4,6 +4,7 @@
 
 mod cli;
 mod core;
+mod guardrails;
 mod knowledge;
 mod ollama;
 mod providers;
