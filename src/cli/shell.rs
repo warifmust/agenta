@@ -352,11 +352,19 @@ impl PaletteReader {
     }
 
     /// Clear the dropdown, commit the prompt line into scrollback, return the line.
+    ///
+    /// Echoes the *submitted* text — the expanded paste or resolved command — not
+    /// `self.buf`, which may still hold a `[Pasted text …]` marker or a partial
+    /// command. That way the transcript shows exactly what was sent before the
+    /// agent starts working, and a pasted prompt isn't invisible.
     fn finish_line(&mut self, line: String) -> Result<LineResult> {
         let mut out = stdout();
         self.clear_all(&mut out)?;
         let (r, g, b) = self.prompt_rgb;
-        write!(out, "{}{}\r\n", self.prompt.truecolor(r, g, b), self.buf)?;
+        // In raw mode a bare `\n` drops a row without returning to column 0, so a
+        // multi-line paste would stairstep. `\r\n` keeps every line left-aligned.
+        let shown = line.replace('\n', "\r\n");
+        write!(out, "{}{}\r\n", self.prompt.truecolor(r, g, b), shown)?;
         out.flush()?;
         Ok(LineResult::Line(line))
     }
