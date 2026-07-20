@@ -92,6 +92,11 @@ pub enum Commands {
         #[arg(long)]
         allow_destructive_tools: bool,
 
+        /// Filesystem path this agent's file tools may access (repeatable). Empty =
+        /// no file access. Sensitive paths (~/.ssh, .env, …) stay blocked.
+        #[arg(long = "fs-allow", value_name = "PATH")]
+        fs_allow: Vec<String>,
+
         /// Interactive mode
         #[arg(short, long)]
         interactive: bool,
@@ -213,6 +218,11 @@ pub enum Commands {
         /// Permit (or forbid) this agent to run destructive tools autonomously.
         #[arg(long)]
         allow_destructive_tools: Option<bool>,
+
+        /// Replace this agent's filesystem-allow list (repeatable). Pass paths the
+        /// agent's file tools may access; omit to leave unchanged.
+        #[arg(long = "fs-allow", value_name = "PATH")]
+        fs_allow: Vec<String>,
 
         /// Custom sub-agent spawn notification message (deep agents only).
         /// Use {task} as a placeholder for the task description.

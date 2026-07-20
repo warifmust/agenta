@@ -69,6 +69,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             provider,
             tools,
             allow_destructive_tools,
+            fs_allow,
             interactive,
         } => {
             if interactive {
@@ -97,6 +98,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             agent.memory_enabled = memory;
             agent.provider = provider;
             agent.config.allow_destructive_tools = allow_destructive_tools;
+            agent.config.fs_allow = fs_allow;
             if let Some(tools_arg) = tools {
                 agent.tools = read_tool_definitions(&tools_arg)?;
             }
@@ -181,6 +183,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             remove_kb: new_remove_kb,
             top_k: new_top_k,
             allow_destructive_tools: new_allow_destructive,
+            fs_allow: new_fs_allow,
             spawn_message: new_spawn_message,
         } => {
             let get_request = DaemonRequest::GetAgent { id: id.clone() };
@@ -299,6 +302,10 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             }
             if let Some(v) = new_allow_destructive {
                 agent.config.allow_destructive_tools = v;
+            }
+            // Non-empty replaces the allow list; omit to leave it unchanged.
+            if !new_fs_allow.is_empty() {
+                agent.config.fs_allow = new_fs_allow;
             }
             match new_deep {
                 Some(true) => {
@@ -2184,6 +2191,15 @@ fn print_agent_details(agent: &Agent) {
     if agent.config.allow_destructive_tools {
         table.add_row(vec!["Destructive Tools", "Allowed (autonomous)"]);
     }
+
+    // Filesystem scope — the guardrail boundary, made visible. Shown even when empty
+    // so it's clear the agent has no file access (rather than the row just missing).
+    let fs = if agent.config.fs_allow.is_empty() {
+        "none (no file access)".to_string()
+    } else {
+        agent.config.fs_allow.join(", ")
+    };
+    table.add_row(vec!["Filesystem", &fs]);
 
     // RAG rows only appear when knowledge bases are attached — their presence is
     // what marks this as a RAG agent (no separate/duplicative flag needed).
