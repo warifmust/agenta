@@ -483,11 +483,11 @@ impl DeepAgentExecutor {
     fn fs_guard(&self, parent: &Agent, tool_name: &str, params: &serde_json::Value) -> Option<String> {
         let raw = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let mode = if tool_name == "write_file" { FsMode::Write } else { FsMode::Read };
-        // MIND (interim): may read anywhere except the sensitive floor — the
-        // per-directory trust store, landing next, will confine it further. Task
-        // agents: only their declared fs_allow roots (empty ⇒ no access).
+        // MIND reads only under directories it's been trusted into (via the chat's
+        // startup prompt); task agents read only their declared fs_allow roots.
+        // Either way, empty ⇒ no access, and the sensitive floor applies on top.
         let roots: Vec<String> = if crate::core::is_mind(parent) {
-            vec!["/".to_string()]
+            guardrails::trust::load()
         } else {
             parent.config.fs_allow.clone()
         };

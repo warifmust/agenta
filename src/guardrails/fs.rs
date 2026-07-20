@@ -138,6 +138,14 @@ fn sensitive_reason(p: &Path, home: &Path) -> Option<String> {
     None
 }
 
+/// Public: is `path` on the sensitive floor? Returns what it is (e.g. `~/.ssh`) or
+/// None. Used by the chat to warn when launched from a protected directory.
+pub fn protected_reason(path: &Path, home: &Path) -> Option<String> {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    sensitive_reason(&p, &home)
+}
+
 /// The core decision. `roots` are the agent's allowed paths (already raw strings
 /// from config/trust store — resolved here). `base` is the directory relative paths
 /// resolve against (the daemon cwd); `home` is `$HOME`.

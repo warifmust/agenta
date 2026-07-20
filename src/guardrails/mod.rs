@@ -10,6 +10,7 @@
 //! abstraction earns its way in once there are two or three, not before.
 
 pub mod fs;
+pub mod trust;
 
 /// Master switch for guardrail *enforcement*. On by default; set `AGENTA_FS_GUARD=off`
 /// (or `0`/`false`/`disabled`) to fall back to pre-guardrail behaviour. This is the

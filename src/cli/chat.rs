@@ -48,6 +48,7 @@ const CHAT_COMMANDS: &[(&str, &str)] = &[
 
 pub async fn run_chat(config: &AppConfig) -> Result<()> {
     print_welcome(config).await;
+    prompt_trust_cwd();
 
     // Same palette reader as `agenta shell` — live `/` dropdown + history — but
     // with the chat's prompt, accent, and command set.
@@ -498,6 +499,45 @@ fn build_mind_input(convo: &[(String, String)], new_msg: &str) -> String {
     }
     s.push_str(new_msg);
     s
+}
+
+/// Trust gate at chat startup — the "trust this folder" prompt. MIND may only read
+/// files under directories you've trusted; the first time you launch from a new one,
+/// this asks. A protected directory (~/.ssh, …) is refused outright; declining just
+/// means MIND can't read here this session. Non-interactive launch ⇒ don't trust
+/// (safe default). Trusted dirs are remembered across sessions.
+fn prompt_trust_cwd() {
+    let Ok(cwd) = std::env::current_dir() else { return };
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+
+    if let Some(what) = crate::guardrails::fs::protected_reason(&cwd, &home) {
+        println!(
+            "  {} You're in a protected directory ({}). File operations here are blocked for safety.",
+            "⚠".truecolor(0xE0, 0xA0, 0x30),
+            what
+        );
+        return;
+    }
+
+    let trusted = crate::guardrails::trust::load();
+    if crate::guardrails::trust::is_trusted(&cwd, &trusted) {
+        return;
+    }
+
+    println!();
+    println!("  {} MIND can read files under the directory you launched from:", "📂".dimmed());
+    println!("    {}", cwd.display().to_string().truecolor(ORANGE.0, ORANGE.1, ORANGE.2));
+    let trust = inquire::Confirm::new("  Trust this directory (now and in future)?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
+    if trust {
+        crate::guardrails::trust::add(&cwd);
+        println!("  {} trusted — sensitive files (.env, .ssh, keys) stay blocked.", "✓".green());
+    } else {
+        println!("  {} not trusted — MIND won't read files here this session.", "·".dimmed());
+    }
+    println!();
 }
 
 /// A working-directory banner prepended to MIND's input. The chat CLI runs in the
