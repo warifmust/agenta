@@ -365,6 +365,13 @@ pub struct AgentConfig {
     /// opted in. (`Write` tools are never gated; only `Destructive`.)
     #[serde(default)]
     pub allow_destructive_tools: bool,
+    /// Filesystem paths this agent's built-in file tools (read_file/list_files/
+    /// write_file) may touch. Empty = no filesystem access (the safe default; see
+    /// [`crate::guardrails::fs`]). Sensitive paths (~/.ssh, .env, …) stay denied even
+    /// under a granted root unless the exact path is listed. MIND uses its trust
+    /// store instead of this field.
+    #[serde(default)]
+    pub fs_allow: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -384,6 +391,7 @@ impl Default for AgentConfig {
             knowledge_bases: vec![],
             rag_top_k: None,
             allow_destructive_tools: false,
+            fs_allow: vec![],
         }
     }
 }

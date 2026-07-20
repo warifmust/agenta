@@ -1,8 +1,12 @@
 use anyhow::anyhow;
 use chrono::Utc;
 use regex::Regex;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::guardrails;
+use crate::guardrails::fs::{FsDecision, FsMode};
 
 fn expand_home(path: &str) -> String {
     if path.starts_with("~/") || path == "~" {
@@ -472,12 +476,50 @@ impl DeepAgentExecutor {
         results
     }
 
+    /// Filesystem guardrail for the built-in file tools. Checked once here, before
+    /// dispatch, so the three tools stay simple. Returns `Some(deny_message)` to
+    /// block, `None` to proceed. Always logs the decision; with `AGENTA_FS_GUARD=off`
+    /// it logs a would-be denial but allows (audit mode).
+    fn fs_guard(&self, parent: &Agent, tool_name: &str, params: &serde_json::Value) -> Option<String> {
+        let raw = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let mode = if tool_name == "write_file" { FsMode::Write } else { FsMode::Read };
+        // MIND (interim): may read anywhere except the sensitive floor — the
+        // per-directory trust store, landing next, will confine it further. Task
+        // agents: only their declared fs_allow roots (empty ⇒ no access).
+        let roots: Vec<String> = if crate::core::is_mind(parent) {
+            vec!["/".to_string()]
+        } else {
+            parent.config.fs_allow.clone()
+        };
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+
+        match guardrails::fs::check_fs_access(&roots, raw, &base, &home, mode) {
+            FsDecision::Allow => None,
+            FsDecision::Deny(reason) => {
+                if guardrails::enforcement_enabled() {
+                    warn!("[guardrail] {} denied {} on {:?} — {}", parent.name, tool_name, raw, reason);
+                    Some(format!("Access denied — {reason}"))
+                } else {
+                    warn!("[guardrail:audit] would deny {} {} on {:?} — {} (AGENTA_FS_GUARD=off, allowing)", parent.name, tool_name, raw, reason);
+                    None
+                }
+            }
+        }
+    }
+
     async fn run_builtin_tool(
         &self,
         parent: &Agent,
         tool_name: &str,
         parameters: &serde_json::Value,
     ) -> Option<String> {
+        // Filesystem guardrail — gate the file tools before they touch disk.
+        if matches!(tool_name, "read_file" | "list_files" | "write_file") {
+            if let Some(denied) = self.fs_guard(parent, tool_name, parameters) {
+                return Some(denied);
+            }
+        }
         match tool_name {
             "read_file"   => self.builtin_read_file(parameters).await,
             // MIND never writes files directly — it is read-and-propose only. Refuse

@@ -10,3 +10,18 @@
 //! abstraction earns its way in once there are two or three, not before.
 
 pub mod fs;
+
+/// Master switch for guardrail *enforcement*. On by default; set `AGENTA_FS_GUARD=off`
+/// (or `0`/`false`/`disabled`) to fall back to pre-guardrail behaviour. This is the
+/// escape hatch for a default-deny feature: a decision is always *logged*, but when
+/// this is off a Deny doesn't actually block — so a surprising breakage is a flag
+/// flip, not a downgrade.
+pub fn enforcement_enabled() -> bool {
+    match std::env::var("AGENTA_FS_GUARD") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        ),
+        Err(_) => true,
+    }
+}
