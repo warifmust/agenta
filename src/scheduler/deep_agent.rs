@@ -163,10 +163,18 @@ impl DeepAgentExecutor {
             .collect();
         let mind = crate::core::is_mind(agent);
         for (name, desc) in builtin_tool_descriptions() {
-            // MIND is read-and-propose only: it must never mutate the filesystem
-            // directly, so it doesn't get write_file. All its changes go through
-            // propose_* (human-approved). Other agents keep write_file.
-            if mind && name == "write_file" {
+            if mind {
+                // MIND is read-and-propose only: it must never mutate the
+                // filesystem directly, so it doesn't get write_file. All its
+                // changes go through propose_* (human-approved).
+                if name == "write_file" {
+                    continue;
+                }
+            } else if crate::tools::is_mind_only_builtin(name) {
+                // Task agents get ONLY the filesystem builtins (fs-guarded). The
+                // introspection/builder/propose/orchestration builtins are MIND's
+                // alone — don't even name them, so a worker can't enumerate the
+                // registry or propose agents/tools by calling one.
                 continue;
             }
             tool_descriptions.push(format!("- {} (built-in): {}", name, desc));
@@ -514,6 +522,16 @@ impl DeepAgentExecutor {
         tool_name: &str,
         parameters: &serde_json::Value,
     ) -> Option<String> {
+        // Builder-builtin guardrail — introspection/propose/orchestration
+        // builtins are MIND-only. A task agent must never enumerate the registry
+        // or propose changes, so refuse here even if the model hallucinates the
+        // call (the catalogue already hides these from non-MIND agents).
+        if !crate::core::is_mind(parent) && crate::tools::is_mind_only_builtin(tool_name) {
+            return Some(format!(
+                "Refused: '{tool_name}' is not available to this agent. Answer using your own \
+                 attached tools and knowledge."
+            ));
+        }
         // Filesystem guardrail — gate the file tools before they touch disk.
         if matches!(tool_name, "read_file" | "list_files" | "write_file") {
             if let Some(denied) = self.fs_guard(parent, tool_name, parameters) {

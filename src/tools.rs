@@ -47,6 +47,19 @@ pub fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOL_NAMES.contains(&name)
 }
 
+/// Builtins any agent may use — the filesystem tools, each access-controlled by
+/// the fs guardrail. Everything else in `BUILTIN_TOOL_NAMES` is MIND-only:
+/// introspection (`list_*`/`get_*`), builder (`propose_*`, `check_command`),
+/// orchestration (`spawn_agent`), and MIND's own memory (`remember_feedback`).
+/// A task agent must not enumerate the registry, propose changes, or spawn
+/// agents — those are the builder's job, not a worker's.
+pub const TASK_AGENT_BUILTIN_NAMES: &[&str] = &["read_file", "list_files", "write_file"];
+
+/// True for a builtin that only MIND (the builder) should be able to see or call.
+pub fn is_mind_only_builtin(name: &str) -> bool {
+    is_builtin_tool(name) && !TASK_AGENT_BUILTIN_NAMES.contains(&name)
+}
+
 /// Descriptions injected into every agent's system prompt.
 pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -603,6 +616,25 @@ mod tests {
         assert!(is_builtin_tool("read_file"));
         assert!(is_builtin_tool("write_file"));
         assert!(is_builtin_tool("list_files"));
+    }
+
+    #[test]
+    fn builder_builtins_are_mind_only_but_fs_tools_are_not() {
+        // Filesystem builtins are available to every agent (fs-guarded).
+        for t in ["read_file", "list_files", "write_file"] {
+            assert!(!is_mind_only_builtin(t), "{t} must be available to task agents");
+        }
+        // Introspection / builder / orchestration builtins are MIND-only.
+        for t in [
+            "list_tools", "list_agents", "list_proposals", "get_tool", "get_agent",
+            "get_proposal", "spawn_agent", "check_command", "remember_feedback",
+            "propose_create_tool", "propose_create_agent", "propose_update_agent",
+            "propose_update_tool", "propose_attach_kb", "propose_detach_kb",
+        ] {
+            assert!(is_mind_only_builtin(t), "{t} must be MIND-only");
+        }
+        // Non-builtins are never classified as MIND-only builtins.
+        assert!(!is_mind_only_builtin("tavily_search"));
     }
 
     #[test]
