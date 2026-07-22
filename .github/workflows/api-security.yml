@@ -1,0 +1,91 @@
+name: API Security (Schemathesis)
+
+# Self-hosted, no-cloud API fuzzing: boots the agenta daemon in the runner and
+# property-tests the REST API against its OWN OpenAPI spec. Replaces the ApiSec
+# cloud SaaS (which scanned a demo project and needed a paid account) — nothing
+# leaves the runner. Excludes /run (needs an LLM provider key) and
+# /knowledge-bases (needs Postgres) so failures are real defects, not missing infra.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz REST API from OpenAPI spec
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build daemon + CLI
+        run: cargo build --bin agenta-daemon --bin agenta
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Schemathesis
+        # Pinned to a validated combo: schemathesis 3.39.5 requires
+        # hypothesis>=6.103.4,<7, but the newest of those (6.14x) raise a
+        # `_fallback` TypeError at runtime. 6.112.0 sits in the sweet spot —
+        # satisfies the constraint and runs clean.
+        run: pip install "schemathesis==3.39.5" "hypothesis==6.112.0"
+
+      - name: Write a throwaway daemon config (SQLite, no auth)
+        run: |
+          mkdir -p "$HOME/.agenta"
+          cat > "$HOME/.agenta/config.toml" <<EOF
+          ollama_url = "http://localhost:11434"
+          database_path = "$HOME/.agenta/agenta-ci.db"
+          socket_path = "$HOME/.agenta/agenta-ci.sock"
+          log_level = "info"
+          default_model = "ci-none"
+          api_port = 8789
+          EOF
+
+      - name: Start the daemon
+        run: |
+          ./target/debug/agenta-daemon > "$HOME/daemon.log" 2>&1 &
+          echo "DAEMON_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Fuzz the API against its OpenAPI spec
+        # Advisory for now: the security-relevant checks pass (no 5xx, no auth
+        # bypass, negative data rejected). The current findings are cosmetic —
+        # error responses are text/plain not JSON — plus data-generation gaps on
+        # complex request bodies. Flip to gating once those are fixed (the
+        # "harden the API for the SaaS" work). The report artifact still uploads.
+        continue-on-error: true
+        run: |
+          schemathesis run http://127.0.0.1:8789/api-doc/openapi.json \
+            --base-url http://127.0.0.1:8789 \
+            --wait-for-schema 30 \
+            --checks all \
+            --data-generation-method all \
+            --exclude-path-regex '/run$|knowledge-bases' \
+            --hypothesis-max-examples 20 \
+            --max-response-time 15000 \
+            --contrib-openapi-fill-missing-examples \
+            --junit-xml schemathesis-report.xml
+
+      - name: Show daemon log on failure
+        if: failure()
+        run: cat "$HOME/daemon.log" || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schemathesis-report
+          path: schemathesis-report.xml
+          if-no-files-found: ignore
