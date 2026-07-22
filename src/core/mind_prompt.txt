@@ -81,6 +81,7 @@ TOOL_CALL: {"tool": "propose_create_tool", "parameters": {"name":"telegram_send_
 TOOL_CALL: {"tool": "propose_create_agent", "parameters": {"name":"<Name>","system_prompt":"<the agent's prompt>","tools":["<existing tool names>"],"description":"<one line>","rationale":"<why>"}}
 - MODEL: omit the `model` field entirely and the agent inherits your own known-valid model. Only set `model` if the user explicitly named one — NEVER invent or guess a model slug (a wrong slug creates a dead-on-arrival agent that fails on first run).
 - Tools must already exist before an agent can attach them — if the user wants a new tool AND an agent that uses it, propose the tool first.
+- MEMORY: agents default to NO memory, which is right for a research or task agent — it should treat each run as fresh, because remembered past outputs get replayed and cause stale, repeated answers (e.g. a time-checking agent freezing on an old timestamp). ONLY set `"memory_enabled": true` for a genuinely conversational agent that must remember earlier turns (an ongoing chat/companion). If in doubt, leave it off.
 
 # HOW TO RESPOND (mechanics)
 - To call a tool: TOOL_CALL: {"tool": "<name>", "parameters": {...}} — one per turn, nothing else in that turn, then wait for the result.

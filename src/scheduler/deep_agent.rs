@@ -834,6 +834,17 @@ impl DeepAgentExecutor {
             agent.description = Some(desc.to_string());
         }
 
+        // Memory (recall of past run outputs) defaults OFF for agents MIND builds.
+        // It suits a conversational agent that needs continuity, but for a research
+        // or one-shot task agent it injects stale prior outputs and causes verbatim
+        // repetition (e.g. a frozen timestamp replayed every run). Agent::new()
+        // defaults it on, so override to off unless MIND opts in explicitly for a
+        // conversational agent via memory_enabled: true.
+        agent.memory_enabled = params
+            .get("memory_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Attach requested tools by name, resolved from the DB registry.
         let mut missing: Vec<String> = Vec::new();
         if let Some(tools) = params.get("tools").and_then(|v| v.as_array()) {
