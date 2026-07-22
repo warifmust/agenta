@@ -48,7 +48,9 @@ const CHAT_COMMANDS: &[(&str, &str)] = &[
 
 pub async fn run_chat(config: &AppConfig) -> Result<()> {
     print_welcome(config).await;
-    prompt_trust_cwd();
+    if !prompt_trust_cwd() {
+        return Ok(());
+    }
 
     // Same palette reader as `agenta shell` — live `/` dropdown + history — but
     // with the chat's prompt, accent, and command set.
@@ -506,8 +508,13 @@ fn build_mind_input(convo: &[(String, String)], new_msg: &str) -> String {
 /// this asks. A protected directory (~/.ssh, …) is refused outright; declining just
 /// means MIND can't read here this session. Non-interactive launch ⇒ don't trust
 /// (safe default). Trusted dirs are remembered across sessions.
-fn prompt_trust_cwd() {
-    let Ok(cwd) = std::env::current_dir() else { return };
+/// Prompt to trust the launch directory. Returns `true` to continue into the
+/// chat, `false` if the user declined — in which case the caller exits without
+/// starting the session. Declining is NOT persisted: launching from the same
+/// directory again re-asks (only trusting is remembered), so this blocks the
+/// current session without blocking the directory forever.
+fn prompt_trust_cwd() -> bool {
+    let Ok(cwd) = std::env::current_dir() else { return true };
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
 
     if let Some(what) = crate::guardrails::fs::protected_reason(&cwd, &home) {
@@ -516,12 +523,12 @@ fn prompt_trust_cwd() {
             "⚠".truecolor(0xE0, 0xA0, 0x30),
             what
         );
-        return;
+        return true;
     }
 
     let trusted = crate::guardrails::trust::load();
     if crate::guardrails::trust::is_trusted(&cwd, &trusted) {
-        return;
+        return true;
     }
 
     println!();
@@ -534,10 +541,16 @@ fn prompt_trust_cwd() {
     if trust {
         crate::guardrails::trust::add(&cwd);
         println!("  {} trusted — sensitive files (.env, .ssh, keys) stay blocked.", "✓".green());
+        println!();
+        true
     } else {
-        println!("  {} not trusted — MIND won't read files here this session.", "·".dimmed());
+        // Declined → don't start the session. Not persisted, so re-launching
+        // here asks again — blocks now without blocking forever.
+        println!("  {} Access not granted — exiting without starting MIND. Nothing was changed.", "·".dimmed());
+        println!("    {}", "Launch agenta here again to be asked, or from a directory you trust.".dimmed());
+        println!();
+        false
     }
-    println!();
 }
 
 /// A working-directory banner prepended to MIND's input. The chat CLI runs in the
