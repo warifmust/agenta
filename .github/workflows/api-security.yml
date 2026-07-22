@@ -36,9 +36,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install Schemathesis
-        # Pinned to a validated combo — schemathesis 3.39.x needs an older
-        # hypothesis (newer ones raise a `_fallback` TypeError).
-        run: pip install "schemathesis==3.39.5" "hypothesis==6.103.1"
+        # Pinned to a validated combo: schemathesis 3.39.5 requires
+        # hypothesis>=6.103.4,<7, but the newest of those (6.14x) raise a
+        # `_fallback` TypeError at runtime. 6.112.0 sits in the sweet spot —
+        # satisfies the constraint and runs clean.
+        run: pip install "schemathesis==3.39.5" "hypothesis==6.112.0"
 
       - name: Write a throwaway daemon config (SQLite, no auth)
         run: |
