@@ -161,6 +161,11 @@ pub enum Commands {
         #[arg(long)]
         max_tokens: Option<u32>,
 
+        /// New context window (num_ctx). Raise it if the agent's prompt is being
+        /// truncated — e.g. MIND's large builder prompt on a local model.
+        #[arg(long)]
+        context_window: Option<u32>,
+
         /// New execution mode
         #[arg(long)]
         mode: Option<String>,
