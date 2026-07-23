@@ -151,8 +151,19 @@ pub struct OllamaClient {
 
 impl OllamaClient {
     pub fn new(base_url: String) -> Self {
+        // Ollama request timeout. Local models — especially large or reasoning
+        // ones — can take minutes on a heavy prompt (e.g. MIND's builder task),
+        // far longer than a cloud call, so this defaults to 300s (matching the
+        // other providers) and is tunable via AGENTA_OLLAMA_TIMEOUT_SECS for
+        // experimenting with slow local models. Set it in the daemon's env
+        // (e.g. ~/.agenta/.env) and restart the daemon.
+        let timeout_secs = std::env::var("AGENTA_OLLAMA_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(300);
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .unwrap_or_default();
         Self { client, base_url }
