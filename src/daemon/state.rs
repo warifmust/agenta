@@ -430,7 +430,20 @@ impl DaemonState {
         };
 
         if let Some(exec_id) = execution_id {
-            if let Some(execution) = self.storage.get_execution(exec_id).await? {
+            // Accept either a full id or the short prefix that list-mode prints
+            // (`exec.id[..8]`). Try an exact match first, then fall back to a
+            // prefix match among the agent's recent executions — so the ids shown
+            // by `agenta logs <agent>` actually work with `-e`.
+            let execution = match self.storage.get_execution(exec_id).await? {
+                Some(e) => Some(e),
+                None => self
+                    .storage
+                    .list_executions(&resolved_agent_id, 200)
+                    .await?
+                    .into_iter()
+                    .find(|e| e.id.starts_with(exec_id)),
+            };
+            if let Some(execution) = execution {
                 let mut logs = Vec::new();
                 logs.push(format!("Execution: {}", execution.id));
                 logs.push(format!("Started: {}", execution.started_at));
