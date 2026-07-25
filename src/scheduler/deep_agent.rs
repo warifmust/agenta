@@ -565,7 +565,52 @@ impl DeepAgentExecutor {
             "propose_detach_kb" => self.builtin_propose_kb(parent, parameters, false).await,
             "check_command" => self.builtin_check_command(parameters).await,
             "remember_feedback" => self.builtin_remember_feedback(parent, parameters).await,
+            "web_fetch"   => self.builtin_web_fetch(parameters).await,
             _             => Some(format!("Unknown built-in tool: {}", tool_name)),
+        }
+    }
+
+    /// Fetch the text of a web page — MIND uses it to read external API docs before
+    /// building a tool, so it builds from the real contract instead of memory.
+    async fn builtin_web_fetch(&self, params: &serde_json::Value) -> Option<String> {
+        let url = match params.get("url").and_then(|v| v.as_str()) {
+            Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
+            _ => return Some("Error: web_fetch requires a 'url' starting with http:// or https://".to_string()),
+        };
+        let max_chars = params
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(8000)
+            .clamp(500, 40_000);
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("agenta-web-fetch/1.0")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => return Some(format!("Error building HTTP client: {e}")),
+        };
+
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(body) => {
+                        let total = body.chars().count();
+                        let text: String = body.chars().take(max_chars).collect();
+                        let note = if total > max_chars {
+                            format!("\n\n[truncated — {total} chars total, showing first {max_chars}]")
+                        } else {
+                            String::new()
+                        };
+                        Some(format!("HTTP {status} · {url}\n\n{text}{note}"))
+                    }
+                    Err(e) => Some(format!("Error reading body from {url}: {e}")),
+                }
+            }
+            Err(e) => Some(format!("Error fetching {url}: {e}")),
         }
     }
 

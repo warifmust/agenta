@@ -41,6 +41,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "propose_detach_kb",
     "check_command",
     "remember_feedback",
+    "web_fetch",
 ];
 
 pub fn is_builtin_tool(name: &str) -> bool {
@@ -209,6 +210,15 @@ pub fn builtin_tool_descriptions() -> Vec<(&'static str, &'static str)> {
              doing Y\", \"from now on Z\", or corrects you in a way that should stick. \
              Parameters: {\"content\": \"<the rule/preference, phrased so future-you understands it>\", \
              \"kind\": \"preference|correction|note\" (optional)}. Saves immediately (no approval needed).",
+        ),
+        (
+            "web_fetch",
+            "Fetch the text of a web page over HTTP(S) — use it to READ external API \
+             docs, references, or specs before building a tool, so you build from the \
+             real contract instead of guessing from memory. Returns the page body \
+             (truncated). \
+             Parameters: {\"url\": \"<https://... doc page>\", \
+             \"max_chars\": <optional, default 8000>}",
         ),
     ]
 }
