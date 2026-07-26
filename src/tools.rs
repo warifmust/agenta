@@ -16,6 +16,138 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 /// else — including every agent secret — is withheld unless the tool allowlists it.
 const BASELINE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL"];
 
+/// The standard on-disk home for tool files: `~/.agenta/tools`.
+pub fn agenta_tools_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".agenta")
+        .join("tools")
+}
+
+/// True when a handler is *only* an interpreter with no script to run — e.g.
+/// `/usr/bin/env bash`, `bash`, `python3`. agenta pipes the tool's input JSON to
+/// the handler's stdin, so a bare interpreter reads that JSON *as its script* and
+/// tries to execute it (`bash: line 1: {"text":…}: command not found`, exit 127).
+/// A valid script handler carries something to run: a script-file argument or a
+/// `-c`/`-lc`/`-e` inline body. Used to reject the broken bare-interpreter form at
+/// tool-creation time instead of failing cryptically at first run.
+pub fn is_bare_interpreter(handler: &str) -> bool {
+    let tokens = match shlex::split(handler) {
+        Some(t) if !t.is_empty() => t,
+        _ => return true, // empty / unbalanced handler can't run anything
+    };
+    let basename = |t: &str| {
+        std::path::Path::new(t)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(t)
+            .to_string()
+    };
+
+    let mut idx = 0;
+    // Skip a leading `env` / `/usr/bin/env` wrapper and any VAR=val assignments.
+    if basename(&tokens[0]) == "env" {
+        idx += 1;
+        while idx < tokens.len() && tokens[idx].contains('=') && !tokens[idx].starts_with('-') {
+            idx += 1;
+        }
+    }
+
+    const INTERPRETERS: &[&str] =
+        &["bash", "sh", "zsh", "dash", "python", "python3", "ruby", "perl", "node"];
+    match tokens.get(idx).map(|t| basename(t)) {
+        // A recognised interpreter with nothing after it is the broken form.
+        Some(interp) if INTERPRETERS.contains(&interp.as_str()) => tokens.len() == idx + 1,
+        // A direct script path or any other command is assumed runnable.
+        _ => false,
+    }
+}
+
+/// Ensure a script starts with a shebang so it's self-describing on disk.
+fn ensure_shebang(script: &str) -> String {
+    if script.starts_with("#!") {
+        script.to_string()
+    } else {
+        format!("#!/usr/bin/env bash\n{}", script)
+    }
+}
+
+/// Write a script tool to disk in the standard layout and return its handler
+/// command string. The layout matches registry-installed tools, so every created
+/// tool is inspectable, editable, and pushable to the registry with no conversion:
+///
+/// ```text
+/// ~/.agenta/tools/<name>/
+///   ├── <name>.sh      (chmod 0755)
+///   └── manifest.json
+/// ```
+///
+/// Returns `"/usr/bin/env bash <abs path>"` for the tool's `handler`.
+pub fn materialize_script_tool(
+    name: &str,
+    script: &str,
+    description: &str,
+    parameters: &serde_json::Value,
+    secrets: &[String],
+    side_effect: &str,
+) -> Result<String> {
+    materialize_script_tool_in(
+        &agenta_tools_dir(),
+        name,
+        script,
+        description,
+        parameters,
+        secrets,
+        side_effect,
+    )
+}
+
+/// Inner form of [`materialize_script_tool`] parameterized on the tools root so
+/// tests can target a temp dir instead of the real `~/.agenta/tools`.
+fn materialize_script_tool_in(
+    tools_root: &std::path::Path,
+    name: &str,
+    script: &str,
+    description: &str,
+    parameters: &serde_json::Value,
+    secrets: &[String],
+    side_effect: &str,
+) -> Result<String> {
+    let dir = tools_root.join(name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow!("failed to create tool dir {}: {}", dir.display(), e))?;
+
+    let script_file = format!("{}.sh", name);
+    let script_path = dir.join(&script_file);
+    std::fs::write(&script_path, ensure_shebang(script))
+        .map_err(|e| anyhow!("failed to write {}: {}", script_path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+
+    // Registry-compatible manifest (see the `agenta tool install` reader): it keys
+    // off `handler` (the script filename), `description`, `env` (secret allowlist),
+    // and `parameters`.
+    let manifest = serde_json::json!({
+        "name": name,
+        "description": description,
+        "handler": script_file,
+        "parameters": parameters,
+        "env": secrets,
+        "side_effect": side_effect,
+    });
+    let manifest_path = dir.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .map_err(|e| anyhow!("failed to write {}: {}", manifest_path.display(), e))?;
+
+    Ok(format!("/usr/bin/env bash {}", script_path.display()))
+}
+
 pub struct ToolInvocation {
     pub name: String,
     pub parameters: serde_json::Value,
@@ -650,6 +782,89 @@ mod tests {
     #[test]
     fn spawn_agent_is_builtin() {
         assert!(is_builtin_tool("spawn_agent"));
+    }
+
+    #[test]
+    fn bare_interpreter_is_detected() {
+        // The broken form MIND produced: an interpreter with nothing to run.
+        for h in [
+            "",
+            "   ",
+            "/usr/bin/env bash",
+            "bash",
+            "/bin/bash",
+            "sh",
+            "python3",
+            "/usr/bin/env python3",
+            "/usr/bin/env FOO=1 bash", // env-assignments but still no script
+        ] {
+            assert!(is_bare_interpreter(h), "{h:?} should be flagged bare");
+        }
+    }
+
+    #[test]
+    fn runnable_handlers_are_not_bare() {
+        for h in [
+            "/usr/bin/env bash /home/x/.agenta/tools/t/t.sh", // script file
+            "bash script.sh",
+            "bash -c 'echo hi'",   // inline body
+            "python3 -c 'print(1)'",
+            "/usr/bin/env FOO=1 bash run.sh", // assignments THEN a script
+            "/opt/mytool/run",                // a non-interpreter binary
+            "https://api.example.com/x",      // an http handler URL
+        ] {
+            assert!(!is_bare_interpreter(h), "{h:?} should NOT be flagged bare");
+        }
+    }
+
+    #[test]
+    fn ensure_shebang_prepends_only_when_missing() {
+        assert_eq!(ensure_shebang("echo hi"), "#!/usr/bin/env bash\necho hi");
+        assert_eq!(ensure_shebang("#!/bin/sh\necho hi"), "#!/bin/sh\necho hi");
+    }
+
+    #[test]
+    fn materialize_writes_folder_manifest_and_runnable_handler() {
+        let root = std::env::temp_dir().join(format!(
+            "agenta_mat_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let handler = materialize_script_tool_in(
+            &root,
+            "unit_probe",
+            "echo hi",
+            "A probe tool",
+            &serde_json::json!({"type": "object"}),
+            &["MY_SECRET".to_string()],
+            "write",
+        )
+        .expect("materialize should succeed");
+
+        let dir = root.join("unit_probe");
+        let script = dir.join("unit_probe.sh");
+        let manifest = dir.join("manifest.json");
+        assert!(script.exists(), "script file should exist");
+        assert!(manifest.exists(), "manifest.json should exist");
+
+        // The wired handler points at the script and is NOT the broken bare form.
+        assert!(handler.ends_with("unit_probe/unit_probe.sh"), "handler: {handler}");
+        assert!(!is_bare_interpreter(&handler));
+
+        // Script gained a shebang.
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert!(body.starts_with("#!/usr/bin/env bash\n"), "body: {body}");
+
+        // Manifest is registry-shaped (handler = filename, env = secrets).
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(m["handler"], "unit_probe.sh");
+        assert_eq!(m["env"][0], "MY_SECRET");
+        assert_eq!(m["side_effect"], "write");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -2844,53 +2844,61 @@ async fn wait_for_script_execution(
 }
 
 pub(crate) fn scaffold_tool_handler(name: &str, handler_arg: Option<&str>) -> Result<String> {
-    let path = if let Some(handler) = handler_arg {
+    // Case A: caller supplied an explicit handler path/command — honour it, writing
+    // a starter script at that path only if nothing exists there yet.
+    if let Some(handler) = handler_arg {
         let script_path = handler
             .strip_prefix("/usr/bin/env bash ")
             .unwrap_or(handler)
             .trim();
-        std::path::PathBuf::from(script_path)
-    } else {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".agenta")
-            .join("tools")
-            .join(format!("{}.sh", name))
-    };
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        let path = std::path::PathBuf::from(script_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !path.exists() {
+            std::fs::write(&path, starter_tool_script(name))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms)?;
+            }
+        }
+        return Ok(format!("/usr/bin/env bash {}", path.display()));
     }
 
-    if !path.exists() {
-        let template = format!(
-            r#"#!/usr/bin/env bash
+    // Case B: auto-scaffold — write the standard folder+manifest layout
+    // (~/.agenta/tools/<name>/<name>.sh + manifest.json), matching registry-installed
+    // tools so the tool is inspectable, editable, and registry-pushable.
+    crate::tools::materialize_script_tool(
+        name,
+        &starter_tool_script(name),
+        "",
+        &serde_json::json!({ "type": "object", "properties": {} }),
+        &[],
+        "read-only",
+    )
+}
+
+/// The starter bash template written for an auto-scaffolded tool.
+fn starter_tool_script(name: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
 set -euo pipefail
 
 # Tool: {name}
-# Input: JSON via stdin or AGENTA_TOOL_PARAMS env var
+# Input: JSON via the AGENTA_TOOL_PARAMS env var (also available on stdin).
 INPUT="${{AGENTA_TOOL_PARAMS:-}}"
 if [ -z "$INPUT" ]; then
   INPUT="$(cat)"
 fi
 
 # TODO: implement logic.
-# Must print plain text (or JSON string) to stdout.
+# Must print plain text (or a JSON string) to stdout.
 echo "tool {name} received: $INPUT"
 "#
-        );
-        std::fs::write(&path, template)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms)?;
-        }
-    }
-
-    Ok(format!("/usr/bin/env bash {}", path.display()))
+    )
 }
 
 pub(crate) fn read_installed_tool(name: &str) -> Result<ToolDefinition> {

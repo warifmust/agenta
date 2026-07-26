@@ -807,21 +807,99 @@ impl DeepAgentExecutor {
             .get("parameters")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
-        let handler = params.get("handler").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-        let mut tool = ToolResource::new(name, description, parameters, handler);
-        if let Some(secrets) = params.get("secrets").and_then(|v| v.as_array()) {
-            tool.secrets = secrets.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+        // Secrets + side-effect are resolved up front because they go into the
+        // on-disk manifest when we materialize a script tool.
+        let secrets: Vec<String> = params
+            .get("secrets")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let side_effect_str = params
+            .get("side_effect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("read-only")
+            .to_string();
+        let side_effect = match side_effect_str.to_lowercase().replace('-', "_").as_str() {
+            "write" => SideEffect::Write,
+            "destructive" => SideEffect::Destructive,
+            _ => SideEffect::ReadOnly,
+        };
+
+        let http_cfg = params.get("http").filter(|h| !h.is_null()).cloned();
+        let script = params
+            .get("script")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
+        let handler_param = params
+            .get("handler")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // Resolve the handler. Three shapes, in priority order:
+        //   1. HTTP tool → handler is the request URL (set via `http` below).
+        //   2. `script`  → write it to ~/.agenta/tools/<name>/<name>.sh + manifest
+        //                  (standard, inspectable layout) and point handler at it.
+        //   3. `handler` → a caller-supplied command string, but reject the
+        //                  bare-interpreter form that would read the input JSON off
+        //                  stdin as its own script and die (`… command not found`).
+        let handler = if http_cfg.is_some() {
+            handler_param.clone()
+        } else if let Some(script_src) = &script {
+            match crate::tools::materialize_script_tool(
+                &name,
+                script_src,
+                &description,
+                &parameters,
+                &secrets,
+                &side_effect_str,
+            ) {
+                Ok(h) => Some(h),
+                Err(e) => return Some(format!("Error writing tool script to disk: {}", e)),
+            }
+        } else {
+            match &handler_param {
+                Some(h) if crate::tools::is_bare_interpreter(h) => {
+                    return Some(format!(
+                        "Error: handler '{}' is only an interpreter with no script, so at runtime it \
+                         would read the tool's input JSON off stdin and try to run it as a command \
+                         (this fails with `command not found`). Put the tool's logic in a `script` \
+                         field instead — a full bash script that reads its input from the \
+                         AGENTA_TOOL_PARAMS env var (JSON) and any secrets from env. I will save it \
+                         to ~/.agenta/tools/{}/{}.sh and wire the handler automatically.",
+                        h, name, name
+                    ));
+                }
+                None => {
+                    return Some(
+                        "Error: a script tool needs a `script` field (the full bash script to run) \
+                         or an `http` block. Provide `script` and I will save it as \
+                         ~/.agenta/tools/<name>/<name>.sh and wire up the handler."
+                            .to_string(),
+                    );
+                }
+                other => other.clone(),
+            }
+        };
+
+        let mut tool = ToolResource::new(
+            name.clone(),
+            description.clone(),
+            parameters.clone(),
+            handler,
+        );
+        tool.secrets = secrets;
+        tool.side_effect = side_effect;
+        if let Some(reqs) = params.get("requires").and_then(|v| v.as_array()) {
+            tool.requires = reqs
+                .iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect();
         }
-        if let Some(se) = params.get("side_effect").and_then(|v| v.as_str()) {
-            tool.side_effect = match se.to_lowercase().replace('-', "_").as_str() {
-                "write" => SideEffect::Write,
-                "destructive" => SideEffect::Destructive,
-                _ => SideEffect::ReadOnly,
-            };
-        }
-        if let Some(http) = params.get("http").filter(|h| !h.is_null()) {
-            tool.http = serde_json::from_value(http.clone()).ok();
+        if let Some(http) = http_cfg {
+            tool.http = serde_json::from_value(http).ok();
         }
 
         let rationale = params
