@@ -2929,7 +2929,9 @@ pub(crate) fn read_installed_tool(name: &str) -> Result<ToolDefinition> {
         .ok_or_else(|| anyhow!("manifest.json missing 'handler'"))?;
 
     let handler_path = install_dir.join(handler_file);
-    let handler = format!("/usr/bin/env bash {}", handler_path.display());
+    // Run the script directly via its shebang (bash/python/node/…), not forced
+    // through bash. See crate::tools::script_handler.
+    let handler = crate::tools::script_handler(&handler_path);
 
     Ok(ToolDefinition {
         name: tool_name,
@@ -3037,7 +3039,9 @@ async fn pull_tool(config: &AppConfig, name: &str, version: &str, attach: Option
         name.to_string(),
         description.clone(),
         parameters,
-        Some(format!("/usr/bin/env bash {}", handler_path.display())),
+        // Run directly via the script's shebang (bash/python/node/…). See
+        // crate::tools::script_handler.
+        Some(crate::tools::script_handler(&handler_path)),
     );
     tool.secrets = env_vars.clone();
     let tool_val = serde_json::to_value(&tool)?;

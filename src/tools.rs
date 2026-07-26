@@ -63,12 +63,63 @@ pub fn is_bare_interpreter(handler: &str) -> bool {
     }
 }
 
-/// Ensure a script starts with a shebang so it's self-describing on disk.
+/// Ensure a script starts with a shebang so it's self-describing on disk and can
+/// be executed directly (the kernel selects the interpreter from the shebang).
 fn ensure_shebang(script: &str) -> String {
     if script.starts_with("#!") {
         script.to_string()
     } else {
         format!("#!/usr/bin/env bash\n{}", script)
+    }
+}
+
+/// The file extension for a script, inferred from its shebang, so a materialized
+/// tool is named by its real language (`.py`, `.js`, `.rb`, …). Defaults to `sh`.
+fn script_extension(script: &str) -> &'static str {
+    let first = script.lines().next().unwrap_or("");
+    if !first.starts_with("#!") {
+        return "sh";
+    }
+    let l = first.to_lowercase();
+    if l.contains("python") {
+        "py"
+    } else if l.contains("node") {
+        "js"
+    } else if l.contains("ruby") {
+        "rb"
+    } else if l.contains("perl") {
+        "pl"
+    } else if l.contains("php") {
+        "php"
+    } else {
+        "sh" // bash / sh / zsh / dash / anything unrecognised
+    }
+}
+
+/// The handler command for a script FILE. The file is executable and carries a
+/// shebang, so we run it directly and let the kernel pick the interpreter — this
+/// is what makes tools language-agnostic (bash, python, node, …) instead of
+/// forcing every handler through bash.
+pub fn script_handler(script_path: &std::path::Path) -> String {
+    script_path.display().to_string()
+}
+
+/// If `path` is a script file beginning with a `#!` line, return the interpreter
+/// command it needs on PATH (e.g. `python3`, `node`), so the executor can preflight
+/// it and fail with a clear "needs X" message instead of a raw kernel ENOENT.
+fn shebang_interpreter(path: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let first = contents.lines().next()?;
+    let rest = first.strip_prefix("#!")?.trim();
+    let mut toks = rest.split_whitespace();
+    let head = toks.next()?;
+    let base = head.rsplit('/').next().unwrap_or(head);
+    if base == "env" {
+        // `#!/usr/bin/env python3` → python3 (skip env flags / VAR=val assignments)
+        toks.find(|a| !a.starts_with('-') && !a.contains('='))
+            .map(|s| s.to_string())
+    } else {
+        Some(base.to_string())
     }
 }
 
@@ -78,11 +129,13 @@ fn ensure_shebang(script: &str) -> String {
 ///
 /// ```text
 /// ~/.agenta/tools/<name>/
-///   ├── <name>.sh      (chmod 0755)
+///   ├── <name>.<ext>   (chmod 0755; ext inferred from the script's shebang)
 ///   └── manifest.json
 /// ```
 ///
-/// Returns `"/usr/bin/env bash <abs path>"` for the tool's `handler`.
+/// The script's shebang decides its extension and how it runs: the returned
+/// handler is the executable file path itself, so the kernel selects the
+/// interpreter (bash, python, node, …) — tools are not forced through bash.
 pub fn materialize_script_tool(
     name: &str,
     script: &str,
@@ -117,9 +170,10 @@ fn materialize_script_tool_in(
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("failed to create tool dir {}: {}", dir.display(), e))?;
 
-    let script_file = format!("{}.sh", name);
+    let body = ensure_shebang(script);
+    let script_file = format!("{}.{}", name, script_extension(&body));
     let script_path = dir.join(&script_file);
-    std::fs::write(&script_path, ensure_shebang(script))
+    std::fs::write(&script_path, &body)
         .map_err(|e| anyhow!("failed to write {}: {}", script_path.display(), e))?;
 
     #[cfg(unix)]
@@ -145,7 +199,7 @@ fn materialize_script_tool_in(
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
         .map_err(|e| anyhow!("failed to write {}: {}", manifest_path.display(), e))?;
 
-    Ok(format!("/usr/bin/env bash {}", script_path.display()))
+    Ok(script_handler(&script_path))
 }
 
 pub struct ToolInvocation {
@@ -658,6 +712,14 @@ pub async fn execute_tool(
     if let Some(cmd) = handler_command(&program, &args) {
         needed.push(cmd);
     }
+    // When the handler is a script run directly via its shebang (no interpreter
+    // token in the handler), the shebang's interpreter must also exist on PATH —
+    // otherwise the kernel fails the exec with a bare ENOENT. Preflight it too.
+    if args.is_empty() && program.contains('/') {
+        if let Some(interp) = shebang_interpreter(&program) {
+            needed.push(interp);
+        }
+    }
     needed.extend(tool.requires.iter().cloned());
     for cmd in &needed {
         if !command_on_path(cmd) {
@@ -824,6 +886,16 @@ mod tests {
     }
 
     #[test]
+    fn script_extension_follows_shebang() {
+        assert_eq!(script_extension("echo hi"), "sh"); // no shebang → bash
+        assert_eq!(script_extension("#!/usr/bin/env bash\necho hi"), "sh");
+        assert_eq!(script_extension("#!/bin/sh\necho hi"), "sh");
+        assert_eq!(script_extension("#!/usr/bin/env python3\nprint(1)"), "py");
+        assert_eq!(script_extension("#!/usr/bin/env node\nconsole.log(1)"), "js");
+        assert_eq!(script_extension("#!/usr/bin/env ruby\nputs 1"), "rb");
+    }
+
+    #[test]
     fn materialize_writes_folder_manifest_and_runnable_handler() {
         let root = std::env::temp_dir().join(format!(
             "agenta_mat_{}_{:?}",
@@ -849,11 +921,12 @@ mod tests {
         assert!(script.exists(), "script file should exist");
         assert!(manifest.exists(), "manifest.json should exist");
 
-        // The wired handler points at the script and is NOT the broken bare form.
-        assert!(handler.ends_with("unit_probe/unit_probe.sh"), "handler: {handler}");
+        // The handler is the bare executable path (run via shebang), NOT bash-wrapped.
+        assert_eq!(handler, script.display().to_string(), "handler: {handler}");
+        assert!(!handler.starts_with("/usr/bin/env bash"), "handler must not force bash");
         assert!(!is_bare_interpreter(&handler));
 
-        // Script gained a shebang.
+        // Script gained a bash shebang (input had none).
         let body = std::fs::read_to_string(&script).unwrap();
         assert!(body.starts_with("#!/usr/bin/env bash\n"), "body: {body}");
 
@@ -863,6 +936,42 @@ mod tests {
         assert_eq!(m["handler"], "unit_probe.sh");
         assert_eq!(m["env"][0], "MY_SECRET");
         assert_eq!(m["side_effect"], "write");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_honors_python_shebang() {
+        let root = std::env::temp_dir().join(format!(
+            "agenta_matpy_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let handler = materialize_script_tool_in(
+            &root,
+            "py_probe",
+            "#!/usr/bin/env python3\nprint('hi')",
+            "A python probe",
+            &serde_json::json!({"type": "object"}),
+            &[],
+            "read-only",
+        )
+        .expect("materialize should succeed");
+
+        // A python script gets a .py file and a bare-path handler (kernel runs it
+        // via the python3 shebang) — NOT wrapped in bash.
+        let script = root.join("py_probe/py_probe.py");
+        assert!(script.exists(), "expected py_probe.py");
+        assert_eq!(handler, script.display().to_string());
+        assert!(!handler.starts_with("/usr/bin/env bash"));
+
+        let m: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("py_probe/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m["handler"], "py_probe.py");
 
         let _ = std::fs::remove_dir_all(&root);
     }
