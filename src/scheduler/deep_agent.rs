@@ -344,7 +344,7 @@ impl DeepAgentExecutor {
             // emit a TOOL_CALL *and* a TASK_COMPLETE (or other stop-word) in the
             // same message; if we checked completion first, the tool would never
             // run. Run it, feed the result back, and let the model finish next turn.
-            if content.contains("TOOL_CALL:") {
+            if has_tool_call(&content) {
                 let calls = self
                     .handle_tool_call(agent, &content, &allowed_mcp_tools)
                     .await;
@@ -377,7 +377,11 @@ impl DeepAgentExecutor {
                         .join("\n\n");
                     const MAX_TOOL_OUTPUT: usize = 8_000;
                     if joined.len() > MAX_TOOL_OUTPUT {
-                        format!("{}… [truncated, {} chars total]", &joined[..MAX_TOOL_OUTPUT], joined.len())
+                        let mut end = MAX_TOOL_OUTPUT;
+                        while end > 0 && !joined.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}… [truncated, {} chars total]", &joined[..end], joined.len())
                     } else {
                         joined
                     }
@@ -450,52 +454,15 @@ impl DeepAgentExecutor {
         allowed_mcp_tools: &std::collections::HashMap<String, (String, String)>,
     ) -> Vec<(String, String)> {
         let mut results: Vec<(String, String)> = Vec::new();
-        let mut cursor = 0usize;
+        let parsed_calls = extract_tool_calls(content);
 
-        while let Some(rel) = content[cursor..].find("TOOL_CALL:") {
-            let marker = cursor + rel;
-            // Find the JSON object after this marker (brace-matched).
-            let json_start = match content[marker..].find('{') {
-                Some(p) => marker + p,
-                None => break,
-            };
-            let mut depth = 0;
-            let mut json_end = json_start;
-            for (i, c) in content[json_start..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            json_end = json_start + i + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Advance past this call regardless of parse outcome.
-            cursor = json_end.max(marker + "TOOL_CALL:".len());
-
-            let json_str = &content[json_start..json_end];
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
-                continue;
-            };
-            let Some(tool_name) = parsed.get("tool").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            // Parameters default to an empty object (many read tools take none).
-            let parameters = parsed
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-
-            let output = if is_builtin_tool(tool_name) {
-                self.run_builtin_tool(agent, tool_name, &parameters)
+        for (tool_name, parameters) in parsed_calls {
+            let output = if is_builtin_tool(&tool_name) {
+                self.run_builtin_tool(agent, &tool_name, &parameters)
                     .await
                     .unwrap_or_else(|| "Tool produced no output.".to_string())
-            } else if crate::mcp::is_mcp_tool_name(tool_name) {
-                match (allowed_mcp_tools.get(tool_name), &self.mcp) {
+            } else if crate::mcp::is_mcp_tool_name(&tool_name) {
+                match (allowed_mcp_tools.get(&tool_name), &self.mcp) {
                     (Some((server, real_name)), Some(mcp)) => {
                         match mcp.call_tool(server, real_name, parameters).await {
                             Ok(out) => out,
@@ -508,13 +475,13 @@ impl DeepAgentExecutor {
                     ),
                 }
             } else {
-                match run_tool(agent, tool_name, parameters).await {
+                match run_tool(agent, &tool_name, parameters).await {
                     Ok(out) => out,
                     Err(err) => format!("Tool error: {}", err),
                 }
             };
 
-            results.push((tool_name.to_string(), output));
+            results.push((tool_name, output));
         }
 
         results
@@ -1468,9 +1435,101 @@ did not actually happen. For a real run: agenta run {} --input \"…\"\n\n{}",
     }
 }
 
+/// True when the model's turn contains either Agenta's native `TOOL_CALL:` marker
+/// or an XML-style `<invoke name="...">` tool call (emitted by some models like
+/// DeepSeek v4 / Qwen / Claude-trained weights despite the JSON instruction).
+fn has_tool_call(content: &str) -> bool {
+    content.contains("TOOL_CALL:") || content.contains("<invoke ")
+}
+
+/// Extract all `(tool_name, parameters)` calls from a model turn.
+/// Supports both `TOOL_CALL: {"tool": ..., "parameters": ...}` and fallback XML
+/// `<invoke name="..."><parameter name="...">...</parameter></invoke>`.
+fn extract_tool_calls(content: &str) -> Vec<(String, serde_json::Value)> {
+    let mut calls: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = content[cursor..].find("TOOL_CALL:") {
+        let marker = cursor + rel;
+        let json_start = match content[marker..].find('{') {
+            Some(p) => marker + p,
+            None => break,
+        };
+        let mut depth = 0;
+        let mut json_end = json_start;
+        for (i, c) in content[json_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        json_end = json_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor = json_end.max(marker + "TOOL_CALL:".len());
+
+        let json_str = &content[json_start..json_end];
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            continue;
+        };
+        let Some(tool_name) = parsed.get("tool").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let parameters = parsed
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        calls.push((tool_name.to_string(), parameters));
+    }
+
+    if !calls.is_empty() || !content.contains("<invoke ") {
+        return calls;
+    }
+
+    // Fallback: parse XML-style `<invoke name="..."><parameter name="...">...</parameter></invoke>`.
+    let Ok(re_invoke) = Regex::new(r#"(?s)<invoke\s+name="([^"]+)">(.*?)</invoke>"#) else {
+        return calls;
+    };
+    let Ok(re_param) = Regex::new(r#"(?s)<parameter\s+name="([^"]+)">(.*?)</parameter>"#) else {
+        return calls;
+    };
+
+    for cap in re_invoke.captures_iter(content) {
+        let tool_name = cap[1].trim().to_string();
+        let body = &cap[2];
+        let mut map = serde_json::Map::new();
+        for pcap in re_param.captures_iter(body) {
+            let key = pcap[1].trim().to_string();
+            let raw_val = pcap[2].trim();
+            map.insert(key, coerce_xml_param_value(raw_val));
+        }
+        calls.push((tool_name, serde_json::Value::Object(map)));
+    }
+
+    calls
+}
+
+fn coerce_xml_param_value(raw: &str) -> serde_json::Value {
+    match raw {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        s if (s.starts_with('{') && s.ends_with('}'))
+            || (s.starts_with('[') && s.ends_with(']')) =>
+        {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+        }
+        s => serde_json::Value::String(s.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_plan;
+    use super::{extract_plan, extract_tool_calls, has_tool_call};
 
     #[test]
     fn extract_plan_parses_numbered_steps() {
@@ -1495,5 +1554,23 @@ mod tests {
         assert_eq!(extract_plan(content).unwrap(), vec!["list tools"]);
         // No PLAN: marker → not a plan turn.
         assert!(extract_plan("Just answering directly, no plan here.").is_none());
+    }
+
+    #[test]
+    fn extract_tool_calls_parses_xml_invoke_fallback() {
+        let xml = r#"<tool_calls>
+<invoke name="mcp__atlassian__confluence_get_page">
+<parameter name="page_id">4582965249</parameter>
+<parameter name="convert_to_markdown">true</parameter>
+<parameter name="include_metadata">true</parameter>
+</invoke>
+</tool_calls>"#;
+        assert!(has_tool_call(xml));
+        let calls = extract_tool_calls(xml);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "mcp__atlassian__confluence_get_page");
+        assert_eq!(calls[0].1["page_id"], "4582965249");
+        assert_eq!(calls[0].1["convert_to_markdown"], true);
+        assert_eq!(calls[0].1["include_metadata"], true);
     }
 }

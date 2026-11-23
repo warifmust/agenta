@@ -352,7 +352,12 @@ async fn handle_slack_event(
                 return;
             }
             let raw = execution.output.as_deref().unwrap_or("").to_string();
-            if raw.trim().is_empty() || raw.trim_start().starts_with("TOOL_CALL:") {
+            let trimmed_raw = raw.trim_start();
+            if raw.trim().is_empty()
+                || trimmed_raw.starts_with("TOOL_CALL:")
+                || trimmed_raw.starts_with("<tool_calls")
+                || trimmed_raw.starts_with("<invoke ")
+            {
                 "Sorry, I couldn't generate a response. Please try again.".to_string()
             } else {
                 markdown_to_slack_mrkdwn(&raw)
@@ -585,12 +590,12 @@ fn convert_non_code_markdown(text: &str) -> String {
     if let Ok(re_link) = Regex::new(r"\[([^\]]+)\]\((https?://[^)\s]+)\)") {
         s = re_link.replace_all(&s, "<$2|$1>").into_owned();
     }
-    // **bold** and __bold__ -> *bold*
+    // **bold** and __bold__ -> *bold* (avoid mangling snake_case / mcp__server__tool)
     if let Ok(re_bold_star) = Regex::new(r"\*\*(.+?)\*\*") {
         s = re_bold_star.replace_all(&s, "*$1*").into_owned();
     }
-    if let Ok(re_bold_under) = Regex::new(r"__(.+?)__") {
-        s = re_bold_under.replace_all(&s, "*$1*").into_owned();
+    if let Ok(re_bold_under) = Regex::new(r"(^|[^\w])__([^_\n]+?)__([^\w]|$)") {
+        s = re_bold_under.replace_all(&s, "$1*$2*$3").into_owned();
     }
     // ~~strike~~ -> ~strike~
     if let Ok(re_strike) = Regex::new(r"~~(.+?)~~") {
