@@ -20,6 +20,10 @@ use agenta::core::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Ensure rustls 0.23 has an explicit process-level CryptoProvider (needed
+    // when multiple crates in the graph pull in rustls 0.23 with different features).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter("info")

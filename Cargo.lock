@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agenta"
-version = "1.2.43"
+version = "1.2.44"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -55,6 +55,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest 0.11.27",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "serde_yaml",
