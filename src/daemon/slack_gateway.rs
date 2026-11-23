@@ -14,6 +14,7 @@ use super::state::DaemonState;
 
 const MAX_RECENT_EVENTS: usize = 256;
 const MAX_THREAD_MESSAGES: usize = 20;
+const MAX_HISTORY_MESSAGES: usize = 8;
 const SLACK_MAX_CHARS: usize = 3500;
 
 pub async fn start_slack_gateway(
@@ -306,8 +307,10 @@ async fn handle_slack_event(
     // Acknowledge with :eyes: while the agent researches and prepares a reply.
     let _ = add_reaction(&http, &bot_token, &event.channel, &event.ts, "eyes").await;
 
-    // If tagged inside an existing thread, fetch recent messages for context.
-    let full_input = if let Some(ref parent_ts) = event.thread_ts {
+    // Fetch recent context: thread replies when inside a thread, otherwise recent
+    // channel/DM history so follow-up messages have conversation continuity.
+    let scope_tag = if is_dm { "Slack DM" } else { "Slack channel" };
+    let context_block = if let Some(ref parent_ts) = event.thread_ts {
         match fetch_thread_context(
             &http,
             &bot_token,
@@ -319,17 +322,7 @@ async fn handle_slack_event(
         )
         .await
         {
-            Ok(Some(ctx)) => {
-                let sender = match event.user.as_deref() {
-                    Some(uid) => resolve_user_name(&http, &bot_token, uid, &user_cache).await,
-                    None => "User".to_string(),
-                };
-                format!(
-                    "[Slack thread context]\n{}\n\n[Latest message from {}]\n{}",
-                    ctx, sender, cleaned_message
-                )
-            }
-            Ok(None) => cleaned_message,
+            Ok(opt) => opt.map(|ctx| format!("[{} thread context]\n{}", scope_tag, ctx)),
             Err(e) => {
                 debug!(
                     "[{}] Could not fetch thread context for {}:{}: {}",
@@ -338,11 +331,44 @@ async fn handle_slack_event(
                     parent_ts,
                     redact_slack_tokens(&e.to_string())
                 );
-                cleaned_message
+                None
             }
         }
     } else {
-        cleaned_message
+        match fetch_channel_history_context(
+            &http,
+            &bot_token,
+            &event.channel,
+            &event.ts,
+            &bot_user_id,
+            &user_cache,
+        )
+        .await
+        {
+            Ok(opt) => opt.map(|ctx| format!("[{} recent messages]\n{}", scope_tag, ctx)),
+            Err(e) => {
+                debug!(
+                    "[{}] Could not fetch recent history for {}: {}",
+                    label,
+                    event.channel,
+                    redact_slack_tokens(&e.to_string())
+                );
+                None
+            }
+        }
+    };
+
+    let full_input = if let Some(ctx) = context_block {
+        let sender = match event.user.as_deref() {
+            Some(uid) => resolve_user_name(&http, &bot_token, uid, &user_cache).await,
+            None => "User".to_string(),
+        };
+        format!(
+            "{}\n\n[{} — latest message from {}]\n{}",
+            ctx, scope_tag, sender, cleaned_message
+        )
+    } else {
+        format!("[{}]\n{}", scope_tag, cleaned_message)
     };
 
     let reply = match daemon.run_agent_sync_execution(&agent, full_input).await {
@@ -868,6 +894,79 @@ async fn fetch_thread_context(
     let start = prior.len().saturating_sub(MAX_THREAD_MESSAGES);
     let mut lines = Vec::new();
     for m in &prior[start..] {
+        let speaker = if m.user.as_deref() == Some(bot_user_id) || m.bot_id.is_some() {
+            "Assistant".to_string()
+        } else if let Some(uid) = m.user.as_deref() {
+            resolve_user_name(http, bot_token, uid, user_cache).await
+        } else {
+            "User".to_string()
+        };
+        let body = strip_bot_mention(m.text.as_deref().unwrap_or(""), bot_user_id);
+        if !body.is_empty() {
+            lines.push(format!("{}: {}", speaker, body));
+        }
+    }
+
+    if lines.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(lines.join("\n")))
+    }
+}
+
+/// Fetch the most recent top-level messages in a DM or channel (via `conversations.history`)
+/// so consecutive messages outside a thread still have conversation continuity.
+async fn fetch_channel_history_context(
+    http: &reqwest::Client,
+    bot_token: &str,
+    channel: &str,
+    current_ts: &str,
+    bot_user_id: &str,
+    user_cache: &Arc<RwLock<HashMap<String, String>>>,
+) -> anyhow::Result<Option<String>> {
+    let limit = (MAX_HISTORY_MESSAGES + 2).to_string();
+    let resp = http
+        .get("https://slack.com/api/conversations.history")
+        .bearer_auth(bot_token)
+        .query(&[
+            ("channel", channel),
+            ("latest", current_ts),
+            ("inclusive", "false"),
+            ("limit", limit.as_str()),
+        ])
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
+
+    let data: ConversationsRepliesResponse = resp.json().await?;
+    if !data.ok {
+        anyhow::bail!(
+            "conversations.history failed: {}",
+            data.error.unwrap_or_else(|| "unknown".into())
+        );
+    }
+
+    // Slack returns conversations.history newest-first; reverse to chronological order.
+    let mut prior: Vec<&ThreadMessage> = data
+        .messages
+        .iter()
+        .filter(|m| {
+            m.ts != current_ts
+                && m.text
+                    .as_deref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false)
+        })
+        .take(MAX_HISTORY_MESSAGES)
+        .collect();
+    prior.reverse();
+
+    if prior.is_empty() {
+        return Ok(None);
+    }
+
+    let mut lines = Vec::new();
+    for m in prior {
         let speaker = if m.user.as_deref() == Some(bot_user_id) || m.bot_id.is_some() {
             "Assistant".to_string()
         } else if let Some(uid) = m.user.as_deref() {
