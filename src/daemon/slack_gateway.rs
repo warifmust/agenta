@@ -351,16 +351,24 @@ async fn handle_slack_event(
                 let _ = remove_reaction(&http, &bot_token, &event.channel, &event.ts, "eyes").await;
                 return;
             }
-            let raw = execution.output.as_deref().unwrap_or("").to_string();
-            let trimmed_raw = raw.trim_start();
-            if raw.trim().is_empty()
-                || trimmed_raw.starts_with("TOOL_CALL:")
-                || trimmed_raw.starts_with("<tool_calls")
-                || trimmed_raw.starts_with("<invoke ")
-            {
-                "Sorry, I couldn't generate a response. Please try again.".to_string()
+            if execution.status == ExecutionStatus::Failed {
+                let err = execution
+                    .error
+                    .as_deref()
+                    .unwrap_or("Unknown execution error");
+                format!("Sorry, I hit an error while working on that: {}", err)
             } else {
-                markdown_to_slack_mrkdwn(&raw)
+                let raw = execution.output.as_deref().unwrap_or("").to_string();
+                let trimmed_raw = raw.trim_start();
+                if raw.trim().is_empty()
+                    || trimmed_raw.starts_with("TOOL_CALL:")
+                    || trimmed_raw.starts_with("<tool_calls")
+                    || trimmed_raw.starts_with("<invoke ")
+                {
+                    "Sorry, I couldn't generate a response. Please try again.".to_string()
+                } else {
+                    markdown_to_slack_mrkdwn(&raw)
+                }
             }
         }
         Err(e) => format!("Agent error: {}", e),

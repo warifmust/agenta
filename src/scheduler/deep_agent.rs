@@ -415,10 +415,41 @@ impl DeepAgentExecutor {
             return Ok(content.trim().to_string());
         }
 
-        // Max iterations hit without a TASK_COMPLETE — the run didn't finish. Fail
-        // loudly (like the truncation guard) rather than passing off a half-done run
-        // as success, and summarise what DID happen instead of dumping the raw last
-        // turn (which is usually a TOOL_CALL JSON blob and reads as garbage).
+        // Max iterations hit without a TASK_COMPLETE. Rather than throwing away
+        // all the tool results gathered so far, give the model one final wrap-up
+        // turn with tools forbidden so it synthesizes a useful answer.
+        if !execution.tool_calls.is_empty() {
+            info!(
+                "Agent {} reached max iterations ({}); requesting final synthesis turn",
+                agent.name, self.max_iterations
+            );
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: "You have reached the tool-call limit. Do NOT call any more tools. \
+                          Write your final answer now summarizing everything you found so far, \
+                          and briefly note if anything remains unchecked."
+                    .to_string(),
+            });
+            let wrap_request = ChatRequest {
+                model: agent.model.clone(),
+                messages,
+                stream: Some(false),
+                format: None,
+                options: Some(params.to_json_value()),
+            };
+            if let Ok(resp) = self.backend.chat(wrap_request).await {
+                let text = resp
+                    .message
+                    .content
+                    .replacen("TASK_COMPLETE:", "", 1)
+                    .trim()
+                    .to_string();
+                if !text.is_empty() && !has_tool_call(&text) {
+                    return Ok(text);
+                }
+            }
+        }
+
         let actions: Vec<String> = execution
             .tool_calls
             .iter()
