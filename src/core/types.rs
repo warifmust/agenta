@@ -100,6 +100,20 @@ pub struct TelegramBotConfig {
     pub name: Option<String>,
 }
 
+/// A single Slack bot entry for multi-bot Socket Mode support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackBotConfig {
+    /// Bot User OAuth Token (`xoxb-...`, or env var name like "$SLACK_BOT_TOKEN")
+    pub bot_token: String,
+    /// App-Level Token (`xapp-...` with `connections:write`, or "$SLACK_APP_TOKEN")
+    pub app_token: String,
+    /// Which agent handles messages from this bot
+    pub default_agent: String,
+    /// Friendly label shown in logs
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Per-provider configuration block (URL + API key).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
@@ -109,6 +123,46 @@ pub struct ProviderConfig {
     /// API key or "$ENV_VAR" reference.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// Transport type for an MCP server.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// Spawn a local process and speak JSON-RPC 2.0 over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect to a remote Streamable HTTP MCP endpoint.
+    Http,
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
+/// Configuration for a single MCP server under `[mcp_servers.<name>]` in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// Executable to spawn for `stdio` transport (e.g. "npx", "uvx", "/usr/local/bin/mcp-server").
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments passed to `command` for `stdio` transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables explicitly granted to a `stdio` server (supports "$ENV_VAR" expansion).
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Endpoint URL for `http` (Streamable HTTP) transport.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP headers for `http` transport (values support "$ENV_VAR" expansion).
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Per-call timeout in seconds (default: 30).
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 /// Configuration for the agenta application
@@ -140,6 +194,9 @@ pub struct AppConfig {
     /// Multi-bot config — each entry gets its own polling loop
     #[serde(default)]
     pub telegram_bots: Vec<TelegramBotConfig>,
+    /// Slack Socket Mode bots — each entry gets its own WebSocket loop
+    #[serde(default)]
+    pub slack_bots: Vec<SlackBotConfig>,
     #[serde(default = "default_api_port")]
     pub api_port: u16,
     #[serde(default)]
@@ -158,6 +215,9 @@ pub struct AppConfig {
     /// Higher = more recall/context (and tokens); lower = tighter/cheaper.
     #[serde(default = "default_rag_top_k")]
     pub rag_top_k: usize,
+    /// Configured MCP servers (`[mcp_servers.<name>]`), attached to agents by name.
+    #[serde(default)]
+    pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
 fn default_registry_owner() -> String { "agenta-tools".to_string() }
@@ -195,12 +255,14 @@ impl Default for AppConfig {
             telegram_bot_token: None,
             telegram_default_agent: None,
             telegram_bots: Vec::new(),
+            slack_bots: Vec::new(),
             api_port: 8789,
             api_token: None,
             timezone: None,
             registry_owner: default_registry_owner(),
             registry_repo: default_registry_repo(),
             rag_top_k: default_rag_top_k(),
+            mcp_servers: std::collections::HashMap::new(),
         }
     }
 }

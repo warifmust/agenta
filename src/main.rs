@@ -6,6 +6,7 @@ mod cli;
 mod core;
 mod guardrails;
 mod knowledge;
+mod mcp;
 mod ollama;
 mod providers;
 mod scheduler;

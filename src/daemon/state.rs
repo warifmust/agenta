@@ -12,6 +12,7 @@ use agenta::core::{
     Proposal, ProposalAction, ProposalStatus,
 };
 use agenta::core::AppConfig;
+use agenta::mcp::McpManager;
 use agenta::providers::build_backend;
 use agenta::scheduler::AgentExecutor;
 use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler as CronScheduler, resolve_timezone};
@@ -19,6 +20,7 @@ use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler
 pub struct DaemonState {
     storage: Arc<dyn Storage>,
     executor: AgentExecutor,
+    mcp_manager: Arc<McpManager>,
     config: AppConfig,
     cron_scheduler: CronScheduler,
     running_agents: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
@@ -31,13 +33,15 @@ pub struct DaemonState {
 impl DaemonState {
     pub async fn new(storage: Arc<dyn Storage>, config: &AppConfig) -> anyhow::Result<Self> {
         let backend = build_backend(config, None);
-        let executor = AgentExecutor::new(storage.clone(), backend);
+        let mcp_manager = Arc::new(McpManager::new(config.mcp_servers.clone()));
+        let executor = AgentExecutor::new(storage.clone(), backend).with_mcp_manager(mcp_manager.clone());
         let timezone = resolve_timezone(config.timezone.as_deref());
         let cron_scheduler = CronScheduler::with_timezone(timezone);
 
         Ok(Self {
             storage,
             executor,
+            mcp_manager,
             config: config.clone(),
             cron_scheduler,
             running_agents: Arc::new(RwLock::new(HashMap::new())),
@@ -535,6 +539,9 @@ impl DaemonState {
             let _ = watcher.stop();
         }
 
+        // Shut down any spawned MCP server child processes
+        self.mcp_manager.shutdown_all().await;
+
         // Stop command triggers
         let mut triggers = self.command_triggers.write().await;
         for (_id, trigger) in triggers.drain() {
@@ -1000,7 +1007,12 @@ fn build_executor_for_agent(
         .unwrap_or(false);
     if has_provider {
         let backend = build_backend(config, agent.provider.as_deref());
-        AgentExecutor::new(storage.clone(), backend)
+        let ex = AgentExecutor::new(storage.clone(), backend);
+        if let Some(mcp) = fallback.mcp_manager() {
+            ex.with_mcp_manager(mcp)
+        } else {
+            ex
+        }
     } else {
         fallback.clone()
     }

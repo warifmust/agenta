@@ -8,6 +8,7 @@ use crate::core::{
     Agent, AgentStatus, ExecutionMode, ExecutionResult, ExecutionStatus, Storage, ToolCall,
     ToolDefinition,
 };
+use crate::mcp::McpManager;
 use crate::ollama::{
     client::{ChatMessage, ChatRequest, GenerateRequest},
     models::ModelParameters,
@@ -19,13 +20,25 @@ use crate::tools::{is_builtin_tool, run_tool, ToolInvocation};
 pub struct AgentExecutor {
     storage: Arc<dyn Storage>,
     backend: Arc<dyn ModelBackend>,
+    /// Optional daemon-level MCP connection pool.
+    mcp_manager: Option<Arc<McpManager>>,
     /// Optional channel for streaming progress messages (e.g. sub-agent notifications)
     pub progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AgentExecutor {
     pub fn new(storage: Arc<dyn Storage>, backend: Arc<dyn ModelBackend>) -> Self {
-        Self { storage, backend, progress_tx: None }
+        Self { storage, backend, mcp_manager: None, progress_tx: None }
+    }
+
+    /// Attach a shared MCP connection manager.
+    pub fn with_mcp_manager(mut self, mcp: Arc<McpManager>) -> Self {
+        self.mcp_manager = Some(mcp);
+        self
+    }
+
+    pub fn mcp_manager(&self) -> Option<Arc<McpManager>> {
+        self.mcp_manager.clone()
     }
 
     /// Attach a progress sender. Returns a new executor with the channel set.

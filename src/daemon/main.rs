@@ -7,9 +7,11 @@ use tracing::{error, info};
 
 mod state;
 mod chat_gateway;
+mod slack_gateway;
 mod rest_api;
 use state::DaemonState;
 use chat_gateway::start_chat_gateway;
+use slack_gateway::start_slack_gateway;
 use rest_api::start_rest_api;
 
 use agenta::core::{
@@ -68,6 +70,11 @@ async fn main() -> anyhow::Result<()> {
     // Optional Telegram chat gateway (long polling)
     if let Err(e) = start_chat_gateway(state.clone(), &config).await {
         error!("Chat gateway startup failed: {}", e);
+    }
+
+    // Optional Slack chat gateway (Socket Mode)
+    if let Err(e) = start_slack_gateway(state.clone(), &config).await {
+        error!("Slack gateway startup failed: {}", e);
     }
 
     // Optional REST API + Swagger

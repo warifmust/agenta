@@ -1,4 +1,4 @@
-use super::{Commands, MemoryCommands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
+use super::{Commands, McpCommands, MemoryCommands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
     ExecutionResult, HttpHandler, Proposal, ProposalStatus, ScriptDefinition, SideEffect,
@@ -182,6 +182,11 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             remove_tool: new_remove_tool,
             add_kb: new_add_kb,
             remove_kb: new_remove_kb,
+            add_mcp: new_add_mcp,
+            remove_mcp: new_remove_mcp,
+            mcp_read_only: new_mcp_read_only,
+            mcp_allow: new_mcp_allow,
+            mcp_deny: new_mcp_deny,
             top_k: new_top_k,
             allow_destructive_tools: new_allow_destructive,
             fs_allow: new_fs_allow,
@@ -299,6 +304,41 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 agent.config.knowledge_bases.retain(|k| k != &kb);
                 if agent.config.knowledge_bases.len() == before {
                     println!("{} Knowledge base '{}' was not attached to this agent.", "!".yellow(), kb);
+                }
+            }
+            if let Some(server) = new_add_mcp {
+                if !config.mcp_servers.contains_key(&server) {
+                    println!(
+                        "{} Warning: MCP server '{}' is not defined in ~/.agenta/config.toml yet.",
+                        "!".yellow(),
+                        server
+                    );
+                }
+                let allow_tools: Vec<String> = new_mcp_allow
+                    .as_deref()
+                    .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                    .unwrap_or_default();
+                let deny_tools: Vec<String> = new_mcp_deny
+                    .as_deref()
+                    .map(|s| s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+                    .unwrap_or_default();
+                let new_ref = crate::core::AgentMcpRef {
+                    server: server.clone(),
+                    read_only: new_mcp_read_only,
+                    allow_tools,
+                    deny_tools,
+                };
+                if let Some(existing) = agent.config.mcp_servers.iter_mut().find(|m| m.server == server) {
+                    *existing = new_ref;
+                } else {
+                    agent.config.mcp_servers.push(new_ref);
+                }
+            }
+            if let Some(server) = new_remove_mcp {
+                let before = agent.config.mcp_servers.len();
+                agent.config.mcp_servers.retain(|m| m.server != server);
+                if agent.config.mcp_servers.len() == before {
+                    println!("{} MCP server '{}' was not attached to this agent.", "!".yellow(), server);
                 }
             }
             if let Some(k) = new_top_k {
@@ -469,6 +509,7 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         Commands::Setup { target } => match target {
             None                          => bootstrap_mind(&config).await,
             Some(SetupCommands::Telegram) => setup_telegram(&config).await,
+            Some(SetupCommands::Slack)    => setup_slack(&config).await,
         },
 
         Commands::Pull { target } => match target {
@@ -480,6 +521,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         Commands::Knowledge { command } => {
             super::knowledge::handle_knowledge_command(command, &config).await
         }
+
+        Commands::Mcp { command } => handle_mcp_command(command, &config).await,
 
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
 
@@ -1066,6 +1109,208 @@ async fn setup_telegram(config: &AppConfig) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Interactive wizard to add a Slack Socket Mode bot entry to config.toml.
+/// Called via `agenta setup slack`.
+async fn setup_slack(config: &AppConfig) -> Result<()> {
+    println!();
+    println!("{}", "  Slack Setup (Socket Mode)".bold().cyan());
+    println!("  Connect a Slack bot to an agent — no public URL or webhook needed.");
+    println!();
+    println!("  1. Create an app at https://api.slack.com/apps (From scratch)");
+    println!("  2. Enable Socket Mode → generate an App-Level Token (xapp-...) with scope: connections:write");
+    println!("  3. Under Event Subscriptions → enable & subscribe to bot events: app_mention, message.im");
+    println!("  4. Under OAuth & Permissions → add Bot Token Scopes:");
+    println!("       app_mentions:read, chat:write, im:history, channels:history, groups:history, reactions:write, users:read");
+    println!("  5. Install App to workspace and copy the Bot User OAuth Token (xoxb-...)");
+    println!();
+
+    print!("  Bot User OAuth Token (xoxb-... or $ENV_VAR, hidden): ");
+    std::io::stdout().flush()?;
+    let bot_token = prompt_secret().unwrap_or_default();
+    if bot_token.is_empty() {
+        println!("  {} No bot token entered — skipping Slack setup.", "⚠".yellow());
+        return Ok(());
+    }
+    println!("  {} {}", "✓ Bot token:".green(), redact_secret(&bot_token).dimmed());
+
+    print!("  App-Level Token (xapp-... or $ENV_VAR, hidden): ");
+    std::io::stdout().flush()?;
+    let app_token = prompt_secret().unwrap_or_default();
+    if app_token.is_empty() {
+        println!("  {} No app token entered — skipping Slack setup.", "⚠".yellow());
+        return Ok(());
+    }
+    println!("  {} {}", "✓ App token:".green(), redact_secret(&app_token).dimmed());
+
+    // List agents so user can pick
+    let agents: Vec<String> = match daemon_request(config, DaemonRequest::ListAgents).await {
+        Ok(DaemonResponse::AgentList { agents }) => agents
+            .iter()
+            .filter_map(|a: &serde_json::Value| {
+                a.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+            })
+            .collect(),
+        _ => vec![],
+    };
+
+    let default_agent = if agents.is_empty() {
+        println!("  No agents found — you can set the agent name manually.");
+        print!("  Agent name: ");
+        std::io::stdout().flush()?;
+        prompt_line().unwrap_or_default()
+    } else {
+        println!("  Which agent should handle messages from this Slack bot?");
+        for (i, name) in agents.iter().enumerate() {
+            println!("    {})  {}", (i + 1).to_string().cyan(), name.bold());
+        }
+        print!("  Choice [1]: ");
+        std::io::stdout().flush()?;
+        let choice = prompt_line().unwrap_or_default();
+        let idx: usize = choice.parse().unwrap_or(1);
+        agents.get(idx.saturating_sub(1)).cloned().unwrap_or_else(|| agents[0].clone())
+    };
+
+    if default_agent.is_empty() {
+        println!("  {} No agent selected — skipping.", "⚠".yellow());
+        return Ok(());
+    }
+
+    print!("  Friendly bot name (optional, press Enter to skip): ");
+    std::io::stdout().flush()?;
+    let label = prompt_line().unwrap_or_default();
+    let bot_name = if label.is_empty() { None } else { Some(label) };
+
+    let config_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".agenta")
+        .join("config.toml");
+
+    let toml_content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut doc: toml::Value = toml_content
+        .parse()
+        .unwrap_or(toml::Value::Table(toml::map::Map::new()));
+
+    let new_bot = {
+        let mut m = toml::map::Map::new();
+        m.insert("bot_token".into(), toml::Value::String(bot_token.clone()));
+        m.insert("app_token".into(), toml::Value::String(app_token.clone()));
+        m.insert("default_agent".into(), toml::Value::String(default_agent.clone()));
+        if let Some(ref n) = bot_name {
+            m.insert("name".into(), toml::Value::String(n.clone()));
+        }
+        toml::Value::Table(m)
+    };
+
+    if let toml::Value::Table(ref mut root) = doc {
+        let bots = root
+            .entry("slack_bots")
+            .or_insert_with(|| toml::Value::Array(vec![]));
+        if let toml::Value::Array(ref mut arr) = bots {
+            arr.push(new_bot);
+        }
+    }
+
+    std::fs::write(&config_path, toml::to_string_pretty(&doc)?)?;
+
+    println!();
+    println!("  {} bot added to ~/.agenta/config.toml", "✓ Slack".green());
+    println!("  Agent  : {}", default_agent.cyan());
+    if let Some(ref n) = bot_name {
+        println!("  Name   : {}", n);
+    }
+    println!();
+    println!("  Restart the daemon to activate: {}", "agenta daemon restart".cyan());
+    println!();
+
+    Ok(())
+}
+
+async fn handle_mcp_command(command: McpCommands, config: &AppConfig) -> Result<()> {
+    match command {
+        McpCommands::List => {
+            if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured in ~/.agenta/config.toml.");
+                println!("Add a [mcp_servers.<name>] section to ~/.agenta/config.toml to get started.");
+                return Ok(());
+            }
+
+            let mut table = Table::new();
+            table.set_header(vec!["Name", "Transport", "Target", "Timeout"]);
+
+            let mut names: Vec<&String> = config.mcp_servers.keys().collect();
+            names.sort();
+            for name in names {
+                let srv = &config.mcp_servers[name];
+                let (transport, target) = match srv.transport {
+                    crate::core::McpTransport::Stdio => {
+                        let cmd = srv.command.as_deref().unwrap_or("(missing command)");
+                        let args = if srv.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", srv.args.join(" "))
+                        };
+                        ("stdio", format!("{}{}", cmd, args))
+                    }
+                    crate::core::McpTransport::Http => {
+                        ("http", srv.url.as_deref().unwrap_or("(missing url)").to_string())
+                    }
+                };
+                table.add_row(vec![
+                    name.as_str(),
+                    transport,
+                    target.as_str(),
+                    &format!("{}s", srv.timeout_secs),
+                ]);
+            }
+            println!("{}", table);
+            Ok(())
+        }
+        McpCommands::Inspect { server } => {
+            if !config.mcp_servers.contains_key(&server) {
+                return Err(anyhow!(
+                    "MCP server '{}' is not configured in ~/.agenta/config.toml",
+                    server
+                ));
+            }
+            println!("Connecting to MCP server '{}'...", server.cyan());
+            let mgr = crate::mcp::McpManager::new(config.mcp_servers.clone());
+            let tools = mgr.list_tools(&server, true).await;
+            mgr.shutdown_all().await;
+
+            let tools = tools?;
+            if tools.is_empty() {
+                println!("MCP server '{}' reported 0 tools.", server);
+                return Ok(());
+            }
+
+            let mut table = Table::new();
+            table.set_header(vec!["Tool", "Read-Only", "Params", "Description"]);
+            for t in &tools {
+                let ro = if crate::mcp::is_tool_read_only(t) { "yes" } else { "no" };
+                let params = crate::mcp::compact_schema_hint(&t.input_schema);
+                let desc = t
+                    .description
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect::<String>();
+                table.add_row(vec![t.name.as_str(), ro, params.as_str(), desc.as_str()]);
+            }
+            println!("{}", table);
+            println!(
+                "\n{} tool(s) discovered. Attach to an agent with:\n  {}",
+                tools.len(),
+                format!("agenta update <agent> --add-mcp {} --mcp-read-only", server).cyan()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Read one line of input for the setup wizard from the controlling terminal.
@@ -2215,6 +2460,33 @@ fn print_agent_details(agent: &Agent) {
             None => "8 (default)".to_string(),
         };
         table.add_row(vec!["RAG Top-K", &top_k]);
+    }
+
+    if !agent.config.mcp_servers.is_empty() {
+        let mcps = agent
+            .config
+            .mcp_servers
+            .iter()
+            .map(|m| {
+                let mut flags = Vec::new();
+                if m.read_only {
+                    flags.push("read-only".to_string());
+                }
+                if !m.allow_tools.is_empty() {
+                    flags.push(format!("allow:{}", m.allow_tools.join(",")));
+                }
+                if !m.deny_tools.is_empty() {
+                    flags.push(format!("deny:{}", m.deny_tools.join(",")));
+                }
+                if flags.is_empty() {
+                    m.server.clone()
+                } else {
+                    format!("{} ({})", m.server, flags.join("; "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        table.add_row(vec!["MCP Servers", &mcps]);
     }
 
     println!("{}", table);

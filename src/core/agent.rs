@@ -342,6 +342,23 @@ pub enum AgentStatus {
     Error,
 }
 
+/// Per-agent reference to a configured MCP server (from `[mcp_servers.<name>]`).
+/// Controls which tools from that server this agent is permitted to see and call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct AgentMcpRef {
+    /// Server name matching a key in `config.mcp_servers`.
+    pub server: String,
+    /// When true, only read-only tools from this server are exposed to the agent.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Optional allowlist of tool names (empty = all tools permitted by `read_only`/`deny_tools`).
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// Optional denylist of tool names (always excluded).
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+}
+
 /// Agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AgentConfig {
@@ -372,6 +389,10 @@ pub struct AgentConfig {
     /// store instead of this field.
     #[serde(default)]
     pub fs_allow: Vec<String>,
+    /// MCP servers attached to this agent (by name from `[mcp_servers.<name>]`),
+    /// with optional per-agent `read_only` / `allow_tools` / `deny_tools` filters.
+    #[serde(default)]
+    pub mcp_servers: Vec<AgentMcpRef>,
 }
 
 impl Default for AgentConfig {
@@ -392,6 +413,7 @@ impl Default for AgentConfig {
             rag_top_k: None,
             allow_destructive_tools: false,
             fs_allow: vec![],
+            mcp_servers: vec![],
         }
     }
 }

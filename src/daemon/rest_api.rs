@@ -13,7 +13,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use agenta::core::{
-    Agent, AgentConfig, AgentEnv, AgentStatus, AppConfig, DeepAgentConfig, ExecutionMode,
+    Agent, AgentConfig, AgentEnv, AgentMcpRef, AgentStatus, AppConfig, DeepAgentConfig, ExecutionMode,
     ExecutionResult, ExecutionStatus, ToolCall, ToolDefinition, ToolResource, TriggerType,
 };
 use agenta::knowledge::KnowledgeBase;
@@ -105,6 +105,7 @@ struct LogsQuery {
             Agent,
             AgentConfig,
             AgentEnv,
+            AgentMcpRef,
             AgentStatus,
             DeepAgentConfig,
             ExecutionMode,

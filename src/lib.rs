@@ -7,6 +7,7 @@ pub mod cli;
 pub mod core;
 pub mod guardrails;
 pub mod knowledge;
+pub mod mcp;
 pub mod ollama;
 pub mod providers;
 pub mod scheduler;

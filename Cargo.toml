@@ -33,6 +33,10 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "postgres", "mi
 # HTTP client for Ollama (rustls = no OpenSSL dependency, works on all cross targets)
 reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
+# WebSocket client for Slack Socket Mode (rustls = no OpenSSL dependency)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
 # Scheduling
 tokio-cron-scheduler = "0.10"
 cron = "0.12"

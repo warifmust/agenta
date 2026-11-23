@@ -215,6 +215,26 @@ pub enum Commands {
         #[arg(long, value_name = "KB_NAME")]
         remove_kb: Option<String>,
 
+        /// Attach (or update) an MCP server from config.toml by name, e.g. --add-mcp github
+        #[arg(long, value_name = "SERVER")]
+        add_mcp: Option<String>,
+
+        /// Detach an MCP server by name, e.g. --remove-mcp github
+        #[arg(long, value_name = "SERVER")]
+        remove_mcp: Option<String>,
+
+        /// Restrict --add-mcp to read-only tools only
+        #[arg(long)]
+        mcp_read_only: bool,
+
+        /// Comma-separated tool allowlist for --add-mcp (e.g. "search_code,get_issue")
+        #[arg(long, value_name = "TOOLS")]
+        mcp_allow: Option<String>,
+
+        /// Comma-separated tool denylist for --add-mcp (e.g. "delete_issue,merge_pull_request")
+        #[arg(long, value_name = "TOOLS")]
+        mcp_deny: Option<String>,
+
         /// RAG retrieval top-k for this agent — how many knowledge passages to
         /// inject per query. Overrides the global `rag_top_k` (default 8).
         #[arg(long, value_name = "N")]
@@ -423,6 +443,23 @@ pub enum Commands {
         #[command(subcommand)]
         command: KnowledgeCommands,
     },
+
+    /// Inspect and manage configured MCP servers
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommands {
+    /// List MCP servers configured in ~/.agenta/config.toml
+    List,
+    /// Connect to an MCP server and list its discovered tools
+    Inspect {
+        /// Server name from [mcp_servers.<name>]
+        server: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -485,6 +522,8 @@ pub enum PullCommands {
 pub enum SetupCommands {
     /// Add or update a Telegram bot for an agent
     Telegram,
+    /// Add a Slack bot (Socket Mode) for an agent
+    Slack,
 }
 
 #[derive(Subcommand)]

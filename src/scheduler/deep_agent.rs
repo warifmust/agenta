@@ -63,6 +63,7 @@ use crate::core::{
     Agent, AgentStatus, DeepAgentConfig, ExecutionMode, ExecutionResult, Proposal, ProposalAction,
     ProposalStatus, SideEffect, Storage, ToolCall, ToolResource,
 };
+use crate::mcp::McpManager;
 use crate::ollama::client::{ChatMessage, ChatRequest};
 use crate::ollama::models::ModelParameters;
 use crate::providers::ModelBackend;
@@ -72,6 +73,7 @@ use crate::tools::{builtin_tool_descriptions, is_builtin_tool, run_tool};
 pub struct DeepAgentExecutor {
     backend: Arc<dyn ModelBackend>,
     storage: Arc<dyn Storage>,
+    mcp: Option<Arc<McpManager>>,
     max_iterations: u32,
     stop_patterns: Vec<Regex>,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -88,6 +90,7 @@ impl DeepAgentExecutor {
         Ok(Self {
             backend: base.backend(),
             storage: base.storage(),
+            mcp: base.mcp_manager(),
             max_iterations: config.max_iterations,
             stop_patterns: stop_patterns?,
             progress_tx: base.progress_tx.clone(),
@@ -178,6 +181,19 @@ impl DeepAgentExecutor {
                 continue;
             }
             tool_descriptions.push(format!("- {} (built-in): {}", name, desc));
+        }
+
+        // Discover permitted MCP tools for this agent's attached MCP servers.
+        let mut allowed_mcp_tools: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        if let Some(mcp) = &self.mcp {
+            if !agent.config.mcp_servers.is_empty() {
+                for (server, tool) in mcp.tools_for_agent(&agent.config.mcp_servers).await {
+                    let full_name = crate::mcp::format_mcp_tool_name(&server, &tool.name);
+                    tool_descriptions.push(crate::mcp::format_tool_prompt_line(&server, &tool));
+                    allowed_mcp_tools.insert(full_name, (server, tool.name));
+                }
+            }
         }
 
         let memory_block = if agent.memory_enabled {
@@ -329,7 +345,9 @@ impl DeepAgentExecutor {
             // same message; if we checked completion first, the tool would never
             // run. Run it, feed the result back, and let the model finish next turn.
             if content.contains("TOOL_CALL:") {
-                let calls = self.handle_tool_call(agent, &content).await;
+                let calls = self
+                    .handle_tool_call(agent, &content, &allowed_mcp_tools)
+                    .await;
 
                 // Record each call with its real tool name (so callers/UIs can
                 // show "called get_agents" traces), and build the fed-back result.
@@ -425,7 +443,12 @@ impl DeepAgentExecutor {
     /// (e.g. gpt-5.4) often batch several calls in one turn. Returns
     /// `(tool_name, result)` pairs in call order so the loop can record and feed
     /// each back.
-    async fn handle_tool_call(&self, agent: &Agent, content: &str) -> Vec<(String, String)> {
+    async fn handle_tool_call(
+        &self,
+        agent: &Agent,
+        content: &str,
+        allowed_mcp_tools: &std::collections::HashMap<String, (String, String)>,
+    ) -> Vec<(String, String)> {
         let mut results: Vec<(String, String)> = Vec::new();
         let mut cursor = 0usize;
 
@@ -471,6 +494,19 @@ impl DeepAgentExecutor {
                 self.run_builtin_tool(agent, tool_name, &parameters)
                     .await
                     .unwrap_or_else(|| "Tool produced no output.".to_string())
+            } else if crate::mcp::is_mcp_tool_name(tool_name) {
+                match (allowed_mcp_tools.get(tool_name), &self.mcp) {
+                    (Some((server, real_name)), Some(mcp)) => {
+                        match mcp.call_tool(server, real_name, parameters).await {
+                            Ok(out) => out,
+                            Err(err) => format!("MCP tool error: {}", err),
+                        }
+                    }
+                    _ => format!(
+                        "Access denied — MCP tool '{}' is not attached or permitted for this agent.",
+                        tool_name
+                    ),
+                }
             } else {
                 match run_tool(agent, tool_name, parameters).await {
                     Ok(out) => out,
