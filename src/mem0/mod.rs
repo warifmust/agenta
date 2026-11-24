@@ -164,13 +164,14 @@ impl Mem0Client {
         }
 
         let user_bucket = resolve_write_bucket(scope, ctx);
+        let agent_id = normalize_entity_id(agent_name);
         let url = format!("{}/memories", self.base_url);
         let body = serde_json::json!({
             "messages": [
                 { "role": "user", "content": user_msg },
                 { "role": "assistant", "content": assistant_msg }
             ],
-            "agent_id": agent_name,
+            "agent_id": agent_id,
             "user_id": user_bucket,
         });
 
@@ -214,10 +215,11 @@ impl Mem0Client {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Mem0Entry>> {
+        let agent_id = normalize_entity_id(agent_name);
         let url = format!("{}/search", self.base_url);
         let mut body = serde_json::json!({
             "query": query,
-            "agent_id": agent_name,
+            "agent_id": agent_id,
             "limit": limit,
         });
         if let Some(uid) = user_id {
@@ -245,10 +247,11 @@ impl Mem0Client {
         user_id: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<Mem0Entry>> {
+        let agent_id = normalize_entity_id(agent_name);
         let url = format!("{}/memories", self.base_url);
         let limit_str = limit.to_string();
         let mut query_params = vec![
-            ("agent_id", agent_name),
+            ("agent_id", agent_id.as_str()),
             ("limit", limit_str.as_str()),
         ];
         if let Some(uid) = user_id {
@@ -280,8 +283,9 @@ impl Mem0Client {
         agent_name: &str,
         user_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        let agent_id = normalize_entity_id(agent_name);
         let url = format!("{}/memories", self.base_url);
-        let mut query_params = vec![("agent_id", agent_name)];
+        let mut query_params = vec![("agent_id", agent_id.as_str())];
         if let Some(uid) = user_id {
             query_params.push(("user_id", uid));
         }
@@ -422,6 +426,15 @@ pub fn parse_mem0_entries(val: &serde_json::Value) -> Vec<Mem0Entry> {
     }
 }
 
+/// Mem0 rejects whitespace in `agent_id` / `user_id`. Normalize names like
+/// `"Kaydee AI"` into `"kaydee-ai"` consistently across read/write/CLI paths.
+pub fn normalize_entity_id(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_ascii_lowercase()
+}
+
 fn resolve_env_ref(raw: &str) -> String {
     if let Some(var) = raw.strip_prefix('$') {
         std::env::var(var).unwrap_or_default()
@@ -479,6 +492,12 @@ mod tests {
         assert!(is_trivial_message("Hey bro."));
         assert!(is_trivial_message("Thanks!"));
         assert!(!is_trivial_message("Syaza handles AD smoke tests"));
+    }
+
+    #[test]
+    fn normalizes_entity_ids_without_whitespace() {
+        assert_eq!(normalize_entity_id("Kaydee AI"), "kaydee-ai");
+        assert_eq!(normalize_entity_id("  My   Agent  "), "my-agent");
     }
 
     #[test]
