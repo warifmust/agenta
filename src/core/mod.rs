@@ -10,7 +10,7 @@ pub use proposal::{Proposal, ProposalAction, ProposalStatus, Risk};
 
 pub use agent::{
     Agent, AgentConfig, AgentEnv, AgentMcpRef, AgentStatus, DeepAgentConfig, ExecutionMode,
-    ExecutionResult, ExecutionStatus, HttpHandler, SideEffect, ToolCall, ToolDefinition,
+    ExecutionResult, ExecutionStatus, HttpHandler, Mem0Scope, SideEffect, ToolCall, ToolDefinition,
     ToolExecution, ToolExecutionStatus, ToolResource, TriggerType,
     ScriptDefinition, ScriptExecution, ScriptExecutionStatus,
 };

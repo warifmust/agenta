@@ -140,6 +140,37 @@ fn default_mcp_timeout_secs() -> u64 {
     30
 }
 
+fn default_mem0_top_k() -> usize {
+    5
+}
+
+fn default_mem0_min_score() -> f32 {
+    0.25
+}
+
+fn default_mem0_timeout_secs() -> u64 {
+    5
+}
+
+/// Configuration for a self-hosted or remote Mem0 memory service (`[mem0]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mem0Config {
+    /// Base URL of the Mem0 service (e.g. "http://127.0.0.1:8888").
+    pub url: String,
+    /// Optional Bearer API key (or "$ENV_VAR" reference).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Maximum number of memories injected per turn (default: 5).
+    #[serde(default = "default_mem0_top_k")]
+    pub top_k: usize,
+    /// Minimum similarity score required to inject a memory (default: 0.25).
+    #[serde(default = "default_mem0_min_score")]
+    pub min_score: f32,
+    /// HTTP timeout in seconds for Mem0 recall calls (default: 5).
+    #[serde(default = "default_mem0_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
 /// Configuration for a single MCP server under `[mcp_servers.<name>]` in config.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -218,6 +249,9 @@ pub struct AppConfig {
     /// Configured MCP servers (`[mcp_servers.<name>]`), attached to agents by name.
     #[serde(default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    /// Optional Mem0 long-term memory service (`[mem0]` in config.toml).
+    #[serde(default)]
+    pub mem0: Option<Mem0Config>,
 }
 
 fn default_registry_owner() -> String { "agenta-tools".to_string() }
@@ -263,6 +297,7 @@ impl Default for AppConfig {
             registry_repo: default_registry_repo(),
             rag_top_k: default_rag_top_k(),
             mcp_servers: std::collections::HashMap::new(),
+            mem0: None,
         }
     }
 }

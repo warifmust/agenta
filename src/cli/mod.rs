@@ -235,6 +235,14 @@ pub enum Commands {
         #[arg(long, value_name = "TOOLS")]
         mcp_deny: Option<String>,
 
+        /// Enable or disable Mem0 long-term memory for this agent
+        #[arg(long)]
+        mem0: Option<bool>,
+
+        /// Mem0 isolation scope: auto (private DMs, shared channels), agent (shared), or user (private)
+        #[arg(long, value_name = "SCOPE")]
+        mem0_scope: Option<String>,
+
         /// RAG retrieval top-k for this agent — how many knowledge passages to
         /// inject per query. Overrides the global `rag_top_k` (default 8).
         #[arg(long, value_name = "N")]
@@ -448,6 +456,50 @@ pub enum Commands {
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
+    },
+
+    /// Inspect and manage Mem0 long-term memories
+    Mem0 {
+        #[command(subcommand)]
+        command: Mem0Commands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum Mem0Commands {
+    /// Check connection and health of the configured [mem0] service
+    Status,
+    /// List stored memories for an agent (optionally filtered by --user bucket)
+    List {
+        /// Agent name
+        agent: String,
+        /// Optional bucket/user_id (e.g. "shared" or "dm:U02HJKRNMA4")
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Max results to display
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Semantic search over an agent's Mem0 memories
+    Search {
+        /// Agent name
+        agent: String,
+        /// Search query
+        query: String,
+        /// Optional bucket/user_id (e.g. "shared" or "dm:U02HJKRNMA4")
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Max results to return
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Clear stored memories for an agent (optionally scoped to one --user bucket)
+    Clear {
+        /// Agent name
+        agent: String,
+        /// Optional bucket/user_id (e.g. "shared" or "dm:U02HJKRNMA4")
+        #[arg(short, long)]
+        user: Option<String>,
     },
 }
 

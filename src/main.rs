@@ -7,6 +7,7 @@ mod core;
 mod guardrails;
 mod knowledge;
 mod mcp;
+mod mem0;
 mod ollama;
 mod providers;
 mod scheduler;

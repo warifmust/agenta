@@ -9,6 +9,7 @@ use crate::core::{
     ToolDefinition,
 };
 use crate::mcp::McpManager;
+use crate::mem0::{Mem0Client, Mem0Context};
 use crate::ollama::{
     client::{ChatMessage, ChatRequest, GenerateRequest},
     models::ModelParameters,
@@ -22,13 +23,24 @@ pub struct AgentExecutor {
     backend: Arc<dyn ModelBackend>,
     /// Optional daemon-level MCP connection pool.
     mcp_manager: Option<Arc<McpManager>>,
+    /// Optional daemon-level Mem0 long-term memory client.
+    mem0_client: Option<Arc<Mem0Client>>,
+    /// Per-run conversation context for Mem0 bucket isolation (DM vs channel).
+    mem0_context: Mem0Context,
     /// Optional channel for streaming progress messages (e.g. sub-agent notifications)
     pub progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AgentExecutor {
     pub fn new(storage: Arc<dyn Storage>, backend: Arc<dyn ModelBackend>) -> Self {
-        Self { storage, backend, mcp_manager: None, progress_tx: None }
+        Self {
+            storage,
+            backend,
+            mcp_manager: None,
+            mem0_client: None,
+            mem0_context: Mem0Context::default(),
+            progress_tx: None,
+        }
     }
 
     /// Attach a shared MCP connection manager.
@@ -39,6 +51,26 @@ impl AgentExecutor {
 
     pub fn mcp_manager(&self) -> Option<Arc<McpManager>> {
         self.mcp_manager.clone()
+    }
+
+    /// Attach a shared Mem0 long-term memory client.
+    pub fn with_mem0_client(mut self, mem0: Arc<Mem0Client>) -> Self {
+        self.mem0_client = Some(mem0);
+        self
+    }
+
+    pub fn mem0_client(&self) -> Option<Arc<Mem0Client>> {
+        self.mem0_client.clone()
+    }
+
+    /// Attach per-run Mem0 conversation context (DM vs channel, Slack user ID).
+    pub fn with_mem0_context(mut self, ctx: Mem0Context) -> Self {
+        self.mem0_context = ctx;
+        self
+    }
+
+    pub fn mem0_context(&self) -> &Mem0Context {
+        &self.mem0_context
     }
 
     /// Attach a progress sender. Returns a new executor with the channel set.

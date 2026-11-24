@@ -64,6 +64,7 @@ use crate::core::{
     ProposalStatus, SideEffect, Storage, ToolCall, ToolResource,
 };
 use crate::mcp::McpManager;
+use crate::mem0::{Mem0Client, Mem0Context};
 use crate::ollama::client::{ChatMessage, ChatRequest};
 use crate::ollama::models::ModelParameters;
 use crate::providers::ModelBackend;
@@ -74,6 +75,8 @@ pub struct DeepAgentExecutor {
     backend: Arc<dyn ModelBackend>,
     storage: Arc<dyn Storage>,
     mcp: Option<Arc<McpManager>>,
+    mem0: Option<Arc<Mem0Client>>,
+    mem0_ctx: Mem0Context,
     max_iterations: u32,
     stop_patterns: Vec<Regex>,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -91,10 +94,32 @@ impl DeepAgentExecutor {
             backend: base.backend(),
             storage: base.storage(),
             mcp: base.mcp_manager(),
+            mem0: base.mem0_client(),
+            mem0_ctx: base.mem0_context().clone(),
             max_iterations: config.max_iterations,
             stop_patterns: stop_patterns?,
             progress_tx: base.progress_tx.clone(),
         })
+    }
+
+    /// Fire-and-forget Mem0 persistence so replies are never delayed waiting on
+    /// Mem0's fact-extraction LLM call.
+    fn spawn_mem0_remember(&self, agent: &Agent, input: &str, answer: &str) {
+        if !agent.config.mem0_enabled {
+            return;
+        }
+        let Some(mem0) = self.mem0.clone() else {
+            return;
+        };
+        let agent_name = agent.name.clone();
+        let scope = agent.config.mem0_scope;
+        let ctx = self.mem0_ctx.clone();
+        let user_input = input.to_string();
+        let assistant_answer = answer.to_string();
+        tokio::spawn(async move {
+            mem0.remember_exchange(&agent_name, scope, &ctx, &user_input, &assistant_answer)
+                .await;
+        });
     }
 
     fn notify(&self, msg: impl Into<String>) {
@@ -196,11 +221,23 @@ impl DeepAgentExecutor {
             }
         }
 
-        let memory_block = if agent.memory_enabled {
+        let mut memory_block = if agent.memory_enabled {
             self.build_memory_block(agent).await
         } else {
             String::new()
         };
+
+        // Native Mem0 recall (pre-turn semantic lookup, non-fatal).
+        if agent.config.mem0_enabled {
+            if let Some(mem0) = &self.mem0 {
+                if let Some(mem0_block) = mem0
+                    .recall_prompt_block(&agent.name, agent.config.mem0_scope, &self.mem0_ctx, input)
+                    .await
+                {
+                    memory_block.push_str(&mem0_block);
+                }
+            }
+        }
 
         let system_content = format!(
             "{system}\n\n{memory}You have access to these tools:\n{tools}\n\nINSTRUCTIONS:\n\
@@ -400,19 +437,24 @@ impl DeepAgentExecutor {
             // Strip the marker and keep the whole message so we never drop the body.
             if content.contains("TASK_COMPLETE:") {
                 info!("Agent {} completed at iteration {}", agent.name, iteration + 1);
-                return Ok(content.replacen("TASK_COMPLETE:", "", 1).trim().to_string());
+                let answer = content.replacen("TASK_COMPLETE:", "", 1).trim().to_string();
+                self.spawn_mem0_remember(agent, input, &answer);
+                return Ok(answer);
             }
 
             // ── Stop condition ────────────────────────────────────────────────
             if self.should_stop(&content) {
                 info!("Agent {} stopped by condition at iteration {}", agent.name, iteration + 1);
+                self.spawn_mem0_remember(agent, input, &content);
                 return Ok(content);
             }
 
             // No TOOL_CALL and no completion marker: the model produced a plain
             // prose response, which is its final answer.
             info!("Agent {} answered in prose at iteration {}", agent.name, iteration + 1);
-            return Ok(content.trim().to_string());
+            let answer = content.trim().to_string();
+            self.spawn_mem0_remember(agent, input, &answer);
+            return Ok(answer);
         }
 
         // Max iterations hit without a TASK_COMPLETE. Rather than throwing away
@@ -445,6 +487,7 @@ impl DeepAgentExecutor {
                     .trim()
                     .to_string();
                 if !text.is_empty() && !has_tool_call(&text) {
+                    self.spawn_mem0_remember(agent, input, &text);
                     return Ok(text);
                 }
             }

@@ -13,6 +13,7 @@ use agenta::core::{
 };
 use agenta::core::AppConfig;
 use agenta::mcp::McpManager;
+use agenta::mem0::{Mem0Client, Mem0Context};
 use agenta::providers::build_backend;
 use agenta::scheduler::AgentExecutor;
 use agenta::trigger::{CommandTrigger, FileWatcherTrigger, HttpTrigger, Scheduler as CronScheduler, resolve_timezone};
@@ -34,7 +35,13 @@ impl DaemonState {
     pub async fn new(storage: Arc<dyn Storage>, config: &AppConfig) -> anyhow::Result<Self> {
         let backend = build_backend(config, None);
         let mcp_manager = Arc::new(McpManager::new(config.mcp_servers.clone()));
-        let executor = AgentExecutor::new(storage.clone(), backend).with_mcp_manager(mcp_manager.clone());
+        let mut executor =
+            AgentExecutor::new(storage.clone(), backend).with_mcp_manager(mcp_manager.clone());
+        if let Some(ref mem0_cfg) = config.mem0 {
+            let mem0 = Arc::new(Mem0Client::new(mem0_cfg));
+            info!("Mem0 memory client configured: {}", mem0_cfg.url);
+            executor = executor.with_mem0_client(mem0);
+        }
         let timezone = resolve_timezone(config.timezone.as_deref());
         let cron_scheduler = CronScheduler::with_timezone(timezone);
 
@@ -360,6 +367,18 @@ impl DaemonState {
         id: &str,
         input: String,
     ) -> anyhow::Result<ExecutionResult> {
+        self.run_agent_sync_execution_with_mem0_context(id, input, Mem0Context::default())
+            .await
+    }
+
+    /// Run an agent synchronously with an explicit Mem0 conversation context
+    /// (e.g. DM vs channel + Slack user ID for isolated memory buckets).
+    pub async fn run_agent_sync_execution_with_mem0_context(
+        &self,
+        id: &str,
+        input: String,
+        mem0_ctx: Mem0Context,
+    ) -> anyhow::Result<ExecutionResult> {
         let mut agent = self
             .get_agent(id)
             .await?
@@ -368,8 +387,8 @@ impl DaemonState {
         self.inject_knowledge(&mut agent, &input).await;
 
         let execution_id = uuid::Uuid::new_v4().to_string();
-        self
-            .executor_for_agent(&agent)
+        self.executor_for_agent(&agent)
+            .with_mem0_context(mem0_ctx)
             .execute_with_id(&agent, Some(input), execution_id)
             .await
     }
@@ -1007,12 +1026,14 @@ fn build_executor_for_agent(
         .unwrap_or(false);
     if has_provider {
         let backend = build_backend(config, agent.provider.as_deref());
-        let ex = AgentExecutor::new(storage.clone(), backend);
+        let mut ex = AgentExecutor::new(storage.clone(), backend);
         if let Some(mcp) = fallback.mcp_manager() {
-            ex.with_mcp_manager(mcp)
-        } else {
-            ex
+            ex = ex.with_mcp_manager(mcp);
         }
+        if let Some(mem0) = fallback.mem0_client() {
+            ex = ex.with_mem0_client(mem0);
+        }
+        ex
     } else {
         fallback.clone()
     }

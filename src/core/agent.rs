@@ -359,6 +359,21 @@ pub struct AgentMcpRef {
     pub deny_tools: Vec<String>,
 }
 
+/// How an agent's Mem0 memories are partitioned across users and channels.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mem0Scope {
+    /// Private per-user bucket in DMs (`dm:<user_id>`), shared team bucket (`shared`)
+    /// in channels. DMs can read shared channel knowledge without ever leaking DM
+    /// facts to other users or channels.
+    #[default]
+    Auto,
+    /// Single shared bucket (`shared`) across all DMs and channels for this agent.
+    Agent,
+    /// Strictly isolated per-user bucket (`dm:<user_id>`) everywhere.
+    User,
+}
+
 /// Agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AgentConfig {
@@ -393,6 +408,12 @@ pub struct AgentConfig {
     /// with optional per-agent `read_only` / `allow_tools` / `deny_tools` filters.
     #[serde(default)]
     pub mcp_servers: Vec<AgentMcpRef>,
+    /// Whether this agent uses the configured Mem0 long-term memory service.
+    #[serde(default)]
+    pub mem0_enabled: bool,
+    /// Isolation scope for Mem0 memories (`auto`, `agent`, or `user`).
+    #[serde(default)]
+    pub mem0_scope: Mem0Scope,
 }
 
 impl Default for AgentConfig {
@@ -414,6 +435,8 @@ impl Default for AgentConfig {
             allow_destructive_tools: false,
             fs_allow: vec![],
             mcp_servers: vec![],
+            mem0_enabled: false,
+            mem0_scope: Mem0Scope::Auto,
         }
     }
 }

@@ -14,7 +14,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use agenta::core::{
     Agent, AgentConfig, AgentEnv, AgentMcpRef, AgentStatus, AppConfig, DeepAgentConfig, ExecutionMode,
-    ExecutionResult, ExecutionStatus, ToolCall, ToolDefinition, ToolResource, TriggerType,
+    ExecutionResult, ExecutionStatus, Mem0Scope, ToolCall, ToolDefinition, ToolResource, TriggerType,
 };
 use agenta::knowledge::KnowledgeBase;
 use super::state::DaemonState;
@@ -111,6 +111,7 @@ struct LogsQuery {
             ExecutionMode,
             ExecutionResult,
             ExecutionStatus,
+            Mem0Scope,
             ToolCall,
             ToolDefinition,
             TriggerType,

@@ -8,6 +8,7 @@ pub mod core;
 pub mod guardrails;
 pub mod knowledge;
 pub mod mcp;
+pub mod mem0;
 pub mod ollama;
 pub mod providers;
 pub mod scheduler;

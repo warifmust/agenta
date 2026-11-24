@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 
 use agenta::core::{AppConfig, ExecutionStatus};
+use agenta::mem0::Mem0Context;
 
 use super::state::DaemonState;
 
@@ -371,7 +372,14 @@ async fn handle_slack_event(
         format!("[{}]\n{}", scope_tag, cleaned_message)
     };
 
-    let reply = match daemon.run_agent_sync_execution(&agent, full_input).await {
+    let mem0_ctx = Mem0Context {
+        is_dm,
+        user_id: event.user.clone(),
+    };
+    let reply = match daemon
+        .run_agent_sync_execution_with_mem0_context(&agent, full_input, mem0_ctx)
+        .await
+    {
         Ok(execution) => {
             if execution.status == ExecutionStatus::Cancelled {
                 let _ = remove_reaction(&http, &bot_token, &event.channel, &event.ts, "eyes").await;

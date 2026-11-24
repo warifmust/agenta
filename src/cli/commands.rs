@@ -1,4 +1,4 @@
-use super::{Commands, McpCommands, MemoryCommands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
+use super::{Commands, McpCommands, Mem0Commands, MemoryCommands, ProposalCommands, PullCommands, ScriptCommands, SetupCommands, ToolCommands, ViewCommands};
 use crate::core::{
     Agent, AgentStatus, AppConfig, DaemonRequest, DaemonResponse, DeepAgentConfig, ExecutionMode,
     ExecutionResult, HttpHandler, Proposal, ProposalStatus, ScriptDefinition, SideEffect,
@@ -187,6 +187,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
             mcp_read_only: new_mcp_read_only,
             mcp_allow: new_mcp_allow,
             mcp_deny: new_mcp_deny,
+            mem0: new_mem0,
+            mem0_scope: new_mem0_scope,
             top_k: new_top_k,
             allow_destructive_tools: new_allow_destructive,
             fs_allow: new_fs_allow,
@@ -340,6 +342,28 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
                 if agent.config.mcp_servers.len() == before {
                     println!("{} MCP server '{}' was not attached to this agent.", "!".yellow(), server);
                 }
+            }
+            if let Some(v) = new_mem0 {
+                if v && config.mem0.is_none() {
+                    println!(
+                        "{} Warning: [mem0] is not configured in ~/.agenta/config.toml yet.",
+                        "!".yellow()
+                    );
+                }
+                agent.config.mem0_enabled = v;
+            }
+            if let Some(scope_str) = new_mem0_scope {
+                agent.config.mem0_scope = match scope_str.trim().to_ascii_lowercase().as_str() {
+                    "auto" => crate::core::Mem0Scope::Auto,
+                    "agent" => crate::core::Mem0Scope::Agent,
+                    "user" => crate::core::Mem0Scope::User,
+                    other => {
+                        return Err(anyhow!(
+                            "Invalid --mem0-scope '{}'. Use: auto, agent, or user.",
+                            other
+                        ))
+                    }
+                };
             }
             if let Some(k) = new_top_k {
                 agent.config.rag_top_k = Some(k);
@@ -523,6 +547,8 @@ pub async fn handle_command(command: Commands, config: AppConfig) -> Result<()> 
         }
 
         Commands::Mcp { command } => handle_mcp_command(command, &config).await,
+
+        Commands::Mem0 { command } => handle_mem0_command(command, &config).await,
 
         Commands::Daemon { command } => handle_daemon_command(command, config).await,
 
@@ -1308,6 +1334,75 @@ async fn handle_mcp_command(command: McpCommands, config: &AppConfig) -> Result<
                 tools.len(),
                 format!("agenta update <agent> --add-mcp {} --mcp-read-only", server).cyan()
             );
+            Ok(())
+        }
+    }
+}
+
+async fn handle_mem0_command(command: Mem0Commands, config: &AppConfig) -> Result<()> {
+    let mem0_cfg = config.mem0.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Mem0 is not configured. Add a [mem0] section with `url = \"http://127.0.0.1:8888\"` to ~/.agenta/config.toml."
+        )
+    })?;
+    let client = crate::mem0::Mem0Client::new(mem0_cfg);
+
+    match command {
+        Mem0Commands::Status => {
+            let health = client.health().await?;
+            println!(
+                "{} Mem0 reachable at {} (top_k={}, min_score={})",
+                "✓".green(),
+                mem0_cfg.url.cyan(),
+                mem0_cfg.top_k,
+                mem0_cfg.min_score
+            );
+            println!("  Health: {}", health);
+            Ok(())
+        }
+        Mem0Commands::List { agent, user, limit } => {
+            let entries = client.list_memories(&agent, user.as_deref(), limit).await?;
+            if entries.is_empty() {
+                println!("No Mem0 memories found for '{}'.", agent);
+                return Ok(());
+            }
+            let mut table = Table::new();
+            table.set_header(vec!["ID", "Bucket", "Memory"]);
+            for e in &entries {
+                let short_id = if e.id.len() > 8 { &e.id[..8] } else { &e.id };
+                let bucket = e.user_id.as_deref().unwrap_or("-");
+                table.add_row(vec![short_id, bucket, e.memory.as_str()]);
+            }
+            println!("{}", table);
+            Ok(())
+        }
+        Mem0Commands::Search { agent, query, user, limit } => {
+            let entries = client
+                .search_bucket(&agent, user.as_deref(), &query, limit)
+                .await?;
+            if entries.is_empty() {
+                println!("No matching Mem0 memories for '{}'.", agent);
+                return Ok(());
+            }
+            let mut table = Table::new();
+            table.set_header(vec!["Score", "Bucket", "Memory"]);
+            for e in &entries {
+                let score = e
+                    .score
+                    .map(|s| format!("{:.2}", s))
+                    .unwrap_or_else(|| "-".to_string());
+                let bucket = e.user_id.as_deref().unwrap_or("-");
+                table.add_row(vec![score.as_str(), bucket, e.memory.as_str()]);
+            }
+            println!("{}", table);
+            Ok(())
+        }
+        Mem0Commands::Clear { agent, user } => {
+            client.clear_memories(&agent, user.as_deref()).await?;
+            match user {
+                Some(u) => println!("{} Cleared Mem0 memories for '{}' (bucket: {}).", "✓".green(), agent, u),
+                None => println!("{} Cleared all Mem0 memories for '{}'.", "✓".green(), agent),
+            }
             Ok(())
         }
     }
@@ -2487,6 +2582,11 @@ fn print_agent_details(agent: &Agent) {
             .collect::<Vec<_>>()
             .join(", ");
         table.add_row(vec!["MCP Servers", &mcps]);
+    }
+
+    if agent.config.mem0_enabled {
+        let mem0_info = format!("Enabled (scope: {:?})", agent.config.mem0_scope);
+        table.add_row(vec!["Mem0 Memory", &mem0_info]);
     }
 
     println!("{}", table);
