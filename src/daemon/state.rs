@@ -589,24 +589,18 @@ impl DaemonState {
     }
 
     // ── Knowledge bases (RAG) ─────────────────────────────────────────────────
-    // KBs live in Postgres/pgvector, not the agent store — queried directly, same
-    // as the `agenta knowledge` CLI. Ingestion is intentionally NOT here (it needs
-    // an async upload+OCR job); this is lifecycle only.
-    async fn kb_store(&self) -> anyhow::Result<agenta::knowledge::PgVectorStore> {
-        let url = match &self.config.database_url {
-            Some(u) if u.starts_with("postgres") => u.clone(),
-            _ => anyhow::bail!("RAG requires Postgres. Set database_url in config.toml."),
-        };
-        Ok(agenta::knowledge::PgVectorStore::new(&url).await?)
+    // KBs live in the configured vector store (pgvector or Qdrant), queried
+    // directly, same as the `agenta knowledge` CLI. Ingestion is intentionally
+    // NOT here (it needs an async upload+OCR job); this is lifecycle only.
+    async fn kb_store(&self) -> anyhow::Result<Box<dyn agenta::knowledge::VectorStore>> {
+        Ok(agenta::knowledge::build_vector_store(&self.config).await?)
     }
 
     pub async fn list_kbs(&self) -> anyhow::Result<Vec<agenta::knowledge::KnowledgeBase>> {
-        use agenta::knowledge::VectorStore;
         Ok(self.kb_store().await?.list_kbs().await?)
     }
 
     pub async fn get_kb(&self, name: &str) -> anyhow::Result<Option<agenta::knowledge::KnowledgeBase>> {
-        use agenta::knowledge::VectorStore;
         Ok(self.kb_store().await?.get_kb(name).await?)
     }
 
@@ -615,28 +609,28 @@ impl DaemonState {
         name: &str,
         embedder: &str,
     ) -> anyhow::Result<agenta::knowledge::KnowledgeBase> {
-        use agenta::knowledge::VectorStore;
         let store = self.kb_store().await?;
         if store.get_kb(name).await?.is_some() {
             anyhow::bail!("Knowledge base '{}' already exists", name);
         }
-        // Validate the embedder is usable and produces the pinned dimension.
+        // Validate the embedder is usable and matches any backend dimension requirement.
         agenta::providers::ensure_embedder_available(&self.config, embedder).await?;
         let emb = agenta::providers::build_embedder(&self.config, embedder).await?;
         let dim = emb.dimension() as i32;
-        if dim != agenta::knowledge::V1_DIMENSION {
-            anyhow::bail!(
-                "v1 supports {}-dim embedders only; '{}' is {}-dim",
-                agenta::knowledge::V1_DIMENSION,
-                embedder,
-                dim
-            );
+        if let Some(req) = store.required_dimension() {
+            if dim != req {
+                anyhow::bail!(
+                    "This vector store supports {}-dim embedders only; '{}' is {}-dim",
+                    req,
+                    embedder,
+                    dim
+                );
+            }
         }
         Ok(store.create_kb(name, &emb.id(), dim).await?)
     }
 
     pub async fn delete_kb(&self, name: &str) -> anyhow::Result<bool> {
-        use agenta::knowledge::VectorStore;
         Ok(self.kb_store().await?.delete_kb(name).await?)
     }
 

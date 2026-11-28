@@ -446,7 +446,7 @@ pub enum Commands {
         target: PullCommands,
     },
 
-    /// Manage knowledge bases for RAG (Postgres/pgvector)
+    /// Manage knowledge bases for RAG (pgvector or Qdrant)
     Knowledge {
         #[command(subcommand)]
         command: KnowledgeCommands,

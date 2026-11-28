@@ -152,6 +152,79 @@ fn default_mem0_timeout_secs() -> u64 {
     5
 }
 
+fn default_qdrant_collection_prefix() -> String {
+    "agenta_kb_".to_string()
+}
+
+/// Supported vector database backends for RAG knowledge bases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorStoreBackend {
+    Pgvector,
+    Qdrant,
+}
+
+impl Default for VectorStoreBackend {
+    fn default() -> Self {
+        Self::Pgvector
+    }
+}
+
+/// Configuration for the RAG vector store (`[vector_store]` in config.toml).
+///
+/// Examples:
+/// ```toml
+/// [vector_store]
+/// backend = "qdrant"
+/// url = "http://127.0.0.1:6333"
+/// # api_key = "$QDRANT_API_KEY"
+/// ```
+/// or:
+/// ```toml
+/// [vector_store]
+/// backend = "pgvector"
+/// # url = "postgres://..."  # optional, defaults to top-level database_url
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorStoreConfig {
+    /// Vector store backend: "pgvector" (default) or "qdrant".
+    #[serde(default)]
+    pub backend: VectorStoreBackend,
+    /// Endpoint URL. For qdrant defaults to "http://127.0.0.1:6333".
+    /// For pgvector falls back to top-level `database_url`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional API key for authenticated Qdrant instances (supports "$ENV_VAR" expansion).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Prefix for Qdrant collection names (default: "agenta_kb_").
+    #[serde(default = "default_qdrant_collection_prefix")]
+    pub collection_prefix: String,
+}
+
+impl Default for VectorStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: VectorStoreBackend::Pgvector,
+            url: None,
+            api_key: None,
+            collection_prefix: default_qdrant_collection_prefix(),
+        }
+    }
+}
+
+impl VectorStoreConfig {
+    /// Resolve API key, expanding `$ENV_VAR` if prefixed with `$`.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let raw = self.api_key.as_ref()?;
+        if let Some(var_name) = raw.strip_prefix('$') {
+            std::env::var(var_name).ok()
+        } else {
+            Some(raw.clone())
+        }
+    }
+}
+
 /// Configuration for a self-hosted or remote Mem0 memory service (`[mem0]` in config.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mem0Config {
@@ -252,6 +325,10 @@ pub struct AppConfig {
     /// Optional Mem0 long-term memory service (`[mem0]` in config.toml).
     #[serde(default)]
     pub mem0: Option<Mem0Config>,
+    /// Optional RAG vector store config (`[vector_store]` in config.toml).
+    /// Supports `backend = "pgvector"` (default, uses `database_url`) or `backend = "qdrant"`.
+    #[serde(default)]
+    pub vector_store: Option<VectorStoreConfig>,
 }
 
 fn default_registry_owner() -> String { "agenta-tools".to_string() }
@@ -298,6 +375,7 @@ impl Default for AppConfig {
             rag_top_k: default_rag_top_k(),
             mcp_servers: std::collections::HashMap::new(),
             mem0: None,
+            vector_store: None,
         }
     }
 }
@@ -533,5 +611,41 @@ mod tests {
     fn provider_api_key_returns_none_for_unknown_provider() {
         let cfg = AppConfig::default();
         assert!(cfg.provider_api_key("deepseek").is_none());
+    }
+
+    #[test]
+    fn vector_store_config_parses_qdrant_and_pgvector() {
+        let qdrant_toml = r#"
+ollama_url = "http://localhost:11434"
+database_path = "/tmp/agenta.db"
+socket_path = "/tmp/agenta.sock"
+log_level = "info"
+default_model = "llama2"
+
+[vector_store]
+backend = "qdrant"
+url = "http://127.0.0.1:6333"
+collection_prefix = "my_kb_"
+"#;
+        let cfg: AppConfig = toml::from_str(qdrant_toml).unwrap();
+        let vs = cfg.vector_store.as_ref().unwrap();
+        assert_eq!(vs.backend, VectorStoreBackend::Qdrant);
+        assert_eq!(vs.url.as_deref(), Some("http://127.0.0.1:6333"));
+        assert_eq!(vs.collection_prefix, "my_kb_");
+
+        let pg_toml = r#"
+ollama_url = "http://localhost:11434"
+database_path = "/tmp/agenta.db"
+socket_path = "/tmp/agenta.sock"
+log_level = "info"
+default_model = "llama2"
+
+[vector_store]
+backend = "pgvector"
+"#;
+        let cfg2: AppConfig = toml::from_str(pg_toml).unwrap();
+        let vs2 = cfg2.vector_store.as_ref().unwrap();
+        assert_eq!(vs2.backend, VectorStoreBackend::Pgvector);
+        assert_eq!(vs2.collection_prefix, "agenta_kb_");
     }
 }

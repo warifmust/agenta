@@ -8,7 +8,7 @@ use owo_colors::OwoColorize;
 
 use super::KnowledgeCommands;
 use crate::core::AppConfig;
-use crate::knowledge::{ingest, Chunk, PgVectorStore, VectorStore, V1_DIMENSION};
+use crate::knowledge::{build_vector_store, ingest, Chunk, VectorStore};
 use crate::providers::{build_embedder, build_ocr, ensure_embedder_available};
 
 const EMBED_BATCH: usize = 64;
@@ -150,19 +150,8 @@ fn pdf_page_count(path: &Path) -> Option<usize> {
         .find_map(|line| line.strip_prefix("Pages:").and_then(|r| r.trim().parse().ok()))
 }
 
-/// RAG requires Postgres/pgvector in v1.
-fn pg_url(config: &AppConfig) -> Result<String> {
-    match &config.database_url {
-        Some(u) if u.starts_with("postgres") => Ok(u.clone()),
-        _ => Err(anyhow!(
-            "RAG requires Postgres. Set database_url = \"postgres://…\" in config.toml \
-             (with the pgvector extension available)."
-        )),
-    }
-}
-
 pub async fn handle_knowledge_command(command: KnowledgeCommands, config: &AppConfig) -> Result<()> {
-    let store = PgVectorStore::new(&pg_url(config)?).await?;
+    let store = build_vector_store(config).await?;
 
     match command {
         KnowledgeCommands::Create { name, embedder } => {
@@ -171,11 +160,13 @@ pub async fn handle_knowledge_command(command: KnowledgeCommands, config: &AppCo
             ensure_embedder_available(config, &embedder).await?;
             let emb = build_embedder(config, &embedder).await?;
             let dim = emb.dimension() as i32;
-            if dim != V1_DIMENSION {
-                return Err(anyhow!(
-                    "v1 supports {}-dim embedders only; '{}' is {}-dim",
-                    V1_DIMENSION, embedder, dim
-                ));
+            if let Some(req) = store.required_dimension() {
+                if dim != req {
+                    return Err(anyhow!(
+                        "This vector store supports {}-dim embedders only; '{}' is {}-dim",
+                        req, embedder, dim
+                    ));
+                }
             }
             if store.get_kb(&name).await?.is_some() {
                 return Err(anyhow!("Knowledge base '{}' already exists", name));
@@ -220,7 +211,7 @@ pub async fn handle_knowledge_command(command: KnowledgeCommands, config: &AppCo
             let strategy = ingest::ChunkStrategy::parse(&chunk_strategy).ok_or_else(|| {
                 anyhow!("Invalid --chunk-strategy '{}' (use 'words' or 'entries')", chunk_strategy)
             })?;
-            add_file(config, &store, &name, &file, yes, ocr, strategy).await?;
+            add_file(config, store.as_ref(), &name, &file, yes, ocr, strategy).await?;
         }
     }
     Ok(())
@@ -228,7 +219,7 @@ pub async fn handle_knowledge_command(command: KnowledgeCommands, config: &AppCo
 
 async fn add_file(
     config: &AppConfig,
-    store: &PgVectorStore,
+    store: &dyn VectorStore,
     kb_name: &str,
     file: &str,
     yes: bool,

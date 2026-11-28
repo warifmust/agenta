@@ -563,17 +563,10 @@ async fn fetch_tools(config: &AppConfig) -> Result<Vec<serde_json::Value>> {
     }
 }
 
-/// Knowledge bases live in Postgres/pgvector, queried directly (not via the daemon),
-/// same as the `agenta knowledge` CLI. Returns a friendly error if RAG isn't configured.
+/// Knowledge bases live in the configured vector store (pgvector or Qdrant),
+/// queried directly (not via the daemon), same as the `agenta knowledge` CLI.
 async fn fetch_kbs(config: &AppConfig) -> Result<Vec<crate::knowledge::KnowledgeBase>> {
-    use crate::knowledge::VectorStore;
-    let url = match &config.database_url {
-        Some(u) if u.starts_with("postgres") => u.clone(),
-        _ => return Err(anyhow::anyhow!(
-            "RAG needs Postgres — set database_url in config.toml (with pgvector)."
-        )),
-    };
-    let store = crate::knowledge::PgVectorStore::new(&url).await?;
+    let store = crate::knowledge::build_vector_store(config).await?;
     Ok(store.list_kbs().await?)
 }
 

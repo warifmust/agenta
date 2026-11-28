@@ -1,7 +1,8 @@
 //! Knowledge bases + vector retrieval (RAG).
 //!
-//! v1 is pgvector-backed (Postgres). Vectors are encoded as pgvector's text form
-//! (`[a,b,c]`) and cast with `::vector` in SQL, so no extra crate is needed.
+//! Supports pluggable vector stores via `[vector_store]` in config.toml:
+//! - `pgvector` (default): Postgres + pgvector (`vector(1024)`).
+//! - `qdrant`: Qdrant REST API (per-KB collections, any dimension).
 
 use std::collections::HashSet;
 
@@ -12,9 +13,13 @@ use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Row};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::core::{AgentaError, Result};
+use crate::core::types::{VectorStoreBackend, VectorStoreConfig};
+use crate::core::{AgentaError, AppConfig, Result};
 
 pub mod ingest;
+pub mod qdrant;
+
+pub use qdrant::QdrantVectorStore;
 
 /// v1 pins one embedding dimension (bge-m3 = 1024). The `knowledge_chunks.embedding`
 /// column is `vector(1024)`; KBs of other dimensions are rejected for now.
@@ -50,6 +55,11 @@ pub struct RetrievedChunk {
 
 #[async_trait]
 pub trait VectorStore: Send + Sync {
+    /// Fixed vector dimension required by this backend, if any (e.g. pgvector's `vector(1024)`).
+    /// `None` means the backend supports arbitrary per-KB dimensions (e.g. Qdrant).
+    fn required_dimension(&self) -> Option<i32> {
+        None
+    }
     async fn create_kb(&self, name: &str, embedder: &str, dimension: i32) -> Result<KnowledgeBase>;
     async fn get_kb(&self, name: &str) -> Result<Option<KnowledgeBase>>;
     async fn list_kbs(&self) -> Result<Vec<KnowledgeBase>>;
@@ -61,6 +71,60 @@ pub trait VectorStore: Send + Sync {
     async fn existing_ids(&self, kb_id: &str, ids: &[String]) -> Result<HashSet<String>>;
     /// Top-k nearest chunks by cosine similarity.
     async fn search(&self, kb_id: &str, query: &[f32], k: usize) -> Result<Vec<RetrievedChunk>>;
+}
+
+/// Returns true if a RAG vector store is configured (either `[vector_store]` with Qdrant,
+/// or Postgres `database_url` / `[vector_store].url` for pgvector).
+pub fn is_vector_store_configured(config: &AppConfig) -> bool {
+    match &config.vector_store {
+        Some(vs) => match vs.backend {
+            VectorStoreBackend::Qdrant => true,
+            VectorStoreBackend::Pgvector => vs
+                .url
+                .as_deref()
+                .or(config.database_url.as_deref())
+                .map(|u| u.starts_with("postgres"))
+                .unwrap_or(false),
+        },
+        None => config
+            .database_url
+            .as_deref()
+            .map(|u| u.starts_with("postgres"))
+            .unwrap_or(false),
+    }
+}
+
+/// Construct the configured RAG `VectorStore` backend (`pgvector` or `qdrant`).
+pub async fn build_vector_store(config: &AppConfig) -> Result<Box<dyn VectorStore>> {
+    let vs = config.vector_store.clone().unwrap_or_default();
+    match vs.backend {
+        VectorStoreBackend::Qdrant => {
+            let url = vs
+                .url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:6333");
+            let api_key = vs.resolved_api_key();
+            let store = QdrantVectorStore::new(url, api_key, &vs.collection_prefix).await?;
+            Ok(Box::new(store))
+        }
+        VectorStoreBackend::Pgvector => {
+            let url = vs
+                .url
+                .as_deref()
+                .or(config.database_url.as_deref())
+                .filter(|u| u.starts_with("postgres"))
+                .ok_or_else(|| {
+                    AgentaError::Config(
+                        "RAG vector store not configured. Either set `database_url = \"postgres://...\"` \
+                         (for pgvector) or add `[vector_store]` with `backend = \"qdrant\"` and \
+                         `url = \"http://127.0.0.1:6333\"` in ~/.agenta/config.toml."
+                            .to_string(),
+                    )
+                })?;
+            let store = PgVectorStore::new(url).await?;
+            Ok(Box::new(store))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,18 +196,17 @@ mod tests {
 
 /// Retrieve top-k passages across the given knowledge bases for a query, formatted
 /// as a context block to inject into an agent's system prompt. Returns None if there
-/// are no KBs, no Postgres, or no hits — retrieval failures are non-fatal to the run.
+/// are no KBs, no vector store configured, or no hits — retrieval failures are non-fatal to the run.
 pub async fn retrieve_context(
     config: &crate::core::AppConfig,
     kb_names: &[String],
     query: &str,
     k: usize,
 ) -> Result<Option<String>> {
-    let url = match &config.database_url {
-        Some(u) if u.starts_with("postgres") => u.clone(),
-        _ => return Ok(None),
-    };
-    let store = PgVectorStore::new(&url).await?;
+    if !is_vector_store_configured(config) {
+        return Ok(None);
+    }
+    let store = build_vector_store(config).await?;
 
     let mut hits: Vec<RetrievedChunk> = Vec::new();
     for name in kb_names {
@@ -261,6 +324,10 @@ impl PgVectorStore {
 
 #[async_trait]
 impl VectorStore for PgVectorStore {
+    fn required_dimension(&self) -> Option<i32> {
+        Some(V1_DIMENSION)
+    }
+
     async fn create_kb(&self, name: &str, embedder: &str, dimension: i32) -> Result<KnowledgeBase> {
         if dimension != V1_DIMENSION {
             return Err(AgentaError::Config(format!(
